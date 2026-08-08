@@ -2,7 +2,9 @@
 
 `mac-cleanup.sh` reports the size and safety status of known regenerable caches,
 then clears only exact allowlisted directories when explicitly requested. Its
-default mode is read-only.
+default mode is read-only. The interface is dependency-free and adapts to the
+terminal: interactive runs use color and an in-place progress bar, while pipes
+and logs receive plain line-oriented output.
 
 Requirements: macOS and Bash 3.2 or newer. Do not run the script with `sudo`.
 
@@ -17,6 +19,27 @@ chmod +x mac-cleanup.sh
 # Interactive cleanup of routine caches
 ./mac-cleanup.sh --clean
 ```
+
+The scan is always shown before cleanup. It reports what was found, how much is
+ready, which caches need an explicit opt-in, and which are blocked by a running
+application. Cleanup then shows progress and a final count of cleared, skipped,
+and failed items.
+
+## Interactive controls
+
+During `--clean`, each ready cache shows its size and what recreating it may
+involve. Choose one of:
+
+| Key | Action |
+| --- | --- |
+| `y` | Clear this cache. |
+| `n` or Enter | Leave this cache unchanged. |
+| `a` | Clear this cache and all remaining ready caches. |
+| `q` | Stop cleanup and leave the remaining caches unchanged. |
+
+The status of each candidate and its related processes is checked again before
+deletion. If the status changed after the scan, the item is skipped and called
+out in the summary.
 
 Close Telegram, Chrome and other Google apps, TradingView, ZCode, package
 managers, and development tools before cleanup. If a related process is still
@@ -55,19 +78,19 @@ active:
 ```
 
 Because `--yes` causes permanent deletion without individual prompts, run the
-read-only report immediately beforehand and review its `Eligible in this run`
+read-only report immediately beforehand and review its `Ready to clean`
 total.
 
 ## Understanding the report
 
 | Status | Meaning |
 | --- | --- |
-| `ready` | The directory exists and all current safeguards passed. |
-| `opt-in` | Regenerable, but requires `--include-reinstallable`. |
-| `SKIP app/process running` | A related application or package manager appears active. |
-| `SKIP symlink` | The cache path redirects elsewhere and will never be cleared. |
-| `SKIP not a directory` | The allowlisted path is an unexpected file type. |
-| `not present` | There is nothing to clean at that path. |
+| `READY` | The directory exists and all current safeguards passed. |
+| `OPTIONAL` | Regenerable, but requires `--include-reinstallable`. |
+| `IN USE` | A related application or package manager appears active. |
+| `SYMLINK` | The cache path redirects elsewhere and will never be cleared. |
+| `INVALID` | The allowlisted path is an unexpected file type. |
+| `MISSING` | There is nothing to clean at that path. |
 
 Use `--verbose` to display every exact allowlisted path, including missing
 ones:
@@ -102,6 +125,7 @@ by this script.
 --include-reinstallable   Include browser binaries and tool runtimes
 --yes                     Confirm all eligible candidates
 --verbose                 Show skipped and missing candidates and their paths
+--no-color                Disable terminal colors
 -h, --help                Show command help
 ```
 
