@@ -1,4 +1,5 @@
 use std::{
+    cmp::Reverse,
     collections::BTreeSet,
     io::{self, IsTerminal},
     path::{Path, PathBuf},
@@ -23,7 +24,7 @@ use ratatui::{
 use crate::{
     cache::{
         CacheEntry, CacheSpec, CacheStatus, CleanupOutcome, CleanupStats, ScanLocation,
-        cache_specs, clean_cache, format_kb, free_kb, scan_cache, scan_locations,
+        clean_cache, format_kb, free_kb, scan_cache, scan_locations, scan_specs,
         validate_scan_root,
     },
     cli::{Cli, Mode},
@@ -41,6 +42,7 @@ enum Phase {
 
 struct App {
     mode: Mode,
+    account_home: PathBuf,
     scan_root: PathBuf,
     locations: Vec<ScanLocation>,
     location_cursor: usize,
@@ -83,10 +85,11 @@ impl App {
             .unwrap_or(0);
         Ok(Self {
             mode: cli.mode(),
+            account_home: home.to_path_buf(),
             scan_root: scan_root.clone(),
             locations,
             location_cursor,
-            specs: cache_specs(&scan_root),
+            specs: scan_specs(&scan_root, home),
             entries: Vec::new(),
             phase: if requested_root.is_some() {
                 Phase::Scanning
@@ -117,10 +120,15 @@ impl App {
 
     fn scan_next(&mut self) {
         if let Some(spec) = self.specs.get(self.scan_index) {
-            self.entries
-                .push(scan_cache(spec, self.include_reinstallable));
+            let entry = scan_cache(spec, self.include_reinstallable);
+            if entry.size_kb > 0
+                || matches!(entry.status, CacheStatus::Symlink | CacheStatus::Invalid)
+            {
+                self.entries.push(entry);
+            }
             self.scan_index += 1;
         } else {
+            self.entries.sort_by_key(|entry| Reverse(entry.size_kb));
             self.phase = Phase::Review;
             self.cursor = self.cursor.min(self.entries.len().saturating_sub(1));
         }
@@ -139,7 +147,7 @@ impl App {
             return;
         };
         self.scan_root = location.path.clone();
-        self.specs = cache_specs(&self.scan_root);
+        self.specs = scan_specs(&self.scan_root, &self.account_home);
         self.restart_scan();
     }
 
@@ -452,7 +460,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .add_modifier(Modifier::BOLD);
     let content = Line::from(vec![
         Span::styled(format!(" {mode} "), title_style),
-        Span::raw("  Safe cleanup for known macOS caches  •  "),
+        Span::raw("  Find removable caches, trash, and temporary data  •  "),
         Span::styled(
             app.scan_root.display().to_string(),
             Style::default().fg(app.color(Color::DarkGray)),
@@ -472,8 +480,8 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn render_metrics(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let metrics = [
-        ("FOUND", format_kb(app.found_kb()), Color::White),
-        ("READY", format_kb(app.ready_kb()), Color::Green),
+        ("WASTE FOUND", format_kb(app.found_kb()), Color::White),
+        ("REMOVABLE", format_kb(app.ready_kb()), Color::Green),
         ("SELECTED", format_kb(app.selected_kb()), Color::Cyan),
         ("OPT-IN", format_kb(app.optional_kb()), Color::Yellow),
     ];
@@ -502,7 +510,28 @@ fn render_metrics(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let header = Row::new(["", "STATUS", "CACHE", "SIZE"])
+    if app.phase == Phase::Review && app.entries.is_empty() {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(""),
+                Line::from("No removable data was found in known waste locations."),
+                Line::from(Span::styled(
+                    "Try another disk, rescan, or enable reinstallable downloads.",
+                    Style::default().fg(app.color(Color::DarkGray)),
+                )),
+            ])
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" WASTE FOUND "),
+            )
+            .alignment(Alignment::Center),
+            area,
+        );
+        return;
+    }
+
+    let header = Row::new(["", "STATUS", "ITEM", "SIZE"])
         .style(
             Style::default()
                 .fg(app.color(Color::DarkGray))
@@ -551,7 +580,11 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ],
     )
     .header(header)
-    .block(Block::default().borders(Borders::ALL).title(" CACHES "))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" WASTE FOUND "),
+    )
     .row_highlight_style(
         Style::default()
             .bg(app.color(Color::DarkGray))
@@ -586,8 +619,12 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Span::raw(outcome),
             ]),
         ]
+    } else if app.phase == Phase::Scanning {
+        vec![Line::from("Scanning known waste locations…")]
     } else {
-        vec![Line::from("Scanning allowlisted cache locations…")]
+        vec![Line::from(
+            "Nothing removable was found at this location. No files were changed.",
+        )]
     };
     frame.render_widget(
         Paragraph::new(lines)
@@ -605,7 +642,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
             let total = app.specs.len().max(1);
             frame.render_widget(
                 Gauge::default()
-                    .block(block.title(" SCANNING "))
+                    .block(block.title(" SCANNING • large folders may take a moment "))
                     .gauge_style(
                         Style::default()
                             .fg(app.color(Color::Cyan))
@@ -700,9 +737,9 @@ fn render_location_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .split(inner);
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from("Choose the root used for the fixed cache allowlist."),
+            Line::from("Choose a disk or home directory to search for removable data."),
             Line::from(Span::styled(
-                "Only known relative cache paths are scanned; unrelated files are never cleanup candidates.",
+                "The scan checks known caches, Trash/recycle bins, and temporary folders; personal files are excluded.",
                 Style::default().fg(app.color(Color::DarkGray)),
             )),
         ])
@@ -768,9 +805,9 @@ fn render_confirmation(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )),
         Line::from(""),
         Line::from(format!(
-            "Clear {count} selected cache(s), totaling about {amount}?"
+            "Clear {count} selected item(s), totaling about {amount}?"
         )),
-        Line::from("The cache directories remain, but deleted contents cannot be restored."),
+        Line::from("The containing folders remain, but deleted contents cannot be restored."),
         Line::from(""),
         Line::from(vec![
             Span::styled(
@@ -843,5 +880,29 @@ mod tests {
         app.entries[0].size_kb = 10;
         app.entries[0].status = CacheStatus::InUse;
         assert!(!app.is_selectable(0));
+    }
+
+    #[test]
+    fn completed_scan_hides_missing_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = Cli {
+            analyze: true,
+            clean: false,
+            include_reinstallable: false,
+            volume: None,
+            yes: false,
+            verbose: false,
+            no_color: true,
+            no_tui: false,
+        };
+        let mut app = App::new(&cli, temp.path()).unwrap();
+        app.choose_location();
+
+        while app.phase == Phase::Scanning {
+            app.scan_next();
+        }
+
+        assert_eq!(app.phase, Phase::Review);
+        assert!(app.entries.is_empty());
     }
 }

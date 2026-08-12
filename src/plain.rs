@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     cache::{
-        CacheEntry, CacheStatus, CleanupOutcome, CleanupStats, cache_specs, clean_cache, format_kb,
-        free_kb, scan_cache, validate_scan_root,
+        CacheEntry, CacheStatus, CleanupOutcome, CleanupStats, clean_cache, format_kb, free_kb,
+        scan_cache, scan_specs, validate_scan_root,
     },
     cli::{Cli, Mode},
 };
@@ -15,7 +15,7 @@ pub fn run(cli: &Cli, home: &Path) -> Result<i32, String> {
         .map(validate_scan_root)
         .transpose()?
         .unwrap_or_else(|| home.to_path_buf());
-    let specs = cache_specs(&scan_root);
+    let specs = scan_specs(&scan_root, home);
     let mut entries: Vec<_> = specs
         .iter()
         .map(|spec| scan_cache(spec, cli.include_reinstallable))
@@ -29,8 +29,8 @@ pub fn run(cli: &Cli, home: &Path) -> Result<i32, String> {
             Mode::Clean => "cleanup with safety checks",
         }
     );
-    println!("Scan root: {}\n", scan_root.display());
-    println!("STATUS     CACHE                           SIZE  DETAILS");
+    println!("Scan location: {}\n", scan_root.display());
+    println!("STATUS     REMOVABLE DATA                  SIZE  DETAILS");
 
     let mut shown = 0;
     for entry in &entries {
@@ -56,7 +56,7 @@ pub fn run(cli: &Cli, home: &Path) -> Result<i32, String> {
         }
     }
     if shown == 0 {
-        println!("No data was found in the known cache locations.");
+        println!("No removable data was found in known waste locations.");
     }
 
     print_totals(&entries);
@@ -82,7 +82,7 @@ pub fn run(cli: &Cli, home: &Path) -> Result<i32, String> {
         return Ok(0);
     }
 
-    println!("\nCleaning {ready_count} eligible cache(s)...");
+    println!("\nCleaning {ready_count} eligible item(s)...");
     let allowlist: Vec<PathBuf> = specs.iter().map(|spec| spec.path.clone()).collect();
     let before = free_kb(&scan_root);
     let mut stats = CleanupStats::default();
@@ -139,16 +139,16 @@ fn print_totals(entries: &[CacheEntry]) {
         .count();
 
     println!(
-        "\nFound:          {} in {found_count} cache(s)",
+        "\nFound:          {} in {found_count} item(s)",
         format_kb(found_kb)
     );
     println!(
-        "Ready to clean: {} in {ready_count} cache(s)",
+        "Ready to clean: {} in {ready_count} item(s)",
         format_kb(ready_kb)
     );
     if optional_count > 0 {
         println!(
-            "Needs opt-in:   {} in {optional_count} cache(s)",
+            "Needs opt-in:   {} in {optional_count} item(s)",
             format_kb(optional_kb)
         );
     }

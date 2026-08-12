@@ -12,7 +12,7 @@ pub enum Mode {
 #[command(
     name = "mac-cleanup",
     version,
-    about = "Safely inspect and clear known, regenerable macOS caches",
+    about = "Find and safely clear known removable data on macOS",
     after_help = "Cleanup is permanent. Close related apps first, and never run this command with sudo."
 )]
 pub struct Cli {
@@ -20,19 +20,19 @@ pub struct Cli {
     #[arg(long, conflicts_with = "clean")]
     pub analyze: bool,
 
-    /// Select and clear eligible cache contents
+    /// Select and clear eligible removable-data contents
     #[arg(long, conflicts_with = "analyze")]
     pub clean: bool,
 
-    /// Include tools and runtimes that require a large download to restore
+    /// Include items that may require a large download to restore
     #[arg(long)]
     pub include_reinstallable: bool,
 
-    /// Scan known cache locations relative to this mounted volume
+    /// Scan known waste locations on this mounted volume or home directory
     #[arg(long, value_name = "PATH")]
     pub volume: Option<PathBuf>,
 
-    /// Clear every eligible cache without interactive confirmation
+    /// Clear every eligible item without interactive confirmation
     #[arg(long, requires = "clean")]
     pub yes: bool,
 

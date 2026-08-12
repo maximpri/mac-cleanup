@@ -12,7 +12,7 @@ pub enum CacheTier {
 
 #[derive(Debug, Clone)]
 pub struct CacheSpec {
-    /// Safety boundary for this candidate (the home directory by default, or a selected volume).
+    /// Safety boundary that must contain this exact cleanup candidate.
     pub home: PathBuf,
     pub path: PathBuf,
     pub label: &'static str,
@@ -88,6 +88,13 @@ pub struct ScanLocation {
 pub fn cache_specs(root: &Path) -> Vec<CacheSpec> {
     let definitions = [
         (
+            ".Trash",
+            "Trash",
+            CacheTier::Routine,
+            "",
+            "files already moved to Trash",
+        ),
+        (
             "Library/Caches/pip",
             "pip cache",
             CacheTier::Routine,
@@ -158,6 +165,41 @@ pub fn cache_specs(root: &Path) -> Vec<CacheSpec> {
             "OpenCode regenerates this cache",
         ),
         (
+            "Library/Caches/go-build",
+            "Go build cache",
+            CacheTier::Routine,
+            "[g]o (build|test|install|run)",
+            "compiled Go build artifacts",
+        ),
+        (
+            ".cache/uv",
+            "uv package cache",
+            CacheTier::Routine,
+            "[u]v (add|build|cache|pip|run|sync)",
+            "downloaded Python packages and build artifacts",
+        ),
+        (
+            "Library/Caches/Yarn",
+            "Yarn package cache",
+            CacheTier::Routine,
+            "[y]arn ",
+            "downloaded JavaScript packages",
+        ),
+        (
+            "Library/Developer/Xcode/DerivedData",
+            "Xcode derived data",
+            CacheTier::Routine,
+            "/Xcode.app/|[x]codebuild",
+            "indexes and build products will be regenerated",
+        ),
+        (
+            "Library/Developer/CoreSimulator/Caches",
+            "Simulator cache",
+            CacheTier::Routine,
+            "[S]imulator.app/|[C]oreSimulator",
+            "simulator cache data will be regenerated",
+        ),
+        (
             "Library/Caches/ms-playwright",
             "Playwright browsers",
             CacheTier::Reinstallable,
@@ -192,6 +234,20 @@ pub fn cache_specs(root: &Path) -> Vec<CacheSpec> {
             "/Codex.app/|[c]odex-runtimes",
             "Codex runtime downloads may return",
         ),
+        (
+            ".gradle/caches",
+            "Gradle caches",
+            CacheTier::Reinstallable,
+            "[g]radle|[G]radleDaemon",
+            "dependencies and build tooling download again",
+        ),
+        (
+            ".cache/huggingface/hub",
+            "Hugging Face models",
+            CacheTier::Reinstallable,
+            "[h]uggingface|[t]ransformers",
+            "models and datasets download again",
+        ),
     ];
 
     definitions
@@ -205,6 +261,116 @@ pub fn cache_specs(root: &Path) -> Vec<CacheSpec> {
             note,
         })
         .collect()
+}
+
+/// Build useful candidates for a selected scan location.
+///
+/// A home-directory scan checks user caches and Trash. A mounted-volume scan
+/// checks volume-level recycle and temporary directories instead of pretending
+/// that the volume root is a user home. Startup and backup system volumes also
+/// include the current user's home layout when it can be resolved safely.
+pub fn scan_specs(scan_root: &Path, account_home: &Path) -> Vec<CacheSpec> {
+    if paths_match(scan_root, account_home) {
+        return cache_specs(account_home);
+    }
+
+    let mut specs = volume_specs(scan_root);
+    let home_on_volume = if scan_root == Path::new("/") {
+        Some(account_home.to_path_buf())
+    } else if looks_like_home(scan_root) {
+        Some(scan_root.to_path_buf())
+    } else {
+        account_home.file_name().and_then(|account_name| {
+            let candidate = scan_root.join("Users").join(account_name);
+            candidate.is_dir().then_some(candidate)
+        })
+    };
+
+    if let Some(home) = home_on_volume {
+        specs.extend(cache_specs(&home));
+    }
+    specs
+}
+
+fn volume_specs(root: &Path) -> Vec<CacheSpec> {
+    let definitions = [
+        (
+            ".Trash",
+            "Volume Trash",
+            "files already moved to this volume's Trash",
+        ),
+        (
+            "#recycle",
+            "Recycle bin",
+            "files already moved to this volume's recycle bin",
+        ),
+        (
+            "@Recycle",
+            "Recycle bin",
+            "files already moved to this volume's recycle bin",
+        ),
+        (
+            "$RECYCLE.BIN",
+            "Windows recycle bin",
+            "files already moved to this volume's recycle bin",
+        ),
+        (
+            ".TemporaryItems",
+            "Temporary items",
+            "temporary files left on this volume",
+        ),
+    ];
+
+    let mut specs: Vec<_> = definitions
+        .into_iter()
+        .map(|(relative, label, note)| CacheSpec {
+            home: root.to_path_buf(),
+            path: root.join(relative),
+            label,
+            tier: CacheTier::Routine,
+            process_pattern: "",
+            note,
+        })
+        .collect();
+
+    if let Some(uid) = effective_user_id() {
+        for path in [
+            root.join(".Trashes").join(uid.to_string()),
+            root.join(format!(".Trash-{uid}")),
+        ] {
+            specs.push(CacheSpec {
+                home: root.to_path_buf(),
+                path,
+                label: "Volume Trash",
+                tier: CacheTier::Routine,
+                process_pattern: "",
+                note: "files already moved to this volume's Trash",
+            });
+        }
+    }
+
+    specs
+}
+
+fn looks_like_home(path: &Path) -> bool {
+    path.join("Library").is_dir()
+        && (path.join(".Trash").exists()
+            || path.join(".cache").exists()
+            || path.join(".npm").exists()
+            || path
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name == "Users"))
+}
+
+fn paths_match(left: &Path, right: &Path) -> bool {
+    left == right
+        || left.canonicalize().ok().is_some_and(|resolved_left| {
+            right
+                .canonicalize()
+                .ok()
+                .is_some_and(|resolved_right| resolved_left == resolved_right)
+        })
 }
 
 pub fn scan_cache(spec: &CacheSpec, include_reinstallable: bool) -> CacheEntry {
@@ -632,13 +798,77 @@ mod tests {
     }
 
     #[test]
-    fn builds_cache_paths_relative_to_the_selected_root() {
-        let root = Path::new("/Volumes/Archive");
+    fn builds_cache_paths_relative_to_a_home_directory() {
+        let root = Path::new("/Users/tester");
         let specs = cache_specs(root);
 
         assert_eq!(specs[0].home, root);
-        assert_eq!(specs[0].path, root.join("Library/Caches/pip"));
-        assert_eq!(specs[8].path, root.join(".npm/_cacache"));
+        assert_eq!(specs[0].path, root.join(".Trash"));
+        assert_eq!(
+            specs
+                .iter()
+                .find(|spec| spec.label == "npm package cache")
+                .unwrap()
+                .path,
+            root.join(".npm/_cacache")
+        );
+    }
+
+    #[test]
+    fn mounted_volume_scan_targets_real_volume_waste() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("Users/tester");
+        let volume = temp.path().join("DATA");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir(&volume).unwrap();
+
+        let specs = scan_specs(&volume, &home);
+
+        assert!(
+            specs
+                .iter()
+                .any(|spec| spec.path == volume.join("#recycle"))
+        );
+        assert!(
+            specs
+                .iter()
+                .all(|spec| spec.path != volume.join("Library/Caches/pip"))
+        );
+    }
+
+    #[test]
+    fn recycle_bin_is_reported_as_removable_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("Users/tester");
+        let volume = temp.path().join("DATA");
+        let recycle = volume.join("#recycle");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&recycle).unwrap();
+        fs::File::create(recycle.join("discarded.bin"))
+            .unwrap()
+            .write_all(&[1; 8_192])
+            .unwrap();
+
+        let spec = scan_specs(&volume, &home)
+            .into_iter()
+            .find(|spec| spec.path == recycle)
+            .unwrap();
+        let entry = scan_cache(&spec, false);
+
+        assert_eq!(entry.status, CacheStatus::Ready);
+        assert!(entry.size_kb > 0);
+    }
+
+    #[test]
+    fn home_scan_includes_user_waste_instead_of_volume_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir(&home).unwrap();
+
+        let specs = scan_specs(&home, &home);
+
+        assert!(specs.iter().any(|spec| spec.path == home.join(".Trash")));
+        assert!(specs.iter().all(|spec| spec.path != home.join("#recycle")));
     }
 
     #[test]
