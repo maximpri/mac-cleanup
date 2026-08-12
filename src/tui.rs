@@ -1,9 +1,11 @@
 use std::{
     cmp::Reverse,
-    collections::BTreeSet,
+    collections::{BTreeSet, HashSet},
+    fs,
     io::{self, IsTerminal},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossterm::{
@@ -24,7 +26,7 @@ use ratatui::{
 use crate::{
     cache::{
         CacheEntry, CacheSpec, CacheStatus, CleanupOutcome, CleanupStats, ScanLocation,
-        clean_cache, format_kb, free_kb, scan_cache, scan_locations, scan_specs,
+        clean_cache, clean_review_data, format_kb, free_kb, scan_locations, scan_specs, status_for,
         validate_scan_root,
     },
     cli::{Cli, Mode},
@@ -37,8 +39,120 @@ enum Phase {
     Review,
     Details,
     Confirm,
+    ReviewConfirm,
     Cleaning,
     Summary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupKind {
+    Cache,
+    ReviewData,
+}
+
+struct DirectoryScan {
+    spec: CacheSpec,
+    status: CacheStatus,
+    readers: Vec<fs::ReadDir>,
+    seen: HashSet<(u64, u64)>,
+    allocated_blocks: u64,
+    inspected_items: u64,
+    errors: u64,
+    started_at: Instant,
+}
+
+impl DirectoryScan {
+    fn new(spec: CacheSpec, status: CacheStatus) -> Self {
+        let mut seen = HashSet::new();
+        let mut allocated_blocks = 0;
+        let mut errors = 0;
+        match fs::symlink_metadata(&spec.path) {
+            Ok(metadata) => {
+                seen.insert((metadata.dev(), metadata.ino()));
+                allocated_blocks = metadata.blocks();
+            }
+            Err(_) => errors += 1,
+        }
+        let readers = match fs::read_dir(&spec.path) {
+            Ok(reader) => vec![reader],
+            Err(_) => {
+                errors += 1;
+                Vec::new()
+            }
+        };
+        Self {
+            spec,
+            status,
+            readers,
+            seen,
+            allocated_blocks,
+            inspected_items: 0,
+            errors,
+            started_at: Instant::now(),
+        }
+    }
+
+    /// Process a bounded slice of filesystem work so drawing and keyboard
+    /// handling get a chance to run between slices.
+    fn advance(&mut self) -> bool {
+        const MAX_ITEMS_PER_TICK: usize = 256;
+        const MAX_TICK_TIME: Duration = Duration::from_millis(8);
+        let tick_started = Instant::now();
+
+        for _ in 0..MAX_ITEMS_PER_TICK {
+            if tick_started.elapsed() >= MAX_TICK_TIME {
+                break;
+            }
+            let Some(reader) = self.readers.last_mut() else {
+                return true;
+            };
+            let entry = match reader.next() {
+                Some(Ok(entry)) => entry,
+                Some(Err(_)) => {
+                    self.errors += 1;
+                    continue;
+                }
+                None => {
+                    self.readers.pop();
+                    continue;
+                }
+            };
+
+            self.inspected_items += 1;
+            let metadata = match fs::symlink_metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    self.errors += 1;
+                    continue;
+                }
+            };
+            let first_visit = self.seen.insert((metadata.dev(), metadata.ino()));
+            if first_visit {
+                self.allocated_blocks = self.allocated_blocks.saturating_add(metadata.blocks());
+            }
+            if first_visit && metadata.is_dir() && !metadata.file_type().is_symlink() {
+                match fs::read_dir(entry.path()) {
+                    Ok(reader) => self.readers.push(reader),
+                    Err(_) => self.errors += 1,
+                }
+            }
+        }
+        self.readers.is_empty()
+    }
+
+    fn size_kb(&self) -> u64 {
+        self.allocated_blocks.saturating_add(1) / 2
+    }
+
+    fn into_entry(self) -> CacheEntry {
+        let size_kb = self.size_kb();
+        CacheEntry {
+            spec: self.spec,
+            status: self.status,
+            size_kb,
+            outcome: None,
+        }
+    }
 }
 
 struct App {
@@ -53,10 +167,16 @@ struct App {
     include_reinstallable: bool,
     no_color: bool,
     scan_index: usize,
+    scan_task: Option<DirectoryScan>,
+    scan_started_at: Instant,
     cursor: usize,
     selected: BTreeSet<usize>,
     cleanup_queue: Vec<usize>,
     cleanup_index: usize,
+    cleanup_kind: CleanupKind,
+    review_target: Option<usize>,
+    review_confirmation: String,
+    review_confirmation_error: bool,
     stats: CleanupStats,
     free_before_kb: u64,
     stopped_early: bool,
@@ -100,10 +220,16 @@ impl App {
             include_reinstallable: cli.include_reinstallable,
             no_color: cli.no_color || std::env::var_os("NO_COLOR").is_some(),
             scan_index: 0,
+            scan_task: None,
+            scan_started_at: Instant::now(),
             cursor: 0,
             selected: BTreeSet::new(),
             cleanup_queue: Vec::new(),
             cleanup_index: 0,
+            cleanup_kind: CleanupKind::Cache,
+            review_target: None,
+            review_confirmation: String::new(),
+            review_confirmation_error: false,
             stats: CleanupStats::default(),
             free_before_kb: 0,
             stopped_early: false,
@@ -120,18 +246,47 @@ impl App {
     }
 
     fn scan_next(&mut self) {
-        if let Some(spec) = self.specs.get(self.scan_index) {
-            let entry = scan_cache(spec, self.include_reinstallable);
-            if entry.size_kb > 0
-                || matches!(entry.status, CacheStatus::Symlink | CacheStatus::Invalid)
-            {
-                self.entries.push(entry);
+        if let Some(task) = self.scan_task.as_mut() {
+            if task.advance() {
+                let entry = self
+                    .scan_task
+                    .take()
+                    .expect("active scan task")
+                    .into_entry();
+                self.record_scan_entry(entry);
+                self.scan_index += 1;
             }
-            self.scan_index += 1;
-        } else {
+            return;
+        }
+
+        let Some(spec) = self.specs.get(self.scan_index).cloned() else {
             self.entries.sort_by_key(|entry| Reverse(entry.size_kb));
             self.phase = Phase::Review;
             self.cursor = self.cursor.min(self.entries.len().saturating_sub(1));
+            return;
+        };
+
+        let status = status_for(&spec, self.include_reinstallable);
+        if matches!(
+            status,
+            CacheStatus::Missing | CacheStatus::Symlink | CacheStatus::Invalid
+        ) {
+            self.record_scan_entry(CacheEntry {
+                spec,
+                status,
+                size_kb: 0,
+                outcome: None,
+            });
+            self.scan_index += 1;
+        } else {
+            self.scan_task = Some(DirectoryScan::new(spec, status));
+        }
+    }
+
+    fn record_scan_entry(&mut self, entry: CacheEntry) {
+        if entry.size_kb > 0 || matches!(entry.status, CacheStatus::Symlink | CacheStatus::Invalid)
+        {
+            self.entries.push(entry);
         }
     }
 
@@ -139,8 +294,19 @@ impl App {
         self.entries.clear();
         self.selected.clear();
         self.scan_index = 0;
+        self.scan_task = None;
+        self.scan_started_at = Instant::now();
         self.cursor = 0;
         self.phase = Phase::Scanning;
+    }
+
+    fn cancel_scan(&mut self) {
+        self.scan_task = None;
+        self.entries.clear();
+        self.selected.clear();
+        self.scan_index = 0;
+        self.cursor = 0;
+        self.phase = Phase::Location;
     }
 
     fn choose_location(&mut self) {
@@ -159,11 +325,17 @@ impl App {
         };
 
         let allowlist: Vec<PathBuf> = self.specs.iter().map(|spec| spec.path.clone()).collect();
-        match clean_cache(
-            &mut self.entries[entry_index],
-            &allowlist,
-            self.include_reinstallable,
-        ) {
+        let outcome = match self.cleanup_kind {
+            CleanupKind::Cache => clean_cache(
+                &mut self.entries[entry_index],
+                &allowlist,
+                self.include_reinstallable,
+            ),
+            CleanupKind::ReviewData => {
+                clean_review_data(&mut self.entries[entry_index], &allowlist)
+            }
+        };
+        match outcome {
             CleanupOutcome::Cleared(kb) => {
                 self.stats.cleared += 1;
                 self.stats.measured_removed_kb += kb;
@@ -197,13 +369,18 @@ impl App {
 
         match self.phase {
             Phase::Location => self.handle_location_key(key.code),
-            Phase::Scanning => {
-                if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
-                    self.quit = true;
-                }
-            }
+            Phase::Scanning => match key.code {
+                KeyCode::Esc => self.cancel_scan(),
+                KeyCode::Char('q') => self.quit = true,
+                _ => {}
+            },
             Phase::Review => self.handle_review_key(key.code),
             Phase::Details => match key.code {
+                KeyCode::Char('d') | KeyCode::Char('D')
+                    if self.mode == Mode::Clean && self.current_is_review_data() =>
+                {
+                    self.start_review_confirmation();
+                }
                 KeyCode::Enter | KeyCode::Esc => self.phase = Phase::Review,
                 KeyCode::Char('q') => self.quit = true,
                 _ => {}
@@ -215,6 +392,7 @@ impl App {
                 }
                 _ => {}
             },
+            Phase::ReviewConfirm => self.handle_review_confirmation_key(key),
             Phase::Cleaning => {
                 if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
                     self.stopped_early = true;
@@ -260,6 +438,11 @@ impl App {
             KeyCode::End => self.cursor = self.entries.len().saturating_sub(1),
             KeyCode::Char(' ') if self.mode == Mode::Clean => self.toggle_current(),
             KeyCode::Char('a') if self.mode == Mode::Clean => self.toggle_all(),
+            KeyCode::Char('d') | KeyCode::Char('D')
+                if self.mode == Mode::Clean && self.current_is_review_data() =>
+            {
+                self.start_review_confirmation();
+            }
             KeyCode::Char('i') => {
                 self.include_reinstallable = !self.include_reinstallable;
                 self.restart_scan();
@@ -303,9 +486,76 @@ impl App {
         })
     }
 
+    fn current_is_review_data(&self) -> bool {
+        self.entries.get(self.cursor).is_some_and(|entry| {
+            entry.status == CacheStatus::Review && entry.size_kb > 0 && entry.outcome.is_none()
+        })
+    }
+
+    fn start_review_confirmation(&mut self) {
+        if !self.current_is_review_data() {
+            return;
+        }
+        self.review_target = Some(self.cursor);
+        self.review_confirmation.clear();
+        self.review_confirmation_error = false;
+        self.phase = Phase::ReviewConfirm;
+    }
+
+    fn handle_review_confirmation_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.review_target = None;
+                self.review_confirmation.clear();
+                self.review_confirmation_error = false;
+                self.phase = Phase::Review;
+            }
+            KeyCode::Backspace => {
+                self.review_confirmation.pop();
+                self.review_confirmation_error = false;
+            }
+            KeyCode::Enter if self.review_confirmation == "DELETE" => {
+                self.begin_review_cleanup();
+            }
+            KeyCode::Enter => self.review_confirmation_error = true,
+            KeyCode::Char(character)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && self.review_confirmation.len() < "DELETE".len() =>
+            {
+                self.review_confirmation
+                    .push(character.to_ascii_uppercase());
+                self.review_confirmation_error = false;
+            }
+            _ => {}
+        }
+    }
+
     fn begin_cleanup(&mut self) {
         self.cleanup_queue = self.selected.iter().copied().collect();
         self.cleanup_index = 0;
+        self.cleanup_kind = CleanupKind::Cache;
+        self.stats = CleanupStats::default();
+        self.free_before_kb = free_kb(&self.scan_root);
+        self.phase = Phase::Cleaning;
+    }
+
+    fn begin_review_cleanup(&mut self) {
+        let Some(target) = self.review_target.take() else {
+            self.phase = Phase::Review;
+            return;
+        };
+        if !self.entries.get(target).is_some_and(|entry| {
+            entry.status == CacheStatus::Review && entry.size_kb > 0 && entry.outcome.is_none()
+        }) {
+            self.phase = Phase::Review;
+            return;
+        }
+        self.cleanup_queue = vec![target];
+        self.cleanup_index = 0;
+        self.cleanup_kind = CleanupKind::ReviewData;
+        self.review_confirmation.clear();
+        self.review_confirmation_error = false;
         self.stats = CleanupStats::default();
         self.free_before_kb = free_kb(&self.scan_root);
         self.phase = Phase::Cleaning;
@@ -461,6 +711,8 @@ fn render(frame: &mut Frame<'_>, app: &App) {
 
     if app.phase == Phase::Confirm {
         render_confirmation(frame, area, app);
+    } else if app.phase == Phase::ReviewConfirm {
+        render_review_confirmation(frame, area, app);
     } else if app.phase == Phase::Details {
         render_entry_details(frame, area, app);
     }
@@ -570,6 +822,12 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
             } else {
                 "[ ]"
             }
+        } else if app.mode == Mode::Clean
+            && entry.status == CacheStatus::Review
+            && entry.size_kb > 0
+            && entry.outcome.is_none()
+        {
+            "[!]"
         } else {
             " · "
         };
@@ -622,7 +880,50 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let lines = if let Some(entry) = app.entries.get(app.cursor) {
+    let lines = if app.phase == Phase::Scanning {
+        if let Some(task) = &app.scan_task {
+            let access = if task.errors == 0 {
+                "Reading allocated filesystem blocks".to_string()
+            } else {
+                format!("Skipped {} unreadable item(s)", task.errors)
+            };
+            vec![
+                Line::from(vec![
+                    Span::styled("Current  ", Style::default().fg(app.color(Color::DarkGray))),
+                    Span::styled(
+                        task.spec.label,
+                        Style::default()
+                            .fg(app.color(Color::Cyan))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Path     ", Style::default().fg(app.color(Color::DarkGray))),
+                    Span::raw(task.spec.path.display().to_string()),
+                ]),
+                Line::from(vec![
+                    Span::styled("Progress ", Style::default().fg(app.color(Color::DarkGray))),
+                    Span::raw(format!(
+                        "{} items inspected • {} found • {} elapsed",
+                        task.inspected_items,
+                        format_kb(task.size_kb()),
+                        format_elapsed(task.started_at.elapsed()),
+                    )),
+                ]),
+                Line::from(vec![
+                    Span::styled("Access   ", Style::default().fg(app.color(Color::DarkGray))),
+                    Span::raw(access),
+                ]),
+            ]
+        } else {
+            let next = app
+                .specs
+                .get(app.scan_index)
+                .map(|spec| format!("Preparing {}…", spec.label))
+                .unwrap_or_else(|| "Finishing scan…".into());
+            vec![Line::from(next)]
+        }
+    } else if let Some(entry) = app.entries.get(app.cursor) {
         let outcome = match &entry.outcome {
             Some(CleanupOutcome::Cleared(kb)) => {
                 format!("Cleared; reclaimed about {}.", format_kb(*kb))
@@ -645,8 +946,6 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Span::raw(outcome),
             ]),
         ]
-    } else if app.phase == Phase::Scanning {
-        vec![Line::from("Scanning known waste locations…")]
     } else {
         vec![Line::from(
             "No reclaimable or app-managed storage was found. No files were changed.",
@@ -666,22 +965,38 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Phase::Location => {}
         Phase::Scanning => {
             let total = app.specs.len().max(1);
+            let current =
+                (app.scan_index + usize::from(app.scan_index < app.specs.len())).min(total);
+            let progress = if let Some(task) = &app.scan_task {
+                format!(
+                    "{current}/{total} • {} • {} items • {} • {}",
+                    task.spec.label,
+                    task.inspected_items,
+                    format_kb(task.size_kb()),
+                    format_elapsed(app.scan_started_at.elapsed()),
+                )
+            } else {
+                format!(
+                    "{current}/{total} • preparing next location • {}",
+                    format_elapsed(app.scan_started_at.elapsed())
+                )
+            };
             frame.render_widget(
                 Gauge::default()
-                    .block(block.title(" SCANNING • large folders may take a moment "))
+                    .block(block.title(" SCANNING • Esc cancel • q quit "))
                     .gauge_style(
                         Style::default()
                             .fg(app.color(Color::Cyan))
                             .add_modifier(Modifier::BOLD),
                     )
                     .ratio(app.scan_index as f64 / total as f64)
-                    .label(format!("{} / {}", app.scan_index, app.specs.len())),
+                    .label(progress),
                 area,
             );
         }
         Phase::Review => {
             let help = if app.mode == Mode::Clean {
-                "↑↓/jk move   space select   a all   enter details/continue   i reinstallables   v volume   r rescan   q quit"
+                "↑↓/jk move   space select   a all   d delete REVIEW   enter details/continue   i opt-in   v volume   r rescan   q quit"
             } else {
                 "↑↓/jk move   enter details   i reinstallables   v volume   r rescan   q quit"
             };
@@ -708,11 +1023,23 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 area,
             );
         }
+        Phase::ReviewConfirm => {
+            frame.render_widget(
+                Paragraph::new("Type DELETE to confirm this one review item, or Esc to cancel")
+                    .block(block.title(" ADVANCED REVIEW DELETION "))
+                    .alignment(Alignment::Center),
+                area,
+            );
+        }
         Phase::Cleaning => {
             let total = app.cleanup_queue.len().max(1);
+            let title = match app.cleanup_kind {
+                CleanupKind::Cache => " CLEANING • Esc/q stops after the current item ",
+                CleanupKind::ReviewData => " DELETING REVIEW DATA • permanent removal in progress ",
+            };
             frame.render_widget(
                 Gauge::default()
-                    .block(block.title(" CLEANING • q stops after the current item "))
+                    .block(block.title(title))
                     .gauge_style(
                         Style::default()
                             .fg(app.color(Color::Green))
@@ -773,7 +1100,7 @@ fn render_location_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Paragraph::new(vec![
             Line::from("Choose a disk or home directory to search for reclaimable space."),
             Line::from(Span::styled(
-                "Known caches can be selected; app-managed data is shown for review but is never deleted.",
+                "Known caches use ordinary selection; app-managed data requires a separate typed confirmation.",
                 Style::default().fg(app.color(Color::DarkGray)),
             )),
         ])
@@ -863,7 +1190,13 @@ fn render_entry_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::raw(outcome),
         ]),
         Line::from(""),
-        Line::from("Enter/Esc close details   •   q quit"),
+        Line::from(
+            if app.mode == Mode::Clean && entry.status == CacheStatus::Review {
+                "d advanced delete   •   Enter/Esc close details   •   q quit"
+            } else {
+                "Enter/Esc close details   •   q quit"
+            },
+        ),
     ];
     frame.render_widget(
         Paragraph::new(text)
@@ -873,6 +1206,78 @@ fn render_entry_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     .border_style(Style::default().fg(app.color(Color::Cyan)))
                     .title(format!(" {} ", entry.spec.label)),
             )
+            .wrap(Wrap { trim: true }),
+        popup,
+    );
+}
+
+fn render_review_confirmation(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(entry) = app.review_target.and_then(|index| app.entries.get(index)) else {
+        return;
+    };
+    let popup = centered_rect(90, 19, area);
+    frame.render_widget(Clear, popup);
+
+    let prompt_style = if app.review_confirmation_error {
+        Style::default()
+            .fg(app.color(Color::Red))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(app.color(Color::Yellow))
+            .add_modifier(Modifier::BOLD)
+    };
+    let feedback = if app.review_confirmation_error {
+        "Phrase does not match. Type DELETE exactly."
+    } else {
+        "Type DELETE, then press Enter:"
+    };
+    let text = vec![
+        Line::from(Span::styled(
+            "PERMANENTLY DELETE APP-MANAGED DATA?",
+            Style::default()
+                .fg(app.color(Color::Red))
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!(
+            "{}  •  {}",
+            entry.spec.label,
+            format_kb(entry.size_kb)
+        )),
+        Line::from(vec![
+            Span::styled("Path  ", Style::default().fg(app.color(Color::DarkGray))),
+            Span::raw(entry.spec.path.display().to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("Impact  ", Style::default().fg(app.color(Color::DarkGray))),
+            Span::raw(entry.spec.note),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Everything inside this folder will be permanently deleted. Settings, history, containers, apps, or local data may be lost.",
+            Style::default().fg(app.color(Color::Red)),
+        )),
+        Line::from("Close the related application first. The folder itself will be retained."),
+        Line::from(""),
+        Line::from(Span::styled(feedback, prompt_style)),
+        Line::from(Span::styled(
+            format!("> {}_", app.review_confirmation),
+            Style::default()
+                .fg(app.color(Color::White))
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from("Esc cancels without changing files"),
+    ];
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(app.color(Color::Red)))
+                    .title(" ADVANCED REVIEW DELETION "),
+            )
+            .alignment(Alignment::Center)
             .wrap(Wrap { trim: true }),
         popup,
     );
@@ -937,6 +1342,15 @@ fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
     })
 }
 
+fn format_elapsed(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds >= 60 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -993,6 +1407,62 @@ mod tests {
 
         assert_eq!(app.phase, Phase::Review);
         assert!(app.entries.is_empty());
+    }
+
+    #[test]
+    fn directory_scan_advances_in_bounded_visible_slices() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        for index in 0..300 {
+            fs::write(cache.join(format!("item-{index}")), [1_u8; 4_096]).unwrap();
+        }
+        let spec = CacheSpec {
+            home: temp.path().to_path_buf(),
+            path: cache,
+            label: "Test cache",
+            tier: crate::cache::CacheTier::Routine,
+            process_pattern: "",
+            note: "test data",
+        };
+        let mut scan = DirectoryScan::new(spec, CacheStatus::Ready);
+
+        let finished = scan.advance();
+
+        assert!(!finished);
+        assert!((1..=256).contains(&scan.inspected_items));
+        assert!(scan.size_kb() > 0);
+        while !scan.advance() {}
+        assert_eq!(scan.inspected_items, 300);
+    }
+
+    #[test]
+    fn escape_cancels_scan_and_returns_to_location_picker() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = Cli {
+            analyze: true,
+            clean: false,
+            include_reinstallable: false,
+            volume: Some(temp.path().to_path_buf()),
+            yes: false,
+            verbose: false,
+            no_color: true,
+            no_tui: false,
+        };
+        let mut app = App::new(&cli, temp.path()).unwrap();
+        app.entries.push(CacheEntry {
+            spec: app.specs[0].clone(),
+            status: CacheStatus::Ready,
+            size_kb: 10,
+            outcome: None,
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(app.phase, Phase::Location);
+        assert!(!app.quit);
+        assert!(app.entries.is_empty());
+        assert!(app.scan_task.is_none());
     }
 
     #[test]
@@ -1055,5 +1525,130 @@ mod tests {
 
         assert_eq!(app.phase, Phase::Confirm);
         assert!(!app.quit);
+    }
+
+    #[test]
+    fn review_deletion_requires_clean_mode_and_typed_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = Cli {
+            analyze: false,
+            clean: true,
+            include_reinstallable: false,
+            volume: None,
+            yes: false,
+            verbose: false,
+            no_color: true,
+            no_tui: false,
+        };
+        let mut app = App::new(&cli, temp.path()).unwrap();
+        let review_spec = app
+            .specs
+            .iter()
+            .find(|spec| spec.label == "Cursor user data")
+            .unwrap()
+            .clone();
+        app.entries = vec![CacheEntry {
+            spec: review_spec,
+            status: CacheStatus::Review,
+            size_kb: 10,
+            outcome: None,
+        }];
+        app.phase = Phase::Review;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert_eq!(app.phase, Phase::ReviewConfirm);
+        assert_eq!(app.review_target, Some(0));
+
+        for character in "delete".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.phase, Phase::Cleaning);
+        assert_eq!(app.cleanup_kind, CleanupKind::ReviewData);
+        assert_eq!(app.cleanup_queue, vec![0]);
+    }
+
+    #[test]
+    fn review_confirmation_prompt_is_visible_in_a_standard_terminal() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = Cli {
+            analyze: false,
+            clean: true,
+            include_reinstallable: false,
+            volume: None,
+            yes: false,
+            verbose: false,
+            no_color: true,
+            no_tui: false,
+        };
+        let mut app = App::new(&cli, temp.path()).unwrap();
+        let review_spec = app
+            .specs
+            .iter()
+            .find(|spec| spec.label == "Cursor user data")
+            .unwrap()
+            .clone();
+        app.entries = vec![CacheEntry {
+            spec: review_spec,
+            status: CacheStatus::Review,
+            size_kb: 10,
+            outcome: None,
+        }];
+        app.phase = Phase::Review;
+        app.start_review_confirmation();
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        let rendered =
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .fold(String::new(), |mut text, cell| {
+                    text.push_str(cell.symbol());
+                    text
+                });
+        assert!(rendered.contains("ADVANCED REVIEW DELETION"));
+        assert!(rendered.contains("Type DELETE"));
+        assert!(rendered.contains("> _"));
+        assert!(rendered.contains("Esc cancels"));
+    }
+
+    #[test]
+    fn review_deletion_is_unavailable_in_analyze_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = Cli {
+            analyze: true,
+            clean: false,
+            include_reinstallable: false,
+            volume: None,
+            yes: false,
+            verbose: false,
+            no_color: true,
+            no_tui: false,
+        };
+        let mut app = App::new(&cli, temp.path()).unwrap();
+        let review_spec = app
+            .specs
+            .iter()
+            .find(|spec| spec.label == "Cursor user data")
+            .unwrap()
+            .clone();
+        app.entries = vec![CacheEntry {
+            spec: review_spec,
+            status: CacheStatus::Review,
+            size_kb: 10,
+            outcome: None,
+        }];
+        app.phase = Phase::Review;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+
+        assert_eq!(app.phase, Phase::Review);
+        assert_eq!(app.review_target, None);
     }
 }

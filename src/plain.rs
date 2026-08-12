@@ -63,7 +63,7 @@ pub fn run(cli: &Cli, home: &Path) -> Result<i32, String> {
 
     if cli.mode() == Mode::Analyze {
         println!(
-            "\nNo files were changed. REVIEW items are app-managed and are never deleted by Mac Cleanup.\nRun with --clean to select eligible cache items."
+            "\nNo files were changed. REVIEW items are excluded from ordinary and unattended cleanup.\nRun the clean-mode TUI for guarded single-item review deletion."
         );
         return Ok(0);
     }

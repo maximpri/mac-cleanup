@@ -14,18 +14,14 @@ The default mode is read-only. Do not run the app with `sudo`.
 Requirements: macOS, Rust 1.88 or newer, and a normal user account.
 
 ```bash
-# Build once, then run the optimized binary
 cargo build --release
 ./target/release/mac-cleanup
-
-# Or use the source-checkout launcher (Cargo builds automatically)
-./mac-cleanup.sh
 ```
 
 Open the interactive cleanup screen with:
 
 ```bash
-./mac-cleanup.sh --clean
+./target/release/mac-cleanup --clean
 ```
 
 The app scans each allowlisted location, shows its size and safety status, and
@@ -46,6 +42,7 @@ and `.TemporaryItems`. Personal files are never inferred to be waste.
 | `↑` / `↓` or `j` / `k` | Move through findings. |
 | `Space` | Select or deselect the highlighted eligible item. |
 | `a` | Select or deselect all eligible items. |
+| `d` | Begin advanced deletion for the single highlighted `REVIEW` item (clean mode only). |
 | `i` | Toggle large reinstallable items and rescan. |
 | `v` | Return to the home/volume picker. |
 | `r` | Rescan all allowlisted locations. |
@@ -53,6 +50,10 @@ and `.TemporaryItems`. Personal files are never inferred to be waste.
 | `y` | Confirm the permanent deletion in the confirmation dialog. |
 | `n` or `Esc` | Cancel the confirmation dialog. |
 | `q` | Quit, or stop after the current item while cleaning. |
+
+While scanning, the interface reports the current location, inspected-item
+count, allocated size found so far, and elapsed time. `Esc` cancels the scan and
+returns to the location picker; `q` quits.
 
 Analysis mode supports navigation, an Enter-opened details dialog,
 reinstallable-item toggling, and rescanning, but does not expose selection or
@@ -64,8 +65,8 @@ Use the location picker in the TUI, or pass the mounted volume path explicitly
 for line-oriented output and automation:
 
 ```bash
-./mac-cleanup.sh --volume "/Volumes/Work Drive"
-./mac-cleanup.sh --analyze --no-tui --verbose --volume "/Volumes/Work Drive"
+./target/release/mac-cleanup --volume "/Volumes/Work Drive"
+./target/release/mac-cleanup --analyze --no-tui --verbose --volume "/Volumes/Work Drive"
 ```
 
 The path must be an accessible real directory, not a symlink. For example, if a
@@ -80,7 +81,7 @@ directly with `--volume` when that is the intended layout.
 | --- | --- |
 | `READY` | The directory exists and all current safeguards passed. |
 | `OPTIONAL` | Regenerable, but needs reinstallable-item opt-in. |
-| `REVIEW` | Large app-managed or personal data. Inspect it in the named app; Mac Cleanup never deletes it. |
+| `REVIEW` | Large app-managed or personal data. Excluded from ordinary and unattended cleanup; clean mode offers guarded single-item deletion. |
 | `IN USE` | A related application or package manager appears active. |
 | `SYMLINK` | The path or one of its parent components redirects elsewhere. |
 | `INVALID` | The allowlisted path is an unexpected file type. |
@@ -119,9 +120,15 @@ Large app-managed areas are also shown as `REVIEW` findings when present:
 - OrbStack containers, images, machines, and volumes
 - Telegram local account and media data
 
-These locations can contain valuable state. They are never selectable, are
-refused by both interactive and unattended cleanup, and should be reduced using
-the controls in Xcode, Cursor, OrbStack, or Telegram.
+These locations can contain valuable state. They are never included in normal
+selection, “select all,” or unattended cleanup and should preferably be reduced
+using the controls in Xcode, Cursor, OrbStack, or Telegram. Clean mode also
+offers advanced deletion for one highlighted `REVIEW` item at a time: press
+`d`, inspect the exact path and impact, then type `DELETE`. This permanently
+clears everything inside that app-managed directory and can remove settings,
+history, containers, simulator apps, or local account data. The related app
+must be closed, and the same path, symlink, type, and allowlist checks are
+repeated immediately before deletion.
 
 ## Automation and plain output
 
@@ -129,15 +136,15 @@ When input or output is redirected, the app automatically emits line-oriented
 plain text. `--no-tui` forces that behavior. Analysis remains read-only:
 
 ```bash
-./mac-cleanup.sh --analyze --no-tui --verbose
+./target/release/mac-cleanup --analyze --no-tui --verbose
 ```
 
 For unattended cleanup, `--yes` clears every currently eligible item without
 opening the TUI. Path, symlink, type, allowlist, and process checks still apply:
 
 ```bash
-./mac-cleanup.sh --clean --yes
-./mac-cleanup.sh --clean --include-reinstallable --yes
+./target/release/mac-cleanup --clean --yes
+./target/release/mac-cleanup --clean --include-reinstallable --yes
 ```
 
 Because `--yes` permanently deletes contents without individual selection,
@@ -161,7 +168,8 @@ review a fresh analysis immediately beforehand.
 ## Safety model
 
 - Analysis is the default and cannot modify files.
-- `REVIEW` findings are informational and cannot be selected or deleted.
+- `REVIEW` findings cannot enter ordinary selection or unattended cleanup.
+  Advanced TUI deletion is single-item only and requires a typed confirmation.
 - Cleanup refuses to run as root or through `sudo`.
 - Only exact known waste paths constructed for the selected location can be
   cleared.

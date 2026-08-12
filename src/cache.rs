@@ -53,7 +53,7 @@ impl CacheStatus {
             Self::Ready => "All current safeguards passed.",
             Self::Optional => "Enable reinstallable items to select this cache.",
             Self::Review => {
-                "App-managed or personal data; review it in the named app. Mac Cleanup will never delete it."
+                "App-managed or personal data; protected from ordinary cleanup. In clean mode, use the advanced single-item review deletion only if you accept losing this data."
             }
             Self::InUse => "A related application or package manager is running.",
             Self::Symlink => "The cache path redirects elsewhere and will not be touched.",
@@ -260,35 +260,35 @@ pub fn cache_specs(root: &Path) -> Vec<CacheSpec> {
             "Library/Developer/Xcode/iOS DeviceSupport",
             "Xcode device support",
             CacheTier::ReviewOnly,
-            "",
+            "/Xcode.app/|[x]codebuild",
             "old iOS support files; review Developer storage in System Settings",
         ),
         (
             "Library/Developer/CoreSimulator/Devices",
             "Simulator devices",
             CacheTier::ReviewOnly,
-            "",
+            "[S]imulator.app/|[C]oreSimulator",
             "simulators may contain apps and data; remove unneeded devices in Xcode",
         ),
         (
             "Library/Application Support/Cursor/User",
             "Cursor user data",
             CacheTier::ReviewOnly,
-            "",
+            "/Cursor.app/|[C]ursor Helper",
             "settings, workspace state, and history; review inside Cursor",
         ),
         (
             "Library/Group Containers/HUAQ24HBR6.dev.orbstack/data",
             "OrbStack data",
             CacheTier::ReviewOnly,
-            "",
+            "/OrbStack.app/|[o]rbstack",
             "containers, images, machines, and volumes; reclaim through OrbStack",
         ),
         (
             "Library/Group Containers/6N38VWS5BX.ru.keepcoder.Telegram/stable",
             "Telegram local data",
             CacheTier::ReviewOnly,
-            "",
+            "/Telegram.app/Contents/MacOS/Telegram",
             "local account and media data; use Telegram's Storage Usage controls",
         ),
     ];
@@ -464,7 +464,7 @@ pub fn clean_cache(
 ) -> CleanupOutcome {
     if entry.spec.tier == CacheTier::ReviewOnly {
         let outcome = CleanupOutcome::SafetySkipped(
-            "review-only storage is never deleted by Mac Cleanup".into(),
+            "review-only storage is excluded from ordinary cleanup".into(),
         );
         entry.status = CacheStatus::Review;
         entry.outcome = Some(outcome.clone());
@@ -499,6 +499,56 @@ pub fn clean_cache(
             let removed = size_before.saturating_sub(directory_kb(&entry.spec.path));
             entry.size_kb = directory_kb(&entry.spec.path);
             CleanupOutcome::Cleared(removed)
+        }
+        Err(error) => CleanupOutcome::Failed(error.to_string()),
+    };
+    entry.outcome = Some(outcome.clone());
+    outcome
+}
+
+/// Permanently clear one explicitly confirmed review-only directory.
+///
+/// This is deliberately separate from `clean_cache` so review data can never
+/// enter ordinary multi-select or unattended cleanup. The TUI calls it only
+/// after a per-item typed confirmation.
+pub fn clean_review_data(entry: &mut CacheEntry, allowlist: &[PathBuf]) -> CleanupOutcome {
+    if entry.spec.tier != CacheTier::ReviewOnly {
+        let outcome = CleanupOutcome::SafetySkipped(
+            "advanced review deletion only accepts review-only storage".into(),
+        );
+        entry.outcome = Some(outcome.clone());
+        return outcome;
+    }
+
+    let current_status = status_for(&entry.spec, false);
+    if current_status != CacheStatus::Review {
+        let outcome =
+            CleanupOutcome::SafetySkipped(format!("status changed to {}", current_status.label()));
+        entry.status = current_status;
+        entry.outcome = Some(outcome.clone());
+        return outcome;
+    }
+
+    if process_is_running(entry.spec.process_pattern) {
+        let outcome = CleanupOutcome::SafetySkipped(
+            "the related application is running; close it before deleting its data".into(),
+        );
+        entry.outcome = Some(outcome.clone());
+        return outcome;
+    }
+
+    let size_before = directory_kb(&entry.spec.path);
+    if size_before == 0 {
+        let outcome = CleanupOutcome::SafetySkipped("already empty".into());
+        entry.outcome = Some(outcome.clone());
+        return outcome;
+    }
+
+    let outcome = match clear_directory_contents(&entry.spec.path, allowlist, &entry.spec.home) {
+        Ok(()) => {
+            let size_after = directory_kb(&entry.spec.path);
+            entry.size_kb = size_after;
+            CleanupOutcome::Cleared(size_before.saturating_sub(size_after))
         }
         Err(error) => CleanupOutcome::Failed(error.to_string()),
     };
@@ -950,7 +1000,7 @@ mod tests {
     }
 
     #[test]
-    fn review_only_storage_can_never_be_cleaned() {
+    fn review_only_storage_is_refused_by_ordinary_cleanup() {
         let temp = tempfile::tempdir().unwrap();
         let managed = temp.path().join("managed");
         fs::create_dir(&managed).unwrap();
@@ -978,6 +1028,37 @@ mod tests {
         assert!(matches!(outcome, CleanupOutcome::SafetySkipped(_)));
         assert!(managed.join("keep-me").exists());
         assert_eq!(entry.status, CacheStatus::Review);
+    }
+
+    #[test]
+    fn explicitly_confirmed_review_cleanup_clears_contents_but_keeps_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let managed = temp.path().join("managed");
+        fs::create_dir(&managed).unwrap();
+        fs::File::create(managed.join("delete-me"))
+            .unwrap()
+            .write_all(&[1; 8_192])
+            .unwrap();
+        let mut entry = CacheEntry {
+            spec: CacheSpec {
+                home: temp.path().to_path_buf(),
+                path: managed.clone(),
+                label: "Managed data",
+                tier: CacheTier::ReviewOnly,
+                process_pattern: "",
+                note: "contains app state",
+            },
+            status: CacheStatus::Review,
+            size_kb: directory_kb(&managed),
+            outcome: None,
+        };
+
+        let outcome = clean_review_data(&mut entry, std::slice::from_ref(&managed));
+
+        assert!(matches!(outcome, CleanupOutcome::Cleared(kb) if kb > 0));
+        assert!(managed.is_dir());
+        assert_eq!(fs::read_dir(&managed).unwrap().count(), 0);
+        assert_eq!(entry.size_kb, 0);
     }
 
     #[test]
