@@ -66,9 +66,10 @@ default. Personal files are never inferred to be waste.
 
 While scanning, the interface reports the current location, inspected-item
 count, allocated size found so far, and elapsed time. The bar animates smoothly
-through the active category but does not cross the next category boundary until
-that work finishes. `Esc` cancels the scan and returns to the location picker;
-`q` quits.
+from zero through the active category but does not cross the next category
+boundary until that work finishes. Its counter reports completed categories, so
+a new scan begins at `0/total`. `Esc` cancels the scan and returns to the
+location picker; `q` quits.
 
 After cleanup, the final summary closes automatically after five seconds.
 Press `Enter`, `q`, or `Esc` to close it immediately.

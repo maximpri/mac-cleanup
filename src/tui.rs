@@ -1099,11 +1099,10 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Phase::Location => {}
         Phase::Scanning => {
             let total = app.specs.len().max(1);
-            let current =
-                (app.scan_index + usize::from(app.scan_index < app.specs.len())).min(total);
+            let completed = app.scan_index.min(total);
             let progress = if let Some(task) = &app.scan_task {
                 format!(
-                    "{}  {current}/{total} • {} • {} items • {} • {}",
+                    "{}  {completed}/{total} • {} • {} items • {} • {}",
                     scan_spinner(task.started_at.elapsed()),
                     task.spec.label,
                     task.inspected_items,
@@ -1112,7 +1111,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 )
             } else {
                 format!(
-                    "{}  {current}/{total} • preparing next location • {}",
+                    "{}  {completed}/{total} • preparing next location • {}",
                     scan_spinner(app.scan_started_at.elapsed()),
                     format_elapsed(app.scan_started_at.elapsed())
                 )
@@ -1542,11 +1541,10 @@ fn smooth_scan_ratio(completed: usize, total: usize, active_elapsed: Option<Dura
     }
 
     let active_fraction = active_elapsed.map_or(0.0, |elapsed| {
-        const INITIAL_ACTIVITY: f64 = 0.04;
         const ACTIVE_CAP: f64 = 0.94;
         const EASING_SECONDS: f64 = 24.0;
         let eased = 1.0 - (-elapsed.as_secs_f64() / EASING_SECONDS).exp();
-        INITIAL_ACTIVITY + (ACTIVE_CAP - INITIAL_ACTIVITY) * eased
+        ACTIVE_CAP * eased
     });
     ((completed as f64 + active_fraction) / total as f64).clamp(0.0, 1.0)
 }
@@ -1746,14 +1744,16 @@ mod tests {
 
     #[test]
     fn active_scan_progress_moves_smoothly_without_claiming_completion() {
+        let initial = smooth_scan_ratio(0, 7, Some(Duration::ZERO));
         let completed_boundary = smooth_scan_ratio(1, 7, None);
         let just_started = smooth_scan_ratio(1, 7, Some(Duration::ZERO));
         let after_ten_seconds = smooth_scan_ratio(1, 7, Some(Duration::from_secs(10)));
         let after_two_minutes = smooth_scan_ratio(1, 7, Some(Duration::from_secs(120)));
         let next_boundary = 2.0 / 7.0;
 
+        assert_eq!(initial, 0.0);
         assert_eq!(completed_boundary, 1.0 / 7.0);
-        assert!(just_started > completed_boundary);
+        assert_eq!(just_started, completed_boundary);
         assert!(after_ten_seconds > just_started);
         assert!(after_two_minutes > after_ten_seconds);
         assert!(after_two_minutes < next_boundary);
