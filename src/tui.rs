@@ -969,7 +969,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 (app.scan_index + usize::from(app.scan_index < app.specs.len())).min(total);
             let progress = if let Some(task) = &app.scan_task {
                 format!(
-                    "{current}/{total} • {} • {} items • {} • {}",
+                    "{}  {current}/{total} • {} • {} items • {} • {}",
+                    scan_spinner(task.started_at.elapsed()),
                     task.spec.label,
                     task.inspected_items,
                     format_kb(task.size_kb()),
@@ -977,19 +978,25 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 )
             } else {
                 format!(
-                    "{current}/{total} • preparing next location • {}",
+                    "{}  {current}/{total} • preparing next location • {}",
+                    scan_spinner(app.scan_started_at.elapsed()),
                     format_elapsed(app.scan_started_at.elapsed())
                 )
             };
+            let ratio = smooth_scan_ratio(
+                app.scan_index,
+                total,
+                app.scan_task.as_ref().map(|task| task.started_at.elapsed()),
+            );
             frame.render_widget(
                 Gauge::default()
-                    .block(block.title(" SCANNING • Esc cancel • q quit "))
+                    .block(block.title(" SCANNING • live progress • Esc cancel • q quit "))
                     .gauge_style(
                         Style::default()
                             .fg(app.color(Color::Cyan))
                             .add_modifier(Modifier::BOLD),
                     )
-                    .ratio(app.scan_index as f64 / total as f64)
+                    .ratio(ratio)
                     .label(progress),
                 area,
             );
@@ -1351,6 +1358,32 @@ fn format_elapsed(duration: Duration) -> String {
     }
 }
 
+/// Smoothly fills the active category's slice while preserving the exact
+/// completed-category boundaries. Directory traversal cannot know its total
+/// item count without doing an expensive first pass, so the active slice eases
+/// toward (but never reaches) its boundary until the category really finishes.
+fn smooth_scan_ratio(completed: usize, total: usize, active_elapsed: Option<Duration>) -> f64 {
+    let total = total.max(1);
+    if completed >= total {
+        return 1.0;
+    }
+
+    let active_fraction = active_elapsed.map_or(0.0, |elapsed| {
+        const INITIAL_ACTIVITY: f64 = 0.04;
+        const ACTIVE_CAP: f64 = 0.94;
+        const EASING_SECONDS: f64 = 24.0;
+        let eased = 1.0 - (-elapsed.as_secs_f64() / EASING_SECONDS).exp();
+        INITIAL_ACTIVITY + (ACTIVE_CAP - INITIAL_ACTIVITY) * eased
+    });
+    ((completed as f64 + active_fraction) / total as f64).clamp(0.0, 1.0)
+}
+
+fn scan_spinner(elapsed: Duration) -> &'static str {
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let frame = (elapsed.as_millis() / 80) as usize % FRAMES.len();
+    FRAMES[frame]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1434,6 +1467,30 @@ mod tests {
         assert!(scan.size_kb() > 0);
         while !scan.advance() {}
         assert_eq!(scan.inspected_items, 300);
+    }
+
+    #[test]
+    fn active_scan_progress_moves_smoothly_without_claiming_completion() {
+        let completed_boundary = smooth_scan_ratio(1, 7, None);
+        let just_started = smooth_scan_ratio(1, 7, Some(Duration::ZERO));
+        let after_ten_seconds = smooth_scan_ratio(1, 7, Some(Duration::from_secs(10)));
+        let after_two_minutes = smooth_scan_ratio(1, 7, Some(Duration::from_secs(120)));
+        let next_boundary = 2.0 / 7.0;
+
+        assert_eq!(completed_boundary, 1.0 / 7.0);
+        assert!(just_started > completed_boundary);
+        assert!(after_ten_seconds > just_started);
+        assert!(after_two_minutes > after_ten_seconds);
+        assert!(after_two_minutes < next_boundary);
+        assert_eq!(smooth_scan_ratio(7, 7, None), 1.0);
+    }
+
+    #[test]
+    fn scan_activity_spinner_advances_independently_of_category_completion() {
+        assert_ne!(
+            scan_spinner(Duration::ZERO),
+            scan_spinner(Duration::from_millis(80))
+        );
     }
 
     #[test]

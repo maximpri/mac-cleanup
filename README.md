@@ -52,8 +52,10 @@ and `.TemporaryItems`. Personal files are never inferred to be waste.
 | `q` | Quit, or stop after the current item while cleaning. |
 
 While scanning, the interface reports the current location, inspected-item
-count, allocated size found so far, and elapsed time. `Esc` cancels the scan and
-returns to the location picker; `q` quits.
+count, allocated size found so far, and elapsed time. The bar animates smoothly
+through the active category but does not cross the next category boundary until
+that work finishes. `Esc` cancels the scan and returns to the location picker;
+`q` quits.
 
 Analysis mode supports navigation, an Enter-opened details dialog,
 reinstallable-item toggling, and rescanning, but does not expose selection or
