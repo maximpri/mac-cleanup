@@ -8,12 +8,12 @@ fn main() -> ExitCode {
     let home = match validate_environment() {
         Ok(home) => home,
         Err(error) => {
-            eprintln!("Error: {error}.");
+            print_error(&cli, &error);
             return ExitCode::FAILURE;
         }
     };
 
-    let result = if !cli.no_tui && !cli.yes && tui::can_run() {
+    let result = if !cli.json && !cli.no_tui && !cli.yes && tui::can_run() {
         tui::run(&cli, &home)
     } else {
         plain::run(&cli, &home)
@@ -22,8 +22,22 @@ fn main() -> ExitCode {
     match result {
         Ok(code) => ExitCode::from(code as u8),
         Err(error) => {
-            eprintln!("Error: {error}.");
+            print_error(&cli, &error);
             ExitCode::FAILURE
         }
+    }
+}
+
+fn print_error(cli: &Cli, error: &str) {
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema_version": 1,
+                "error": error,
+            })
+        );
+    } else {
+        eprintln!("Error: {error}.");
     }
 }

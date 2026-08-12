@@ -4,6 +4,14 @@ use std::{
     process::{Command, Stdio},
 };
 
+const DF_COMMAND: &str = "/bin/df";
+const DSCL_COMMAND: &str = "/usr/bin/dscl";
+const DU_COMMAND: &str = "/usr/bin/du";
+const ID_COMMAND: &str = "/usr/bin/id";
+const PGREP_COMMAND: &str = "/usr/bin/pgrep";
+const DISKUTIL_COMMAND: &str = "/usr/sbin/diskutil";
+const MOUNT_COMMAND: &str = "/sbin/mount";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheTier {
     Routine,
@@ -30,6 +38,7 @@ pub enum CacheStatus {
     Optional,
     Review,
     InUse,
+    ScanError,
     Symlink,
     Invalid,
     Missing,
@@ -42,6 +51,7 @@ impl CacheStatus {
             Self::Optional => "OPTIONAL",
             Self::Review => "REVIEW",
             Self::InUse => "IN USE",
+            Self::ScanError => "SCAN ERROR",
             Self::Symlink => "SYMLINK",
             Self::Invalid => "INVALID",
             Self::Missing => "MISSING",
@@ -56,6 +66,9 @@ impl CacheStatus {
                 "App-managed or personal data; protected from ordinary cleanup. In clean mode, use the advanced single-item review deletion only if you accept losing this data."
             }
             Self::InUse => "A related application or package manager is running.",
+            Self::ScanError => {
+                "The directory or a required safety check could not be read completely. It will not be cleaned. macOS-protected user data may require Full Disk Access for the terminal."
+            }
             Self::Symlink => "The cache path redirects elsewhere and will not be touched.",
             Self::Invalid => "The allowlisted path is not a directory.",
             Self::Missing => "No cache directory exists at this location.",
@@ -75,7 +88,7 @@ pub struct CacheEntry {
 pub enum CleanupOutcome {
     Cleared(u64),
     SafetySkipped(String),
-    Failed(String),
+    Failed { error: String, removed_kb: u64 },
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -91,6 +104,24 @@ pub struct CleanupStats {
 pub struct ScanLocation {
     pub label: String,
     pub path: PathBuf,
+    pub kind: ScanLocationKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ScanLocationKind {
+    Local,
+    Usb,
+    Network,
+}
+
+impl ScanLocationKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Local => "LOCAL",
+            Self::Usb => "USB",
+            Self::Network => "NETWORK",
+        }
+    }
 }
 
 pub fn cache_specs(root: &Path) -> Vec<CacheSpec> {
@@ -159,6 +190,27 @@ pub fn cache_specs(root: &Path) -> Vec<CacheSpec> {
             "browser and app cache data reloads",
         ),
         (
+            "Library/Caches/com.apple.Safari",
+            "Safari cache",
+            CacheTier::Routine,
+            "/Safari.app/Contents/MacOS/Safari",
+            "website cache reloads; profiles and browsing data remain",
+        ),
+        (
+            "Library/Caches/Firefox",
+            "Firefox cache",
+            CacheTier::Routine,
+            "/Firefox.app/Contents/MacOS/firefox",
+            "website cache reloads; profiles and browsing data remain",
+        ),
+        (
+            "Library/Caches/Adobe",
+            "Adobe app cache",
+            CacheTier::Routine,
+            "[A]dobe|[P]hotoshop|[I]llustrator|[P]remiere|[A]fter Effects|[L]ightroom",
+            "Adobe applications regenerate cached files",
+        ),
+        (
             ".npm/_cacache",
             "npm package cache",
             CacheTier::Routine,
@@ -208,6 +260,13 @@ pub fn cache_specs(root: &Path) -> Vec<CacheSpec> {
             "simulator cache data will be regenerated",
         ),
         (
+            "Library/Caches/org.swift.swiftpm",
+            "SwiftPM cache",
+            CacheTier::Reinstallable,
+            "[s]wift (build|package|run|test)|[s]wift-(build|package)",
+            "package metadata and downloads will be regenerated",
+        ),
+        (
             "Library/Caches/ms-playwright",
             "Playwright browsers",
             CacheTier::Reinstallable,
@@ -250,6 +309,20 @@ pub fn cache_specs(root: &Path) -> Vec<CacheSpec> {
             "dependencies and build tooling download again",
         ),
         (
+            "Library/Caches/CocoaPods",
+            "CocoaPods cache",
+            CacheTier::Reinstallable,
+            "[/ ]pod (cache|install|repo|update)",
+            "downloaded Pods install again",
+        ),
+        (
+            "Library/Caches/Cypress",
+            "Cypress runtimes",
+            CacheTier::Reinstallable,
+            "[c]ypress",
+            "Cypress application binaries download again",
+        ),
+        (
             ".cache/huggingface/hub",
             "Hugging Face models",
             CacheTier::Reinstallable,
@@ -262,6 +335,13 @@ pub fn cache_specs(root: &Path) -> Vec<CacheSpec> {
             CacheTier::ReviewOnly,
             "/Xcode.app/|[x]codebuild",
             "old iOS support files; review Developer storage in System Settings",
+        ),
+        (
+            "Library/Developer/Xcode/Archives",
+            "Xcode archives",
+            CacheTier::ReviewOnly,
+            "/Xcode.app/|[x]codebuild",
+            "signed build archives may be needed for distribution or symbolication",
         ),
         (
             "Library/Developer/CoreSimulator/Devices",
@@ -316,12 +396,13 @@ pub fn scan_specs(scan_root: &Path, account_home: &Path) -> Vec<CacheSpec> {
     if paths_match(scan_root, account_home) {
         return cache_specs(account_home);
     }
+    if looks_like_home(scan_root) {
+        return cache_specs(scan_root);
+    }
 
     let mut specs = volume_specs(scan_root);
     let home_on_volume = if scan_root == Path::new("/") {
         Some(account_home.to_path_buf())
-    } else if looks_like_home(scan_root) {
-        Some(scan_root.to_path_buf())
     } else {
         account_home.file_name().and_then(|account_name| {
             let candidate = scan_root.join("Users").join(account_name);
@@ -417,14 +498,20 @@ fn paths_match(left: &Path, right: &Path) -> bool {
 }
 
 pub fn scan_cache(spec: &CacheSpec, include_reinstallable: bool) -> CacheEntry {
-    let status = status_for(spec, include_reinstallable);
+    let mut status = status_for(spec, include_reinstallable);
     let size_kb = if matches!(
         status,
-        CacheStatus::Missing | CacheStatus::Symlink | CacheStatus::Invalid
+        CacheStatus::Missing | CacheStatus::ScanError | CacheStatus::Symlink | CacheStatus::Invalid
     ) {
         0
     } else {
-        directory_kb(&spec.path)
+        match try_directory_kb(&spec.path) {
+            Ok(size_kb) => size_kb,
+            Err(_) => {
+                status = CacheStatus::ScanError;
+                0
+            }
+        }
     };
 
     CacheEntry {
@@ -446,14 +533,21 @@ pub fn status_for(spec: &CacheSpec, include_reinstallable: bool) -> CacheStatus 
         CacheStatus::Symlink
     } else if !metadata.is_dir() {
         CacheStatus::Invalid
+    } else if fs::read_dir(&spec.path).is_err() {
+        CacheStatus::ScanError
     } else if spec.tier == CacheTier::ReviewOnly {
         CacheStatus::Review
-    } else if process_is_running(spec.process_pattern) {
-        CacheStatus::InUse
-    } else if spec.tier == CacheTier::Reinstallable && !include_reinstallable {
-        CacheStatus::Optional
     } else {
-        CacheStatus::Ready
+        match related_process_state(spec.process_pattern) {
+            ProcessState::Running => CacheStatus::InUse,
+            ProcessState::CheckFailed => CacheStatus::ScanError,
+            ProcessState::NotRunning
+                if spec.tier == CacheTier::Reinstallable && !include_reinstallable =>
+            {
+                CacheStatus::Optional
+            }
+            ProcessState::NotRunning => CacheStatus::Ready,
+        }
     }
 }
 
@@ -480,27 +574,56 @@ pub fn clean_cache(
         return outcome;
     }
 
-    let size_before = directory_kb(&entry.spec.path);
+    let size_before = match try_directory_kb(&entry.spec.path) {
+        Ok(size_kb) => size_kb,
+        Err(error) => {
+            let outcome = CleanupOutcome::SafetySkipped(format!(
+                "could not measure the directory safely: {error}"
+            ));
+            entry.status = CacheStatus::ScanError;
+            entry.outcome = Some(outcome.clone());
+            return outcome;
+        }
+    };
     if size_before == 0 {
         let outcome = CleanupOutcome::SafetySkipped("already empty".into());
         entry.outcome = Some(outcome.clone());
         return outcome;
     }
 
-    if process_is_running(entry.spec.process_pattern) {
-        let outcome = CleanupOutcome::SafetySkipped("a related process just started".into());
-        entry.status = CacheStatus::InUse;
-        entry.outcome = Some(outcome.clone());
-        return outcome;
+    match related_process_state(entry.spec.process_pattern) {
+        ProcessState::Running => {
+            let outcome = CleanupOutcome::SafetySkipped("a related process just started".into());
+            entry.status = CacheStatus::InUse;
+            entry.outcome = Some(outcome.clone());
+            return outcome;
+        }
+        ProcessState::CheckFailed => {
+            let outcome = CleanupOutcome::SafetySkipped(
+                "could not verify that related applications are closed".into(),
+            );
+            entry.status = CacheStatus::ScanError;
+            entry.outcome = Some(outcome.clone());
+            return outcome;
+        }
+        ProcessState::NotRunning => {}
     }
 
     let outcome = match clear_directory_contents(&entry.spec.path, allowlist, &entry.spec.home) {
         Ok(()) => {
-            let removed = size_before.saturating_sub(directory_kb(&entry.spec.path));
-            entry.size_kb = directory_kb(&entry.spec.path);
+            let size_after = directory_kb(&entry.spec.path);
+            let removed = size_before.saturating_sub(size_after);
+            entry.size_kb = size_after;
             CleanupOutcome::Cleared(removed)
         }
-        Err(error) => CleanupOutcome::Failed(error.to_string()),
+        Err(error) => {
+            let size_after = try_directory_kb(&entry.spec.path).unwrap_or(size_before);
+            entry.size_kb = size_after;
+            CleanupOutcome::Failed {
+                error: error.to_string(),
+                removed_kb: size_before.saturating_sub(size_after),
+            }
+        }
     };
     entry.outcome = Some(outcome.clone());
     outcome
@@ -529,15 +652,36 @@ pub fn clean_review_data(entry: &mut CacheEntry, allowlist: &[PathBuf]) -> Clean
         return outcome;
     }
 
-    if process_is_running(entry.spec.process_pattern) {
-        let outcome = CleanupOutcome::SafetySkipped(
-            "the related application is running; close it before deleting its data".into(),
-        );
-        entry.outcome = Some(outcome.clone());
-        return outcome;
+    match related_process_state(entry.spec.process_pattern) {
+        ProcessState::Running => {
+            let outcome = CleanupOutcome::SafetySkipped(
+                "the related application is running; close it before deleting its data".into(),
+            );
+            entry.outcome = Some(outcome.clone());
+            return outcome;
+        }
+        ProcessState::CheckFailed => {
+            let outcome = CleanupOutcome::SafetySkipped(
+                "could not verify that the related application is closed".into(),
+            );
+            entry.status = CacheStatus::ScanError;
+            entry.outcome = Some(outcome.clone());
+            return outcome;
+        }
+        ProcessState::NotRunning => {}
     }
 
-    let size_before = directory_kb(&entry.spec.path);
+    let size_before = match try_directory_kb(&entry.spec.path) {
+        Ok(size_kb) => size_kb,
+        Err(error) => {
+            let outcome = CleanupOutcome::SafetySkipped(format!(
+                "could not measure the directory safely: {error}"
+            ));
+            entry.status = CacheStatus::ScanError;
+            entry.outcome = Some(outcome.clone());
+            return outcome;
+        }
+    };
     if size_before == 0 {
         let outcome = CleanupOutcome::SafetySkipped("already empty".into());
         entry.outcome = Some(outcome.clone());
@@ -550,7 +694,14 @@ pub fn clean_review_data(entry: &mut CacheEntry, allowlist: &[PathBuf]) -> Clean
             entry.size_kb = size_after;
             CleanupOutcome::Cleared(size_before.saturating_sub(size_after))
         }
-        Err(error) => CleanupOutcome::Failed(error.to_string()),
+        Err(error) => {
+            let size_after = try_directory_kb(&entry.spec.path).unwrap_or(size_before);
+            entry.size_kb = size_after;
+            CleanupOutcome::Failed {
+                error: error.to_string(),
+                removed_kb: size_before.saturating_sub(size_after),
+            }
+        }
     };
     entry.outcome = Some(outcome.clone());
     outcome
@@ -579,39 +730,74 @@ pub fn clear_directory_contents(
         ));
     }
 
-    for item in fs::read_dir(target)? {
-        let path = item?.path();
-        let item_metadata = fs::symlink_metadata(&path)?;
-        if item_metadata.is_dir() && !item_metadata.file_type().is_symlink() {
-            fs::remove_dir_all(path)?;
+    let resolved_root = root.canonicalize()?;
+    let resolved_target = target.canonicalize()?;
+    if resolved_target == resolved_root || !resolved_target.starts_with(&resolved_root) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "target is not a strict descendant of the safety root: {}",
+                target.display()
+            ),
+        ));
+    }
+
+    for (completely_removed, item) in fs::read_dir(target)?.enumerate() {
+        let path = item
+            .map_err(|error| cleanup_progress_error(error, completely_removed))?
+            .path();
+        let item_metadata = fs::symlink_metadata(&path)
+            .map_err(|error| cleanup_progress_error(error, completely_removed))?;
+        let result = if item_metadata.is_dir() && !item_metadata.file_type().is_symlink() {
+            fs::remove_dir_all(path)
         } else {
-            fs::remove_file(path)?;
-        }
+            fs::remove_file(path)
+        };
+        result.map_err(|error| cleanup_progress_error(error, completely_removed))?;
     }
     Ok(())
 }
 
+fn cleanup_progress_error(error: io::Error, completely_removed: usize) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!(
+            "cleanup may be partial; removed {completely_removed} complete top-level item(s) before the error: {error}"
+        ),
+    )
+}
+
 pub fn directory_kb(path: &Path) -> u64 {
-    if fs::symlink_metadata(path)
-        .map(|metadata| metadata.file_type().is_symlink() || !metadata.is_dir())
-        .unwrap_or(true)
-    {
-        return 0;
+    try_directory_kb(path).unwrap_or(0)
+}
+
+fn try_directory_kb(path: &Path) -> io::Result<u64> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path is not a real directory: {}", path.display()),
+        ));
     }
 
-    Command::new("du")
-        .args(["-sk"])
-        .arg(path)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .and_then(|line| line.split_whitespace().next()?.parse().ok())
-        .unwrap_or(0)
+    let output = Command::new(DU_COMMAND).args(["-sk"]).arg(path).output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "{DU_COMMAND} could not read {}",
+            path.display()
+        )));
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "du returned non-UTF-8 output"))?;
+    text.split_whitespace()
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "du returned no size"))?
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "du returned an invalid size"))
 }
 
 pub fn free_kb(root: &Path) -> u64 {
-    Command::new("df")
+    Command::new(DF_COMMAND)
         .args(["-k"])
         .arg(root)
         .output()
@@ -633,13 +819,30 @@ pub fn format_kb(kb: u64) -> String {
 }
 
 pub fn process_is_running(pattern: &str) -> bool {
-    !pattern.is_empty()
-        && Command::new("pgrep")
-            .args(["-f", pattern])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
+    !matches!(related_process_state(pattern), ProcessState::NotRunning)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessState {
+    NotRunning,
+    Running,
+    CheckFailed,
+}
+
+fn related_process_state(pattern: &str) -> ProcessState {
+    if pattern.is_empty() {
+        return ProcessState::NotRunning;
+    }
+    match Command::new(PGREP_COMMAND)
+        .args(["-f", pattern])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => ProcessState::Running,
+        Ok(status) if status.code() == Some(1) => ProcessState::NotRunning,
+        Ok(_) | Err(_) => ProcessState::CheckFailed,
+    }
 }
 
 fn has_symlink_component_below(path: &Path, root: &Path) -> bool {
@@ -678,15 +881,17 @@ pub fn scan_locations(home: &Path) -> Vec<ScanLocation> {
     scan_locations_in(home, Path::new("/Volumes"), true)
 }
 
+pub fn scan_location_kind(path: &Path) -> ScanLocationKind {
+    let filesystem = mounted_filesystem(path);
+    classify_scan_location(disk_info(path).as_deref(), filesystem.as_deref())
+}
+
 fn scan_locations_in(
     home: &Path,
     volumes_dir: &Path,
     include_startup_volume: bool,
 ) -> Vec<ScanLocation> {
-    let mut locations = vec![ScanLocation {
-        label: "Home directory".into(),
-        path: home.to_path_buf(),
-    }];
+    let mut locations = Vec::new();
 
     if include_startup_volume {
         push_unique_location(
@@ -694,9 +899,19 @@ fn scan_locations_in(
             ScanLocation {
                 label: "Startup volume".into(),
                 path: PathBuf::from("/"),
+                kind: ScanLocationKind::Local,
             },
         );
     }
+
+    push_unique_location(
+        &mut locations,
+        ScanLocation {
+            label: "Home directory".into(),
+            path: home.to_path_buf(),
+            kind: ScanLocationKind::Local,
+        },
+    );
 
     let mut mounted = fs::read_dir(volumes_dir)
         .into_iter()
@@ -710,15 +925,88 @@ fn scan_locations_in(
             }
             Some(ScanLocation {
                 label: entry.file_name().to_string_lossy().into_owned(),
+                kind: scan_location_kind(&path),
                 path,
             })
         })
         .collect::<Vec<_>>();
-    mounted.sort_by_key(|location| location.label.to_lowercase());
+    mounted.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.label.to_lowercase().cmp(&right.label.to_lowercase()))
+    });
     for location in mounted {
         push_unique_location(&mut locations, location);
     }
     locations
+}
+
+fn classify_scan_location(
+    disk_info: Option<&str>,
+    filesystem_type: Option<&str>,
+) -> ScanLocationKind {
+    if filesystem_type.is_some_and(is_network_filesystem) {
+        return ScanLocationKind::Network;
+    }
+    if disk_info
+        .and_then(|info| plist_string(info, "BusProtocol"))
+        .is_some_and(|protocol| protocol.eq_ignore_ascii_case("USB"))
+    {
+        return ScanLocationKind::Usb;
+    }
+    ScanLocationKind::Local
+}
+
+fn is_network_filesystem(filesystem_type: &str) -> bool {
+    matches!(
+        filesystem_type.to_ascii_lowercase().as_str(),
+        "afpfs" | "autofs" | "cifs" | "fuse.sshfs" | "nfs" | "smbfs" | "sshfs" | "webdav"
+    )
+}
+
+fn disk_info(path: &Path) -> Option<String> {
+    let output = Command::new(DISKUTIL_COMMAND)
+        .args(["info", "-plist"])
+        .arg(path)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8(output.stdout).ok())
+        .flatten()
+}
+
+fn mounted_filesystem(path: &Path) -> Option<String> {
+    let output = Command::new(MOUNT_COMMAND).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mounts = String::from_utf8(output.stdout).ok()?;
+    mounted_filesystem_from_output(&mounts, path)
+}
+
+fn mounted_filesystem_from_output(output: &str, path: &Path) -> Option<String> {
+    let expected_mount = path.to_string_lossy();
+    output.lines().find_map(|line| {
+        let (mount_description, options) = line.rsplit_once(" (")?;
+        let (_, mount_point) = mount_description.rsplit_once(" on ")?;
+        if mount_point != expected_mount {
+            return None;
+        }
+        options
+            .strip_suffix(')')?
+            .split(',')
+            .next()
+            .map(|filesystem| filesystem.trim().to_string())
+    })
+}
+
+fn plist_string<'a>(plist: &'a str, key: &str) -> Option<&'a str> {
+    let key_marker = format!("<key>{key}</key>");
+    let value = plist.split_once(&key_marker)?.1;
+    let value = value.split_once("<string>")?.1;
+    value.split_once("</string>").map(|(value, _)| value.trim())
 }
 
 fn push_unique_location(locations: &mut Vec<ScanLocation>, location: ScanLocation) {
@@ -742,23 +1030,19 @@ fn push_unique_location(locations: &mut Vec<ScanLocation>, location: ScanLocatio
 }
 
 pub fn validate_environment() -> Result<PathBuf, String> {
-    let testing = env::var("MAC_CLEANUP_TESTING").is_ok_and(|value| value == "1");
-    if !testing && env::consts::OS != "macos" {
+    if env::consts::OS != "macos" {
         return Err("this application is intended for macOS".into());
     }
 
-    if !testing && effective_user_id() == Some(0) {
+    let user_id = effective_user_id()
+        .ok_or_else(|| "could not determine the effective user ID safely".to_string())?;
+    if user_id == 0 {
         return Err("do not run this application with sudo or as root".into());
     }
 
-    let home = if testing {
-        env::var_os("MAC_CLEANUP_TEST_HOME")
-            .or_else(|| env::var_os("HOME"))
-            .map(PathBuf::from)
-    } else {
-        account_home().or_else(|| env::var_os("HOME").map(PathBuf::from))
-    }
-    .ok_or_else(|| "could not determine the current account's home directory".to_string())?;
+    let home = account_home()
+        .or_else(|| env::var_os("HOME").map(PathBuf::from))
+        .ok_or_else(|| "could not determine the current account's home directory".to_string())?;
 
     if home == Path::new("/") || !home.is_dir() {
         return Err(format!(
@@ -766,11 +1050,11 @@ pub fn validate_environment() -> Result<PathBuf, String> {
             home.display()
         ));
     }
-    Ok(home)
+    validate_scan_root(&home).map_err(|error| format!("invalid home directory: {error}"))
 }
 
 fn effective_user_id() -> Option<u32> {
-    Command::new("id")
+    Command::new(ID_COMMAND)
         .arg("-u")
         .output()
         .ok()
@@ -780,7 +1064,7 @@ fn effective_user_id() -> Option<u32> {
 }
 
 fn account_home() -> Option<PathBuf> {
-    let user = Command::new("id")
+    let user = Command::new(ID_COMMAND)
         .arg("-un")
         .output()
         .ok()
@@ -788,7 +1072,7 @@ fn account_home() -> Option<PathBuf> {
         .and_then(|output| String::from_utf8(output.stdout).ok())?;
     let user = user.trim();
 
-    let output = Command::new("dscl")
+    let output = Command::new(DSCL_COMMAND)
         .args([".", "-read", &format!("/Users/{user}"), "NFSHomeDirectory"])
         .output()
         .ok()?;
@@ -796,7 +1080,14 @@ fn account_home() -> Option<PathBuf> {
         return None;
     }
     let text = String::from_utf8(output.stdout).ok()?;
-    text.split_whitespace().nth(1).map(PathBuf::from)
+    parse_account_home(&text)
+}
+
+fn parse_account_home(output: &str) -> Option<PathBuf> {
+    output.lines().find_map(|line| {
+        let path = line.trim_start().strip_prefix("NFSHomeDirectory:")?.trim();
+        (!path.is_empty()).then(|| PathBuf::from(path))
+    })
 }
 
 #[cfg(test)]
@@ -819,6 +1110,40 @@ mod tests {
     }
 
     #[test]
+    fn refuses_to_clear_the_safety_root_itself() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::File::create(temp.path().join("keep-me")).unwrap();
+
+        let error = clear_directory_contents(
+            temp.path(),
+            std::slice::from_ref(&temp.path().to_path_buf()),
+            temp.path(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(temp.path().join("keep-me").exists());
+    }
+
+    #[test]
+    fn refuses_an_allowlisted_path_that_escapes_its_safety_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::File::create(outside.join("keep-me")).unwrap();
+        let escaping_path = root.join("../outside");
+
+        let error =
+            clear_directory_contents(&escaping_path, std::slice::from_ref(&escaping_path), &root)
+                .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(outside.join("keep-me").exists());
+    }
+
+    #[test]
     fn clears_contents_but_keeps_cache_directory() {
         let temp = tempfile::tempdir().unwrap();
         let cache = temp.path().join("cache");
@@ -837,6 +1162,37 @@ mod tests {
 
         assert!(cache.is_dir());
         assert_eq!(fs::read_dir(cache).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn failed_cleanup_preserves_the_remaining_measured_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        fs::write(cache.join("keep-me"), [1_u8; 8_192]).unwrap();
+        let size_before = directory_kb(&cache);
+        let mut entry = CacheEntry {
+            spec: CacheSpec {
+                home: temp.path().to_path_buf(),
+                path: cache.clone(),
+                label: "Test cache",
+                tier: CacheTier::Routine,
+                process_pattern: "",
+                note: "test data",
+            },
+            status: CacheStatus::Ready,
+            size_kb: size_before,
+            outcome: None,
+        };
+
+        let outcome = clean_cache(&mut entry, &[], false);
+
+        assert!(matches!(
+            outcome,
+            CleanupOutcome::Failed { removed_kb: 0, .. }
+        ));
+        assert_eq!(entry.size_kb, size_before);
+        assert!(cache.join("keep-me").exists());
     }
 
     #[cfg(unix)]
@@ -902,6 +1258,29 @@ mod tests {
     }
 
     #[test]
+    fn process_check_errors_block_cleanup() {
+        assert_eq!(related_process_state("["), ProcessState::CheckFailed);
+        assert!(process_is_running("["));
+    }
+
+    #[test]
+    fn parses_account_home_paths_containing_spaces() {
+        assert_eq!(
+            parse_account_home("NFSHomeDirectory: /Users/Example User\n"),
+            Some(PathBuf::from("/Users/Example User"))
+        );
+        assert_eq!(parse_account_home("NFSHomeDirectory:\n"), None);
+    }
+
+    #[test]
+    fn cleanup_errors_warn_that_removal_may_be_partial() {
+        let error = cleanup_progress_error(io::Error::other("test failure"), 2);
+
+        assert!(error.to_string().contains("cleanup may be partial"));
+        assert!(error.to_string().contains("removed 2 complete"));
+    }
+
+    #[test]
     fn builds_cache_paths_relative_to_a_home_directory() {
         let root = Path::new("/Users/tester");
         let specs = cache_specs(root);
@@ -915,6 +1294,30 @@ mod tests {
                 .unwrap()
                 .path,
             root.join(".npm/_cacache")
+        );
+        assert_eq!(
+            specs
+                .iter()
+                .find(|spec| spec.label == "Safari cache")
+                .unwrap()
+                .tier,
+            CacheTier::Routine
+        );
+        assert_eq!(
+            specs
+                .iter()
+                .find(|spec| spec.label == "SwiftPM cache")
+                .unwrap()
+                .tier,
+            CacheTier::Reinstallable
+        );
+        assert_eq!(
+            specs
+                .iter()
+                .find(|spec| spec.label == "CocoaPods cache")
+                .unwrap()
+                .path,
+            root.join("Library/Caches/CocoaPods")
         );
     }
 
@@ -978,6 +1381,29 @@ mod tests {
     }
 
     #[test]
+    fn directly_selected_home_does_not_duplicate_user_trash() {
+        let temp = tempfile::tempdir().unwrap();
+        let account_home = temp.path().join("Users/current");
+        let selected_home = temp.path().join("Users/other");
+        fs::create_dir_all(&account_home).unwrap();
+        fs::create_dir_all(selected_home.join("Library")).unwrap();
+        fs::create_dir(selected_home.join(".Trash")).unwrap();
+
+        let specs = scan_specs(&selected_home, &account_home);
+        let trash_count = specs
+            .iter()
+            .filter(|spec| spec.path == selected_home.join(".Trash"))
+            .count();
+
+        assert_eq!(trash_count, 1);
+        assert!(
+            specs
+                .iter()
+                .all(|spec| spec.path != selected_home.join("#recycle"))
+        );
+    }
+
+    #[test]
     fn home_scan_includes_large_app_managed_storage_as_review_only() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
@@ -988,6 +1414,10 @@ mod tests {
             .iter()
             .find(|spec| spec.label == "Xcode device support")
             .unwrap();
+        let xcode_archives = specs
+            .iter()
+            .find(|spec| spec.label == "Xcode archives")
+            .unwrap();
         let orbstack = specs
             .iter()
             .find(|spec| spec.label == "OrbStack data")
@@ -997,6 +1427,11 @@ mod tests {
         assert_eq!(
             xcode_support.path,
             home.join("Library/Developer/Xcode/iOS DeviceSupport")
+        );
+        assert_eq!(xcode_archives.tier, CacheTier::ReviewOnly);
+        assert_eq!(
+            xcode_archives.path,
+            home.join("Library/Developer/Xcode/Archives")
         );
         assert_eq!(orbstack.tier, CacheTier::ReviewOnly);
     }
@@ -1076,11 +1511,58 @@ mod tests {
         let locations = scan_locations_in(&home, &volumes, false);
 
         assert_eq!(locations.len(), 2);
-        assert_eq!(locations[0].path, home);
+        assert_eq!(locations[0].path, home.canonicalize().unwrap());
+        assert_eq!(locations[0].kind, ScanLocationKind::Local);
         assert_eq!(locations[1].label, "Work Drive");
+        assert_eq!(locations[1].kind, ScanLocationKind::Local);
         assert_eq!(
             locations[1].path,
             volumes.join("Work Drive").canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn classifies_local_usb_and_network_storage() {
+        let local_plist = "<key>BusProtocol</key><string>Apple Fabric</string>";
+        let usb_plist = "<key>BusProtocol</key>\n<string>USB</string>";
+
+        assert_eq!(
+            classify_scan_location(Some(local_plist), Some("apfs")),
+            ScanLocationKind::Local
+        );
+        assert_eq!(
+            classify_scan_location(Some(usb_plist), Some("apfs")),
+            ScanLocationKind::Usb
+        );
+        assert_eq!(
+            classify_scan_location(Some(usb_plist), Some("smbfs")),
+            ScanLocationKind::Network
+        );
+        assert_eq!(
+            classify_scan_location(None, Some("nfs")),
+            ScanLocationKind::Network
+        );
+    }
+
+    #[test]
+    fn parses_filesystem_types_for_mount_points_with_spaces() {
+        let mounts = concat!(
+            "/dev/disk3s3s1 on / (apfs, sealed, local)\n",
+            "/dev/disk7s1 on /Volumes/USB Drive (exfat, local, noowners)\n",
+            "//user@nas/Data on /Volumes/Team Share (smbfs, nodev, nosuid)\n",
+        );
+
+        assert_eq!(
+            mounted_filesystem_from_output(mounts, Path::new("/")),
+            Some("apfs".into())
+        );
+        assert_eq!(
+            mounted_filesystem_from_output(mounts, Path::new("/Volumes/USB Drive")),
+            Some("exfat".into())
+        );
+        assert_eq!(
+            mounted_filesystem_from_output(mounts, Path::new("/Volumes/Team Share")),
+            Some("smbfs".into())
         );
     }
 

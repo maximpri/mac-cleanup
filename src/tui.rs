@@ -5,6 +5,7 @@ use std::{
     io::{self, IsTerminal},
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 
@@ -26,8 +27,8 @@ use ratatui::{
 use crate::{
     cache::{
         CacheEntry, CacheSpec, CacheStatus, CleanupOutcome, CleanupStats, ScanLocation,
-        clean_cache, clean_review_data, format_kb, free_kb, scan_locations, scan_specs, status_for,
-        validate_scan_root,
+        clean_cache, clean_review_data, format_kb, free_kb, scan_location_kind, scan_locations,
+        scan_specs, status_for, validate_scan_root,
     },
     cli::{Cli, Mode},
 };
@@ -49,6 +50,9 @@ enum CleanupKind {
     Cache,
     ReviewData,
 }
+
+const SUMMARY_AUTO_CLOSE_AFTER: Duration = Duration::from_secs(5);
+const OPEN_COMMAND: &str = "/usr/bin/open";
 
 struct DirectoryScan {
     spec: CacheSpec,
@@ -148,7 +152,11 @@ impl DirectoryScan {
         let size_kb = self.size_kb();
         CacheEntry {
             spec: self.spec,
-            status: self.status,
+            status: if self.errors == 0 {
+                self.status
+            } else {
+                CacheStatus::ScanError
+            },
             size_kb,
             outcome: None,
         }
@@ -181,6 +189,8 @@ struct App {
     stats: CleanupStats,
     free_before_kb: u64,
     stopped_early: bool,
+    summary_started_at: Option<Instant>,
+    status_message: Option<String>,
     quit: bool,
 }
 
@@ -198,12 +208,22 @@ impl App {
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "Selected volume".into()),
                 path: path.clone(),
+                kind: scan_location_kind(path),
             });
         }
         let scan_root = requested_root.clone().unwrap_or_else(|| home.to_path_buf());
-        let location_cursor = locations
-            .iter()
-            .position(|location| location.path == scan_root)
+        let location_cursor = requested_root
+            .as_ref()
+            .and_then(|requested| {
+                locations
+                    .iter()
+                    .position(|location| location.path == *requested)
+            })
+            .or_else(|| {
+                locations
+                    .iter()
+                    .position(|location| location.path == Path::new("/"))
+            })
             .unwrap_or(0);
         Ok(Self {
             mode: cli.mode(),
@@ -235,6 +255,8 @@ impl App {
             stats: CleanupStats::default(),
             free_before_kb: 0,
             stopped_early: false,
+            summary_started_at: None,
+            status_message: None,
             quit: false,
         })
     }
@@ -271,7 +293,10 @@ impl App {
         let status = status_for(&spec, self.include_reinstallable);
         if matches!(
             status,
-            CacheStatus::Missing | CacheStatus::Symlink | CacheStatus::Invalid
+            CacheStatus::Missing
+                | CacheStatus::ScanError
+                | CacheStatus::Symlink
+                | CacheStatus::Invalid
         ) {
             self.record_scan_entry(CacheEntry {
                 spec,
@@ -286,7 +311,11 @@ impl App {
     }
 
     fn record_scan_entry(&mut self, entry: CacheEntry) {
-        if entry.size_kb > 0 || matches!(entry.status, CacheStatus::Symlink | CacheStatus::Invalid)
+        if entry.size_kb > 0
+            || matches!(
+                entry.status,
+                CacheStatus::ScanError | CacheStatus::Symlink | CacheStatus::Invalid
+            )
         {
             self.entries.push(entry);
         }
@@ -299,6 +328,7 @@ impl App {
         self.scan_task = None;
         self.scan_started_at = Instant::now();
         self.cursor = 0;
+        self.status_message = None;
         self.phase = Phase::Scanning;
     }
 
@@ -343,7 +373,10 @@ impl App {
                 self.stats.measured_removed_kb += kb;
             }
             CleanupOutcome::SafetySkipped(_) => self.stats.safety_skipped += 1,
-            CleanupOutcome::Failed(_) => self.stats.failed += 1,
+            CleanupOutcome::Failed { removed_kb, .. } => {
+                self.stats.failed += 1;
+                self.stats.measured_removed_kb += removed_kb;
+            }
         }
         self.cleanup_index += 1;
     }
@@ -351,7 +384,20 @@ impl App {
     fn finish_cleanup(&mut self) {
         self.stats.filesystem_change_kb =
             free_kb(&self.scan_root).saturating_sub(self.free_before_kb);
+        self.summary_started_at = Some(Instant::now());
         self.phase = Phase::Summary;
+    }
+
+    fn summary_remaining(&self) -> Option<Duration> {
+        self.summary_started_at
+            .map(|started_at| SUMMARY_AUTO_CLOSE_AFTER.saturating_sub(started_at.elapsed()))
+    }
+
+    fn summary_has_timed_out(&self) -> bool {
+        self.phase == Phase::Summary
+            && self
+                .summary_remaining()
+                .is_some_and(|remaining| remaining.is_zero())
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
@@ -387,6 +433,7 @@ impl App {
                 KeyCode::Char('c') | KeyCode::Char('C') if !self.analysis_only => {
                     self.prepare_safe_cleanup();
                 }
+                KeyCode::Char('o') | KeyCode::Char('O') => self.reveal_current(),
                 KeyCode::Enter | KeyCode::Esc => self.phase = Phase::Review,
                 KeyCode::Char('q') => self.quit = true,
                 _ => {}
@@ -436,12 +483,20 @@ impl App {
         match code {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.cursor = self.cursor.saturating_sub(1);
+                self.status_message = None;
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.cursor = (self.cursor + 1).min(self.entries.len().saturating_sub(1));
+                self.status_message = None;
             }
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.entries.len().saturating_sub(1),
+            KeyCode::Home => {
+                self.cursor = 0;
+                self.status_message = None;
+            }
+            KeyCode::End => {
+                self.cursor = self.entries.len().saturating_sub(1);
+                self.status_message = None;
+            }
             KeyCode::Char(' ') if self.mode == Mode::Clean => self.toggle_current(),
             KeyCode::Char('a') if self.mode == Mode::Clean => self.toggle_all(),
             KeyCode::Char('d') | KeyCode::Char('D')
@@ -457,6 +512,7 @@ impl App {
                 self.include_reinstallable = !self.include_reinstallable;
                 self.restart_scan();
             }
+            KeyCode::Char('o') | KeyCode::Char('O') => self.reveal_current(),
             KeyCode::Char('r') => self.restart_scan(),
             KeyCode::Char('v') => self.phase = Phase::Location,
             KeyCode::Enter if self.mode == Mode::Clean && !self.selected.is_empty() => {
@@ -526,6 +582,28 @@ impl App {
         self.phase = Phase::ReviewConfirm;
     }
 
+    fn reveal_current(&mut self) {
+        let Some(entry) = self.entries.get(self.cursor) else {
+            return;
+        };
+        let path = entry.spec.path.clone();
+        self.status_message = Some(
+            match Command::new(OPEN_COMMAND)
+                .arg("-R")
+                .arg(&path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+            {
+                Ok(status) if status.success() => {
+                    format!("Revealed: {}", path.display())
+                }
+                Ok(status) => format!("Finder could not reveal the path (open exited {status})."),
+                Err(error) => format!("Finder could not be opened: {error}"),
+            },
+        );
+    }
+
     fn handle_review_confirmation_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
@@ -560,6 +638,7 @@ impl App {
         self.cleanup_index = 0;
         self.cleanup_kind = CleanupKind::Cache;
         self.stats = CleanupStats::default();
+        self.summary_started_at = None;
         self.free_before_kb = free_kb(&self.scan_root);
         self.phase = Phase::Cleaning;
     }
@@ -581,12 +660,22 @@ impl App {
         self.review_confirmation.clear();
         self.review_confirmation_error = false;
         self.stats = CleanupStats::default();
+        self.summary_started_at = None;
         self.free_before_kb = free_kb(&self.scan_root);
         self.phase = Phase::Cleaning;
     }
 
     fn identified_kb(&self) -> u64 {
         self.entries.iter().map(|entry| entry.size_kb).sum()
+    }
+
+    fn current_location_kind(&self) -> crate::cache::ScanLocationKind {
+        self.locations
+            .iter()
+            .find(|location| location.path == self.scan_root)
+            .map_or(crate::cache::ScanLocationKind::Local, |location| {
+                location.kind
+            })
     }
 
     fn ready_kb(&self) -> u64 {
@@ -692,6 +781,10 @@ fn run_loop(
         {
             app.handle_key(key);
         }
+
+        if !app.quit && app.summary_has_timed_out() {
+            app.quit = true;
+        }
     }
     Ok(i32::from(app.stats.failed > 0))
 }
@@ -753,6 +846,10 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let content = Line::from(vec![
         Span::styled(format!(" {mode} "), title_style),
         Span::raw("  Find reclaimable space and app-managed storage  •  "),
+        Span::styled(
+            format!("{}  •  ", app.current_location_kind().label()),
+            Style::default().fg(app.color(Color::DarkGray)),
+        ),
         Span::styled(
             app.scan_root.display().to_string(),
             Style::default().fg(app.color(Color::DarkGray)),
@@ -858,14 +955,16 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let (status, color) = match &entry.outcome {
             Some(CleanupOutcome::Cleared(_)) => ("CLEARED", Color::Green),
             Some(CleanupOutcome::SafetySkipped(_)) => ("SKIPPED", Color::Yellow),
-            Some(CleanupOutcome::Failed(_)) => ("FAILED", Color::Red),
+            Some(CleanupOutcome::Failed { .. }) => ("FAILED", Color::Red),
             None => (
                 entry.status.label(),
                 match entry.status {
                     CacheStatus::Ready => Color::Green,
                     CacheStatus::Optional | CacheStatus::InUse => Color::Yellow,
                     CacheStatus::Review => Color::Magenta,
-                    CacheStatus::Symlink | CacheStatus::Invalid => Color::Red,
+                    CacheStatus::ScanError | CacheStatus::Symlink | CacheStatus::Invalid => {
+                        Color::Red
+                    }
                     CacheStatus::Missing => Color::DarkGray,
                 },
             ),
@@ -953,10 +1052,14 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 format!("Cleared; reclaimed about {}.", format_kb(*kb))
             }
             Some(CleanupOutcome::SafetySkipped(reason)) => format!("Skipped: {reason}."),
-            Some(CleanupOutcome::Failed(error)) => format!("Failed: {error}"),
+            Some(CleanupOutcome::Failed { error, removed_kb }) if *removed_kb > 0 => format!(
+                "Failed after removing about {}: {error}",
+                format_kb(*removed_kb)
+            ),
+            Some(CleanupOutcome::Failed { error, .. }) => format!("Failed: {error}"),
             None => entry.status.explanation().to_string(),
         };
-        vec![
+        let mut lines = vec![
             Line::from(vec![
                 Span::styled("Path  ", Style::default().fg(app.color(Color::DarkGray))),
                 Span::raw(entry.spec.path.display().to_string()),
@@ -969,7 +1072,14 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Span::styled("Safety  ", Style::default().fg(app.color(Color::DarkGray))),
                 Span::raw(outcome),
             ]),
-        ]
+        ];
+        if let Some(message) = &app.status_message {
+            lines.push(Line::from(vec![
+                Span::styled("Finder  ", Style::default().fg(app.color(Color::DarkGray))),
+                Span::raw(message),
+            ]));
+        }
+        lines
     } else {
         vec![Line::from(
             "No reclaimable or app-managed storage was found. No files were changed.",
@@ -1027,13 +1137,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
         Phase::Review => {
             let help = if app.analysis_only {
-                "↑↓/jk move   enter details   i reinstallables   v volume   r rescan   q quit"
+                "↑↓/jk move   enter details   o finder   i reinstallables   v volume   r rescan   q quit"
             } else if app.mode == Mode::Clean {
-                "↑↓/jk move   space select   a all safe   c clean all safe   d delete REVIEW   enter details/continue   i opt-in   v volume   r rescan   q quit"
+                "↑↓/jk move   space select   a all safe   c clean all safe   d delete REVIEW   enter details/continue   o finder   i opt-in   v volume   r rescan   q quit"
             } else if app.current_is_review_data() {
-                "d delete this REVIEW   c clean all safe   enter details   i opt-in   v volume   r rescan   q quit"
+                "d delete this REVIEW   c clean all safe   enter details   o finder   i opt-in   v volume   r rescan   q quit"
             } else {
-                "c clean all safe   enter details   i opt-in   v volume   r rescan   q quit"
+                "c clean all safe   enter details   o finder   i opt-in   v volume   r rescan   q quit"
             };
             frame.render_widget(
                 Paragraph::new(help)
@@ -1095,8 +1205,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
             } else {
                 "COMPLETE"
             };
+            let closes_in = app
+                .summary_remaining()
+                .unwrap_or_default()
+                .as_secs_f64()
+                .ceil() as u64;
             let summary = format!(
-                "{status}  •  removed {}  •  disk change {}  •  cleared {}  •  skipped {}  •  failed {}  •  enter/q close",
+                "{status}  •  closing in {closes_in}s (enter/q/esc now)  •  removed {}  •  disk change {}  •  cleared {}  •  skipped {}  •  failed {}",
                 format_kb(app.stats.measured_removed_kb),
                 format_kb(app.stats.filesystem_change_kb),
                 app.stats.cleared,
@@ -1133,9 +1248,11 @@ fn render_location_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .split(inner);
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from("Choose a disk or home directory to search for reclaimable space."),
+            Line::from(
+                "Choose a local, USB, or network location to search for reclaimable space.",
+            ),
             Line::from(Span::styled(
-                "Known caches use ordinary selection; app-managed data requires a separate typed confirmation.",
+                "The local startup volume is selected by default. App-managed data requires a separate typed confirmation.",
                 Style::default().fg(app.color(Color::DarkGray)),
             )),
         ])
@@ -1146,6 +1263,15 @@ fn render_location_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let rows = app.locations.iter().map(|location| {
         Row::new(vec![
+            Cell::from(location.kind.label()).style(match location.kind {
+                crate::cache::ScanLocationKind::Local => {
+                    Style::default().fg(app.color(Color::Green))
+                }
+                crate::cache::ScanLocationKind::Usb => Style::default().fg(app.color(Color::Cyan)),
+                crate::cache::ScanLocationKind::Network => {
+                    Style::default().fg(app.color(Color::Magenta))
+                }
+            }),
             Cell::from(location.label.clone()),
             Cell::from(location.path.display().to_string())
                 .style(Style::default().fg(app.color(Color::Gray))),
@@ -1153,10 +1279,14 @@ fn render_location_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
     });
     let table = Table::new(
         rows,
-        [Constraint::Percentage(30), Constraint::Percentage(70)],
+        [
+            Constraint::Length(9),
+            Constraint::Percentage(28),
+            Constraint::Percentage(72),
+        ],
     )
     .header(
-        Row::new(["LOCATION", "PATH"]).style(
+        Row::new(["TYPE", "LOCATION", "PATH"]).style(
             Style::default()
                 .fg(app.color(Color::DarkGray))
                 .add_modifier(Modifier::BOLD),
@@ -1177,12 +1307,15 @@ fn render_location_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         "cancel"
     };
+    let help = if area.width < 72 {
+        format!("↑↓/jk choose   enter scan   esc/q {close}")
+    } else {
+        format!("↑↓/jk choose   enter scan   esc/q {close}   •   use --volume PATH for automation")
+    };
     frame.render_widget(
-        Paragraph::new(format!(
-            "↑↓/jk choose   enter scan   esc/q {close}   •   use --volume PATH for automation"
-        ))
-        .block(Block::default().borders(Borders::ALL).title(" KEYS "))
-        .alignment(Alignment::Center),
+        Paragraph::new(help)
+            .block(Block::default().borders(Borders::ALL).title(" KEYS "))
+            .alignment(Alignment::Center),
         sections[2],
     );
 }
@@ -1199,10 +1332,14 @@ fn render_entry_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
             format!("Cleared; reclaimed about {}.", format_kb(*kb))
         }
         Some(CleanupOutcome::SafetySkipped(reason)) => format!("Skipped: {reason}."),
-        Some(CleanupOutcome::Failed(error)) => format!("Failed: {error}"),
+        Some(CleanupOutcome::Failed { error, removed_kb }) if *removed_kb > 0 => format!(
+            "Failed after removing about {}: {error}",
+            format_kb(*removed_kb)
+        ),
+        Some(CleanupOutcome::Failed { error, .. }) => format!("Failed: {error}"),
         None => entry.status.explanation().to_string(),
     };
-    let text = vec![
+    let mut text = vec![
         Line::from(vec![
             Span::styled("Size    ", Style::default().fg(app.color(Color::DarkGray))),
             Span::styled(
@@ -1227,14 +1364,20 @@ fn render_entry_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Line::from(""),
         Line::from(
             if !app.analysis_only && entry.status == CacheStatus::Review {
-                "d advanced delete   •   c clean all safe   •   Enter/Esc close"
+                "d advanced delete   •   c clean all safe   •   o reveal in Finder   •   Enter/Esc close"
             } else if !app.analysis_only && app.mode == Mode::Analyze {
-                "c clean all safe   •   Enter/Esc close details   •   q quit"
+                "c clean all safe   •   o reveal in Finder   •   Enter/Esc close details   •   q quit"
             } else {
-                "Enter/Esc close details   •   q quit"
+                "o reveal in Finder   •   Enter/Esc close details   •   q quit"
             },
         ),
     ];
+    if let Some(message) = &app.status_message {
+        text.push(Line::from(Span::styled(
+            message,
+            Style::default().fg(app.color(Color::Cyan)),
+        )));
+    }
     frame.render_widget(
         Paragraph::new(text)
             .block(
@@ -1428,6 +1571,7 @@ mod tests {
             volume: None,
             yes: false,
             verbose: false,
+            json: false,
             no_color: true,
             no_tui: false,
         };
@@ -1449,6 +1593,28 @@ mod tests {
     }
 
     #[test]
+    fn location_picker_defaults_to_the_local_startup_volume() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = Cli {
+            analyze: false,
+            clean: false,
+            include_reinstallable: false,
+            volume: None,
+            yes: false,
+            verbose: false,
+            json: false,
+            no_color: true,
+            no_tui: false,
+        };
+
+        let app = App::new(&cli, temp.path()).unwrap();
+        let selected = &app.locations[app.location_cursor];
+
+        assert_eq!(selected.path, Path::new("/"));
+        assert_eq!(selected.kind, crate::cache::ScanLocationKind::Local);
+    }
+
+    #[test]
     fn completed_scan_hides_missing_candidates() {
         let temp = tempfile::tempdir().unwrap();
         let cli = Cli {
@@ -1458,6 +1624,7 @@ mod tests {
             volume: None,
             yes: false,
             verbose: false,
+            json: false,
             no_color: true,
             no_tui: false,
         };
@@ -1470,6 +1637,57 @@ mod tests {
 
         assert_eq!(app.phase, Phase::Review);
         assert!(app.entries.is_empty());
+    }
+
+    #[test]
+    fn completed_summary_closes_after_the_grace_period() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = Cli {
+            analyze: false,
+            clean: true,
+            include_reinstallable: false,
+            volume: None,
+            yes: false,
+            verbose: false,
+            json: false,
+            no_color: true,
+            no_tui: false,
+        };
+        let mut app = App::new(&cli, temp.path()).unwrap();
+        app.phase = Phase::Summary;
+        app.summary_started_at = Some(Instant::now());
+
+        assert!(!app.summary_has_timed_out());
+
+        app.summary_started_at = Some(
+            Instant::now()
+                .checked_sub(SUMMARY_AUTO_CLOSE_AFTER + Duration::from_millis(1))
+                .unwrap(),
+        );
+        assert!(app.summary_has_timed_out());
+    }
+
+    #[test]
+    fn completed_summary_can_be_closed_immediately() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = Cli {
+            analyze: false,
+            clean: true,
+            include_reinstallable: false,
+            volume: None,
+            yes: false,
+            verbose: false,
+            json: false,
+            no_color: true,
+            no_tui: false,
+        };
+        let mut app = App::new(&cli, temp.path()).unwrap();
+        app.phase = Phase::Summary;
+        app.summary_started_at = Some(Instant::now());
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.quit);
     }
 
     #[test]
@@ -1497,6 +1715,33 @@ mod tests {
         assert!(scan.size_kb() > 0);
         while !scan.advance() {}
         assert_eq!(scan.inspected_items, 300);
+    }
+
+    #[test]
+    fn incomplete_directory_scan_is_not_marked_ready() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let unreadable = cache.join("unreadable");
+        fs::create_dir(&cache).unwrap();
+        fs::create_dir(&unreadable).unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+        let spec = CacheSpec {
+            home: temp.path().to_path_buf(),
+            path: cache,
+            label: "Test cache",
+            tier: crate::cache::CacheTier::Routine,
+            process_pattern: "",
+            note: "test data",
+        };
+        let mut scan = DirectoryScan::new(spec, CacheStatus::Ready);
+
+        while !scan.advance() {}
+        let entry = scan.into_entry();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(entry.status, CacheStatus::ScanError);
     }
 
     #[test]
@@ -1533,6 +1778,7 @@ mod tests {
             volume: Some(temp.path().to_path_buf()),
             yes: false,
             verbose: false,
+            json: false,
             no_color: true,
             no_tui: false,
         };
@@ -1562,6 +1808,7 @@ mod tests {
             volume: None,
             yes: false,
             verbose: false,
+            json: false,
             no_color: true,
             no_tui: false,
         };
@@ -1595,6 +1842,7 @@ mod tests {
             volume: None,
             yes: false,
             verbose: false,
+            json: false,
             no_color: true,
             no_tui: false,
         };
@@ -1624,6 +1872,7 @@ mod tests {
             volume: None,
             yes: false,
             verbose: false,
+            json: false,
             no_color: true,
             no_tui: false,
         };
@@ -1667,6 +1916,7 @@ mod tests {
             volume: None,
             yes: false,
             verbose: false,
+            json: false,
             no_color: true,
             no_tui: false,
         };
@@ -1696,6 +1946,7 @@ mod tests {
             volume: None,
             yes: false,
             verbose: false,
+            json: false,
             no_color: true,
             no_tui: false,
         };
@@ -1729,6 +1980,7 @@ mod tests {
                 });
         assert!(rendered.contains("d advanced delete"));
         assert!(rendered.contains("c clean all safe"));
+        assert!(rendered.contains("o reveal in Finder"));
 
         app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
 
@@ -1747,6 +1999,7 @@ mod tests {
             volume: None,
             yes: false,
             verbose: false,
+            json: false,
             no_color: true,
             no_tui: false,
         };
@@ -1789,6 +2042,7 @@ mod tests {
             volume: None,
             yes: false,
             verbose: false,
+            json: false,
             no_color: true,
             no_tui: false,
         };
@@ -1838,6 +2092,7 @@ mod tests {
             volume: None,
             yes: false,
             verbose: false,
+            json: false,
             no_color: true,
             no_tui: false,
         };

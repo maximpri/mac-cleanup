@@ -37,8 +37,12 @@ pub struct Cli {
     pub yes: bool,
 
     /// Show missing candidates and exact paths in plain output
-    #[arg(long)]
+    #[arg(long, conflicts_with = "json")]
     pub verbose: bool,
+
+    /// Emit a stable machine-readable report (implies non-interactive output)
+    #[arg(long, conflicts_with = "verbose")]
+    pub json: bool,
 
     /// Disable colored output
     #[arg(long, action = ArgAction::SetTrue)]

@@ -14,6 +14,11 @@ The default mode is read-only. Do not run the app with `sudo`.
 
 Requirements: macOS, Rust 1.88 or newer, and a normal user account.
 
+Full Disk Access is optional. If macOS reports `SCAN ERROR` for a protected
+user cache you intentionally want to inspect, grant it to the terminal in
+System Settings → Privacy & Security → Full Disk Access, then rescan. The app
+does not treat an unreadable directory as empty or eligible for cleanup.
+
 ```bash
 cargo build --release
 ./target/release/mac-cleanup
@@ -30,13 +35,16 @@ restart. Press `c` after the scan to review and confirm all currently safe
 The app scans each allowlisted location, shows its size and safety status, and
 lets you inspect every exact path before selecting anything. Cleanup uses a
 separate permanent-deletion confirmation dialog and rechecks each selected item
-immediately before touching it.
+immediately before touching it. Press `o` on a finding to reveal that exact
+directory in Finder before deciding what to do.
 
 Interactive runs begin with a scan-location picker. Choose the home directory,
 the startup volume, or any mounted volume listed under `/Volumes`. Home scans
 look for user Trash and regenerable caches. Volume scans look for real
 volume-level waste such as `.Trashes`, `#recycle`, `@Recycle`, `$RECYCLE.BIN`,
-and `.TemporaryItems`. Personal files are never inferred to be waste.
+and `.TemporaryItems`. The picker labels each location as `LOCAL`, `USB`, or
+`NETWORK`, orders local storage first, and selects the local startup volume by
+default. Personal files are never inferred to be waste.
 
 ## TUI controls
 
@@ -47,6 +55,7 @@ and `.TemporaryItems`. Personal files are never inferred to be waste.
 | `a` | Select or deselect all eligible items. |
 | `c` | Select all safe `READY` items and open the cleanup confirmation. |
 | `d` | Begin advanced deletion for the single highlighted `REVIEW` item. |
+| `o` | Reveal the highlighted exact path in Finder. |
 | `i` | Toggle large reinstallable items and rescan. |
 | `v` | Return to the home/volume picker. |
 | `r` | Rescan all allowlisted locations. |
@@ -60,6 +69,9 @@ count, allocated size found so far, and elapsed time. The bar animates smoothly
 through the active category but does not cross the next category boundary until
 that work finishes. `Esc` cancels the scan and returns to the location picker;
 `q` quits.
+
+After cleanup, the final summary closes automatically after five seconds.
+Press `Enter`, `q`, or `Esc` to close it immediately.
 
 The default TUI starts in analysis mode. `c` opts into ordinary safe cleanup,
 and `d` opts into a guarded single-item `REVIEW` deletion. Passing `--analyze`
@@ -81,7 +93,8 @@ The path must be an accessible real directory, not a symlink. For example, if a
 NAS share uses `/Volumes/DATA/#recycle`, selecting `/Volumes/DATA` reports the
 size of that recycle bin. A mounted macOS system volume also checks the matching
 current-account home under `Users`, when present. Select a user-home directory
-directly with `--volume` when that is the intended layout.
+directly with `--volume` when that is the intended layout. Plain output also
+reports the detected storage type.
 
 ## Cache statuses
 
@@ -91,6 +104,7 @@ directly with `--volume` when that is the intended layout.
 | `OPTIONAL` | Regenerable, but needs reinstallable-item opt-in. |
 | `REVIEW` | Large app-managed or personal data. Excluded from ordinary and unattended cleanup; clean mode offers guarded single-item deletion. |
 | `IN USE` | A related application or package manager appears active. |
+| `SCAN ERROR` | The directory or a required safety check could not be read completely, so cleanup is disabled. Protected user data may require Full Disk Access. |
 | `SYMLINK` | The path or one of its parent components redirects elsewhere. |
 | `INVALID` | The allowlisted path is an unexpected file type. |
 | `MISSING` | There is nothing to clean at that path (plain `--verbose` output only). |
@@ -106,9 +120,9 @@ Routine cleanup includes:
 - user Trash and volume-level Trash, recycle-bin, and temporary folders
 - pip, node-gyp, Homebrew, Python, npm package, and OpenCode caches
 - Go, uv, Yarn, Xcode derived-data, and Simulator caches
+- Safari, Firefox, Google, and Adobe caches; browser profiles and browsing data remain
 - TradingView and ZCode updater downloads
 - Telegram cached media and thumbnails; messages are not removed
-- Google application and browser caches; profiles are not removed
 
 The following regenerable downloads are visible but unavailable by default:
 
@@ -116,14 +130,15 @@ The following regenerable downloads are visible but unavailable by default:
 - temporary `npx` package installations
 - Chrome DevTools MCP downloads
 - Codex runtimes
-- Gradle caches and Hugging Face models
+- Gradle, SwiftPM, and Hugging Face caches
+- CocoaPods downloads and Cypress application binaries
 
 Press `i` in the TUI or start with `--include-reinstallable` to make those items
 eligible. Using their associated tools later may trigger a large download.
 
 Large app-managed areas are also shown as `REVIEW` findings when present:
 
-- Xcode iOS device-support files and Simulator devices
+- Xcode archives, iOS device-support files, and Simulator devices
 - Cursor user and workspace data
 - OrbStack containers, images, machines, and volumes
 - Telegram local account and media data
@@ -141,11 +156,27 @@ checks are repeated immediately before deletion.
 ## Automation and plain output
 
 When input or output is redirected, the app automatically emits line-oriented
-plain text. `--no-tui` forces that behavior. Analysis remains read-only:
+plain text. `--no-tui` forces that behavior. Findings are ordered largest-first,
+and analysis remains read-only:
 
 ```bash
 ./target/release/mac-cleanup --analyze --no-tui --verbose
 ```
+
+For scripts and inventory tools, `--json` emits a versioned report and implies
+non-interactive output. Sizes are allocated filesystem kilobytes, paths are
+exact, and cleanup outcomes are included when cleanup was requested:
+
+```bash
+./target/release/mac-cleanup --json | jq '.summary, (.items[] | select(.size_kb > 0))'
+./target/release/mac-cleanup --clean --yes --json > cleanup-report.json
+```
+
+The top-level `schema_version` is currently `1`. Runtime scan and validation
+errors remain machine-readable after argument parsing. `--json` cannot be
+combined with `--verbose`. Reports include the scan location and storage type,
+aggregate cleanable/opt-in/review totals, every allowlisted item, and—when
+applicable—the result of each cleanup attempt.
 
 For unattended cleanup, `--yes` clears every currently eligible item without
 opening the TUI. Path, symlink, type, allowlist, and process checks still apply:
@@ -167,6 +198,7 @@ review a fresh analysis immediately beforehand.
 --volume <PATH>           Scan known waste on this volume or home directory
 --yes                     Clear all eligible items without the TUI
 --verbose                 Show missing items and exact paths in plain output
+--json                    Emit a versioned machine-readable report
 --no-color                Disable colored output
 --no-tui                  Force line-oriented output
 -h, --help                Show command help
@@ -188,8 +220,10 @@ review a fresh analysis immediately beforehand.
 - The candidate directory itself is retained; only its contents are removed.
 - Symlinks inside an eligible cache are unlinked without following them.
 - Large runtimes and browser binaries require explicit opt-in.
-- Documents, projects, messages, browser profiles, Application Support,
-  containers, and macOS system files are outside the allowlist.
+- Ordinary cleanup excludes documents, projects, messages, browser profiles,
+  Application Support, containers, and macOS system files. A few explicitly
+  listed `REVIEW` locations can be cleared only through the separate typed
+  confirmation described above.
 
 Deletion is permanent rather than moving data to Trash because files in Trash
 continue occupying disk space. The final summary distinguishes measured cache
