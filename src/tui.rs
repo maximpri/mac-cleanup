@@ -35,6 +35,7 @@ enum Phase {
     Location,
     Scanning,
     Review,
+    Details,
     Confirm,
     Cleaning,
     Summary,
@@ -202,6 +203,11 @@ impl App {
                 }
             }
             Phase::Review => self.handle_review_key(key.code),
+            Phase::Details => match key.code {
+                KeyCode::Enter | KeyCode::Esc => self.phase = Phase::Review,
+                KeyCode::Char('q') => self.quit = true,
+                _ => {}
+            },
             Phase::Confirm => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => self.begin_cleanup(),
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -263,8 +269,8 @@ impl App {
             KeyCode::Enter if self.mode == Mode::Clean && !self.selected.is_empty() => {
                 self.phase = Phase::Confirm;
             }
-            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter if self.mode == Mode::Analyze => {
-                self.quit = true;
+            KeyCode::Enter if self.entries.get(self.cursor).is_some() => {
+                self.phase = Phase::Details;
             }
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             _ => {}
@@ -305,7 +311,7 @@ impl App {
         self.phase = Phase::Cleaning;
     }
 
-    fn found_kb(&self) -> u64 {
+    fn identified_kb(&self) -> u64 {
         self.entries.iter().map(|entry| entry.size_kb).sum()
     }
 
@@ -329,6 +335,14 @@ impl App {
         self.entries
             .iter()
             .filter(|entry| entry.status == CacheStatus::Optional)
+            .map(|entry| entry.size_kb)
+            .sum()
+    }
+
+    fn review_kb(&self) -> u64 {
+        self.entries
+            .iter()
+            .filter(|entry| entry.status == CacheStatus::Review)
             .map(|entry| entry.size_kb)
             .sum()
     }
@@ -447,6 +461,8 @@ fn render(frame: &mut Frame<'_>, app: &App) {
 
     if app.phase == Phase::Confirm {
         render_confirmation(frame, area, app);
+    } else if app.phase == Phase::Details {
+        render_entry_details(frame, area, app);
     }
 }
 
@@ -460,7 +476,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .add_modifier(Modifier::BOLD);
     let content = Line::from(vec![
         Span::styled(format!(" {mode} "), title_style),
-        Span::raw("  Find removable caches, trash, and temporary data  •  "),
+        Span::raw("  Find reclaimable space and app-managed storage  •  "),
         Span::styled(
             app.scan_root.display().to_string(),
             Style::default().fg(app.color(Color::DarkGray)),
@@ -479,12 +495,21 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_metrics(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let metrics = [
-        ("WASTE FOUND", format_kb(app.found_kb()), Color::White),
-        ("REMOVABLE", format_kb(app.ready_kb()), Color::Green),
-        ("SELECTED", format_kb(app.selected_kb()), Color::Cyan),
-        ("OPT-IN", format_kb(app.optional_kb()), Color::Yellow),
-    ];
+    let metrics = if app.mode == Mode::Clean {
+        [
+            ("CLEANABLE", format_kb(app.ready_kb()), Color::Green),
+            ("SELECTED", format_kb(app.selected_kb()), Color::Cyan),
+            ("OPT-IN", format_kb(app.optional_kb()), Color::Yellow),
+            ("REVIEW", format_kb(app.review_kb()), Color::Magenta),
+        ]
+    } else {
+        [
+            ("IDENTIFIED", format_kb(app.identified_kb()), Color::White),
+            ("CLEANABLE", format_kb(app.ready_kb()), Color::Green),
+            ("OPT-IN", format_kb(app.optional_kb()), Color::Yellow),
+            ("REVIEW", format_kb(app.review_kb()), Color::Magenta),
+        ]
+    };
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Ratio(1, 4); 4])
@@ -514,7 +539,7 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(""),
-                Line::from("No removable data was found in known waste locations."),
+                Line::from("No reclaimable or app-managed storage was found."),
                 Line::from(Span::styled(
                     "Try another disk, rescan, or enable reinstallable downloads.",
                     Style::default().fg(app.color(Color::DarkGray)),
@@ -523,7 +548,7 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" WASTE FOUND "),
+                    .title(" STORAGE FOUND "),
             )
             .alignment(Alignment::Center),
             area,
@@ -557,6 +582,7 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 match entry.status {
                     CacheStatus::Ready => Color::Green,
                     CacheStatus::Optional | CacheStatus::InUse => Color::Yellow,
+                    CacheStatus::Review => Color::Magenta,
                     CacheStatus::Symlink | CacheStatus::Invalid => Color::Red,
                     CacheStatus::Missing => Color::DarkGray,
                 },
@@ -583,7 +609,7 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" WASTE FOUND "),
+            .title(" STORAGE FOUND "),
     )
     .row_highlight_style(
         Style::default()
@@ -623,7 +649,7 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
         vec![Line::from("Scanning known waste locations…")]
     } else {
         vec![Line::from(
-            "Nothing removable was found at this location. No files were changed.",
+            "No reclaimable or app-managed storage was found. No files were changed.",
         )]
     };
     frame.render_widget(
@@ -655,13 +681,21 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
         Phase::Review => {
             let help = if app.mode == Mode::Clean {
-                "↑↓/jk move   space select   a all   i reinstallables   v volume   r rescan   enter continue   q quit"
+                "↑↓/jk move   space select   a all   enter details/continue   i reinstallables   v volume   r rescan   q quit"
             } else {
-                "↑↓/jk inspect   i reinstallables   v volume   r rescan   enter/q close"
+                "↑↓/jk move   enter details   i reinstallables   v volume   r rescan   q quit"
             };
             frame.render_widget(
                 Paragraph::new(help)
                     .block(block.title(" KEYS "))
+                    .alignment(Alignment::Center),
+                area,
+            );
+        }
+        Phase::Details => {
+            frame.render_widget(
+                Paragraph::new("Viewing the highlighted finding")
+                    .block(block.title(" DETAILS "))
                     .alignment(Alignment::Center),
                 area,
             );
@@ -737,9 +771,9 @@ fn render_location_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .split(inner);
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from("Choose a disk or home directory to search for removable data."),
+            Line::from("Choose a disk or home directory to search for reclaimable space."),
             Line::from(Span::styled(
-                "The scan checks known caches, Trash/recycle bins, and temporary folders; personal files are excluded.",
+                "Known caches can be selected; app-managed data is shown for review but is never deleted.",
                 Style::default().fg(app.color(Color::DarkGray)),
             )),
         ])
@@ -788,6 +822,59 @@ fn render_location_picker(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .block(Block::default().borders(Borders::ALL).title(" KEYS "))
         .alignment(Alignment::Center),
         sections[2],
+    );
+}
+
+fn render_entry_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(entry) = app.entries.get(app.cursor) else {
+        return;
+    };
+    let popup = centered_rect(84, 13, area);
+    frame.render_widget(Clear, popup);
+
+    let outcome = match &entry.outcome {
+        Some(CleanupOutcome::Cleared(kb)) => {
+            format!("Cleared; reclaimed about {}.", format_kb(*kb))
+        }
+        Some(CleanupOutcome::SafetySkipped(reason)) => format!("Skipped: {reason}."),
+        Some(CleanupOutcome::Failed(error)) => format!("Failed: {error}"),
+        None => entry.status.explanation().to_string(),
+    };
+    let text = vec![
+        Line::from(vec![
+            Span::styled("Size    ", Style::default().fg(app.color(Color::DarkGray))),
+            Span::styled(
+                format_kb(entry.size_kb),
+                Style::default()
+                    .fg(app.color(Color::Cyan))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Path    ", Style::default().fg(app.color(Color::DarkGray))),
+            Span::raw(entry.spec.path.display().to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("Effect  ", Style::default().fg(app.color(Color::DarkGray))),
+            Span::raw(entry.spec.note),
+        ]),
+        Line::from(vec![
+            Span::styled("Safety  ", Style::default().fg(app.color(Color::DarkGray))),
+            Span::raw(outcome),
+        ]),
+        Line::from(""),
+        Line::from("Enter/Esc close details   •   q quit"),
+    ];
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(app.color(Color::Cyan)))
+                    .title(format!(" {} ", entry.spec.label)),
+            )
+            .wrap(Wrap { trim: true }),
+        popup,
     );
 }
 
@@ -880,6 +967,8 @@ mod tests {
         app.entries[0].size_kb = 10;
         app.entries[0].status = CacheStatus::InUse;
         assert!(!app.is_selectable(0));
+        app.entries[0].status = CacheStatus::Review;
+        assert!(!app.is_selectable(0));
     }
 
     #[test]
@@ -904,5 +993,67 @@ mod tests {
 
         assert_eq!(app.phase, Phase::Review);
         assert!(app.entries.is_empty());
+    }
+
+    #[test]
+    fn enter_opens_and_closes_details_without_quitting_analyze_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = Cli {
+            analyze: true,
+            clean: false,
+            include_reinstallable: false,
+            volume: None,
+            yes: false,
+            verbose: false,
+            no_color: true,
+            no_tui: false,
+        };
+        let mut app = App::new(&cli, temp.path()).unwrap();
+        app.entries = vec![CacheEntry {
+            spec: app.specs[0].clone(),
+            status: CacheStatus::Ready,
+            size_kb: 10,
+            outcome: None,
+        }];
+        app.phase = Phase::Review;
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.phase, Phase::Details);
+        assert!(!app.quit);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.phase, Phase::Review);
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn enter_still_opens_confirmation_when_cleanup_items_are_selected() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = Cli {
+            analyze: false,
+            clean: true,
+            include_reinstallable: false,
+            volume: None,
+            yes: false,
+            verbose: false,
+            no_color: true,
+            no_tui: false,
+        };
+        let mut app = App::new(&cli, temp.path()).unwrap();
+        app.entries = vec![CacheEntry {
+            spec: app.specs[0].clone(),
+            status: CacheStatus::Ready,
+            size_kb: 10,
+            outcome: None,
+        }];
+        app.selected.insert(0);
+        app.phase = Phase::Review;
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.phase, Phase::Confirm);
+        assert!(!app.quit);
     }
 }

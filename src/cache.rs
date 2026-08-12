@@ -8,6 +8,9 @@ use std::{
 pub enum CacheTier {
     Routine,
     Reinstallable,
+    /// Large app-managed data that is useful for diagnosis but must never be
+    /// deleted as though it were a cache.
+    ReviewOnly,
 }
 
 #[derive(Debug, Clone)]
@@ -25,6 +28,7 @@ pub struct CacheSpec {
 pub enum CacheStatus {
     Ready,
     Optional,
+    Review,
     InUse,
     Symlink,
     Invalid,
@@ -36,6 +40,7 @@ impl CacheStatus {
         match self {
             Self::Ready => "READY",
             Self::Optional => "OPTIONAL",
+            Self::Review => "REVIEW",
             Self::InUse => "IN USE",
             Self::Symlink => "SYMLINK",
             Self::Invalid => "INVALID",
@@ -47,6 +52,9 @@ impl CacheStatus {
         match self {
             Self::Ready => "All current safeguards passed.",
             Self::Optional => "Enable reinstallable items to select this cache.",
+            Self::Review => {
+                "App-managed or personal data; review it in the named app. Mac Cleanup will never delete it."
+            }
             Self::InUse => "A related application or package manager is running.",
             Self::Symlink => "The cache path redirects elsewhere and will not be touched.",
             Self::Invalid => "The allowlisted path is not a directory.",
@@ -248,6 +256,41 @@ pub fn cache_specs(root: &Path) -> Vec<CacheSpec> {
             "[h]uggingface|[t]ransformers",
             "models and datasets download again",
         ),
+        (
+            "Library/Developer/Xcode/iOS DeviceSupport",
+            "Xcode device support",
+            CacheTier::ReviewOnly,
+            "",
+            "old iOS support files; review Developer storage in System Settings",
+        ),
+        (
+            "Library/Developer/CoreSimulator/Devices",
+            "Simulator devices",
+            CacheTier::ReviewOnly,
+            "",
+            "simulators may contain apps and data; remove unneeded devices in Xcode",
+        ),
+        (
+            "Library/Application Support/Cursor/User",
+            "Cursor user data",
+            CacheTier::ReviewOnly,
+            "",
+            "settings, workspace state, and history; review inside Cursor",
+        ),
+        (
+            "Library/Group Containers/HUAQ24HBR6.dev.orbstack/data",
+            "OrbStack data",
+            CacheTier::ReviewOnly,
+            "",
+            "containers, images, machines, and volumes; reclaim through OrbStack",
+        ),
+        (
+            "Library/Group Containers/6N38VWS5BX.ru.keepcoder.Telegram/stable",
+            "Telegram local data",
+            CacheTier::ReviewOnly,
+            "",
+            "local account and media data; use Telegram's Storage Usage controls",
+        ),
     ];
 
     definitions
@@ -403,6 +446,8 @@ pub fn status_for(spec: &CacheSpec, include_reinstallable: bool) -> CacheStatus 
         CacheStatus::Symlink
     } else if !metadata.is_dir() {
         CacheStatus::Invalid
+    } else if spec.tier == CacheTier::ReviewOnly {
+        CacheStatus::Review
     } else if process_is_running(spec.process_pattern) {
         CacheStatus::InUse
     } else if spec.tier == CacheTier::Reinstallable && !include_reinstallable {
@@ -417,6 +462,15 @@ pub fn clean_cache(
     allowlist: &[PathBuf],
     include_reinstallable: bool,
 ) -> CleanupOutcome {
+    if entry.spec.tier == CacheTier::ReviewOnly {
+        let outcome = CleanupOutcome::SafetySkipped(
+            "review-only storage is never deleted by Mac Cleanup".into(),
+        );
+        entry.status = CacheStatus::Review;
+        entry.outcome = Some(outcome.clone());
+        return outcome;
+    }
+
     let current_status = status_for(&entry.spec, include_reinstallable);
     if current_status != CacheStatus::Ready {
         let outcome =
@@ -869,6 +923,61 @@ mod tests {
 
         assert!(specs.iter().any(|spec| spec.path == home.join(".Trash")));
         assert!(specs.iter().all(|spec| spec.path != home.join("#recycle")));
+    }
+
+    #[test]
+    fn home_scan_includes_large_app_managed_storage_as_review_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir(&home).unwrap();
+
+        let specs = scan_specs(&home, &home);
+        let xcode_support = specs
+            .iter()
+            .find(|spec| spec.label == "Xcode device support")
+            .unwrap();
+        let orbstack = specs
+            .iter()
+            .find(|spec| spec.label == "OrbStack data")
+            .unwrap();
+
+        assert_eq!(xcode_support.tier, CacheTier::ReviewOnly);
+        assert_eq!(
+            xcode_support.path,
+            home.join("Library/Developer/Xcode/iOS DeviceSupport")
+        );
+        assert_eq!(orbstack.tier, CacheTier::ReviewOnly);
+    }
+
+    #[test]
+    fn review_only_storage_can_never_be_cleaned() {
+        let temp = tempfile::tempdir().unwrap();
+        let managed = temp.path().join("managed");
+        fs::create_dir(&managed).unwrap();
+        fs::File::create(managed.join("keep-me"))
+            .unwrap()
+            .write_all(&[1; 8_192])
+            .unwrap();
+        let mut entry = CacheEntry {
+            spec: CacheSpec {
+                home: temp.path().to_path_buf(),
+                path: managed.clone(),
+                label: "Managed data",
+                tier: CacheTier::ReviewOnly,
+                process_pattern: "",
+                note: "must be managed by its app",
+            },
+            status: CacheStatus::Review,
+            size_kb: 8,
+            outcome: None,
+        };
+
+        assert_eq!(status_for(&entry.spec, true), CacheStatus::Review);
+        let outcome = clean_cache(&mut entry, std::slice::from_ref(&managed), true);
+
+        assert!(matches!(outcome, CleanupOutcome::SafetySkipped(_)));
+        assert!(managed.join("keep-me").exists());
+        assert_eq!(entry.status, CacheStatus::Review);
     }
 
     #[test]

@@ -30,7 +30,7 @@ pub fn run(cli: &Cli, home: &Path) -> Result<i32, String> {
         }
     );
     println!("Scan location: {}\n", scan_root.display());
-    println!("STATUS     REMOVABLE DATA                  SIZE  DETAILS");
+    println!("STATUS     STORAGE ITEM                    SIZE  DETAILS");
 
     let mut shown = 0;
     for entry in &entries {
@@ -56,13 +56,15 @@ pub fn run(cli: &Cli, home: &Path) -> Result<i32, String> {
         }
     }
     if shown == 0 {
-        println!("No removable data was found in known waste locations.");
+        println!("No reclaimable or app-managed storage was found.");
     }
 
     print_totals(&entries);
 
     if cli.mode() == Mode::Analyze {
-        println!("\nNo files were changed. Run with --clean to select eligible items.");
+        println!(
+            "\nNo files were changed. REVIEW items are app-managed and are never deleted by Mac Cleanup.\nRun with --clean to select eligible cache items."
+        );
         return Ok(0);
     }
 
@@ -137,9 +139,18 @@ fn print_totals(entries: &[CacheEntry]) {
         .iter()
         .filter(|entry| entry.status == CacheStatus::Optional && entry.size_kb > 0)
         .count();
+    let review_kb: u64 = entries
+        .iter()
+        .filter(|entry| entry.status == CacheStatus::Review)
+        .map(|entry| entry.size_kb)
+        .sum();
+    let review_count = entries
+        .iter()
+        .filter(|entry| entry.status == CacheStatus::Review && entry.size_kb > 0)
+        .count();
 
     println!(
-        "\nFound:          {} in {found_count} item(s)",
+        "\nIdentified:     {} in {found_count} item(s)",
         format_kb(found_kb)
     );
     println!(
@@ -150,6 +161,12 @@ fn print_totals(entries: &[CacheEntry]) {
         println!(
             "Needs opt-in:   {} in {optional_count} item(s)",
             format_kb(optional_kb)
+        );
+    }
+    if review_count > 0 {
+        println!(
+            "Review in apps: {} in {review_count} item(s)",
+            format_kb(review_kb)
         );
     }
 }

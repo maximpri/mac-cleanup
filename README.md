@@ -2,7 +2,8 @@
 
 Mac Cleanup finds disk space that can be reclaimed safely: files already in
 Trash or a volume recycle bin, temporary data, development artifacts, package
-caches, and other regenerable downloads. Its full-screen
+caches, and other regenerable downloads. It also identifies large app-managed
+storage that may be worth reviewing without treating it as disposable. Its full-screen
 [Ratatui](https://ratatui.rs/) interface makes no changes unless cleanup mode is
 explicitly requested and the user confirms a selection.
 
@@ -48,13 +49,14 @@ and `.TemporaryItems`. Personal files are never inferred to be waste.
 | `i` | Toggle large reinstallable items and rescan. |
 | `v` | Return to the home/volume picker. |
 | `r` | Rescan all allowlisted locations. |
-| `Enter` | Review the selected items for cleanup. |
+| `Enter` | Show details for the highlighted finding, or review selected cleanup items. |
 | `y` | Confirm the permanent deletion in the confirmation dialog. |
 | `n` or `Esc` | Cancel the confirmation dialog. |
 | `q` | Quit, or stop after the current item while cleaning. |
 
-Analysis mode supports navigation, details, reinstallable-item toggling, and
-rescanning, but does not expose selection or cleanup actions.
+Analysis mode supports navigation, an Enter-opened details dialog,
+reinstallable-item toggling, and rescanning, but does not expose selection or
+cleanup actions.
 
 ## Scan another volume
 
@@ -78,6 +80,7 @@ directly with `--volume` when that is the intended layout.
 | --- | --- |
 | `READY` | The directory exists and all current safeguards passed. |
 | `OPTIONAL` | Regenerable, but needs reinstallable-item opt-in. |
+| `REVIEW` | Large app-managed or personal data. Inspect it in the named app; Mac Cleanup never deletes it. |
 | `IN USE` | A related application or package manager appears active. |
 | `SYMLINK` | The path or one of its parent components redirects elsewhere. |
 | `INVALID` | The allowlisted path is an unexpected file type. |
@@ -108,6 +111,17 @@ The following regenerable downloads are visible but unavailable by default:
 
 Press `i` in the TUI or start with `--include-reinstallable` to make those items
 eligible. Using their associated tools later may trigger a large download.
+
+Large app-managed areas are also shown as `REVIEW` findings when present:
+
+- Xcode iOS device-support files and Simulator devices
+- Cursor user and workspace data
+- OrbStack containers, images, machines, and volumes
+- Telegram local account and media data
+
+These locations can contain valuable state. They are never selectable, are
+refused by both interactive and unattended cleanup, and should be reduced using
+the controls in Xcode, Cursor, OrbStack, or Telegram.
 
 ## Automation and plain output
 
@@ -147,6 +161,7 @@ review a fresh analysis immediately beforehand.
 ## Safety model
 
 - Analysis is the default and cannot modify files.
+- `REVIEW` findings are informational and cannot be selected or deleted.
 - Cleanup refuses to run as root or through `sudo`.
 - Only exact known waste paths constructed for the selected location can be
   cleared.
