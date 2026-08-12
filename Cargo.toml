@@ -1,0 +1,18 @@
+[package]
+name = "mac-cleanup"
+version = "0.2.0"
+edition = "2024"
+description = "A conservative macOS cache cleaner with a Ratatui interface"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4.6.6", features = ["derive"] }
+crossterm = "0.29.0"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
+
+[dev-dependencies]
+tempfile = "3.23.0"
+
+[profile.release]
+lto = "thin"
+strip = true

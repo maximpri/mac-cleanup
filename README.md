@@ -1,49 +1,89 @@
-# Safe macOS cache cleanup
+# Mac Cleanup
 
-`mac-cleanup.sh` reports the size and safety status of known regenerable caches,
-then clears only exact allowlisted directories when explicitly requested. Its
-default mode is read-only. The interface is dependency-free and adapts to the
-terminal: interactive runs use color and an in-place progress bar, while pipes
-and logs receive plain line-oriented output.
+Mac Cleanup is a conservative macOS cache cleaner with a full-screen
+[Ratatui](https://ratatui.rs/) interface. It scans a fixed allowlist of known,
+regenerable caches and makes no changes unless cleanup mode is explicitly
+requested and the user confirms a selection.
 
-Requirements: macOS and Bash 3.2 or newer. Do not run the script with `sudo`.
+The default mode is read-only. Do not run the app with `sudo`.
 
-## Quick start
+## Run it
+
+Requirements: macOS, Rust 1.88 or newer, and a normal user account.
 
 ```bash
-chmod +x mac-cleanup.sh
+# Build once, then run the optimized binary
+cargo build --release
+./target/release/mac-cleanup
 
-# Read-only analysis
+# Or use the source-checkout launcher (Cargo builds automatically)
 ./mac-cleanup.sh
+```
 
-# Interactive cleanup of routine caches
+Open the interactive cleanup screen with:
+
+```bash
 ./mac-cleanup.sh --clean
 ```
 
-The scan is always shown before cleanup. It reports what was found, how much is
-ready, which caches need an explicit opt-in, and which are blocked by a running
-application. Cleanup then shows progress and a final count of cleared, skipped,
-and failed items.
+The app scans each allowlisted location, shows its size and safety status, and
+lets you inspect every exact path before selecting anything. Cleanup uses a
+separate permanent-deletion confirmation dialog and rechecks each selected item
+immediately before touching it.
 
-## Interactive controls
+Interactive runs begin with a scan-location picker. Choose the home directory,
+the startup volume, or any mounted volume listed under `/Volumes`. The selected
+location becomes the root for the same fixed relative cache allowlist; the app
+does not recursively classify unrelated files as caches.
 
-During `--clean`, each ready cache shows its size and what recreating it may
-involve. Choose one of:
+## TUI controls
 
 | Key | Action |
 | --- | --- |
-| `y` | Clear this cache. |
-| `n` or Enter | Leave this cache unchanged. |
-| `a` | Clear this cache and all remaining ready caches. |
-| `q` | Stop cleanup and leave the remaining caches unchanged. |
+| `↑` / `↓` or `j` / `k` | Move through cache entries. |
+| `Space` | Select or deselect the highlighted eligible cache. |
+| `a` | Select or deselect all eligible caches. |
+| `i` | Toggle large reinstallable items and rescan. |
+| `v` | Return to the home/volume picker. |
+| `r` | Rescan all allowlisted locations. |
+| `Enter` | Review the selected items for cleanup. |
+| `y` | Confirm the permanent deletion in the confirmation dialog. |
+| `n` or `Esc` | Cancel the confirmation dialog. |
+| `q` | Quit, or stop after the current item while cleaning. |
 
-The status of each candidate and its related processes is checked again before
-deletion. If the status changed after the scan, the item is skipped and called
-out in the summary.
+Analysis mode supports navigation, details, reinstallable-item toggling, and
+rescanning, but does not expose selection or cleanup actions.
+
+## Scan another volume
+
+Use the location picker in the TUI, or pass the mounted volume path explicitly
+for line-oriented output and automation:
+
+```bash
+./mac-cleanup.sh --volume "/Volumes/Work Drive"
+./mac-cleanup.sh --analyze --no-tui --verbose --volume "/Volumes/Work Drive"
+```
+
+The path must be an accessible real directory, not a symlink. A volume selection
+changes only the root used to construct known cache paths. For example, the pip
+candidate on `/Volumes/Work Drive` is
+`/Volumes/Work Drive/Library/Caches/pip`. Select a user-home directory directly
+with `--volume` when that is the intended layout.
+
+## Cache statuses
+
+| Status | Meaning |
+| --- | --- |
+| `READY` | The directory exists and all current safeguards passed. |
+| `OPTIONAL` | Regenerable, but needs reinstallable-item opt-in. |
+| `IN USE` | A related application or package manager appears active. |
+| `SYMLINK` | The path or one of its parent components redirects elsewhere. |
+| `INVALID` | The allowlisted path is an unexpected file type. |
+| `MISSING` | There is nothing to clean at that path. |
 
 Close Telegram, Chrome and other Google apps, TradingView, ZCode, package
-managers, and development tools before cleanup. If a related process is still
-running, that candidate is skipped automatically.
+managers, and development tools before cleanup. A candidate whose related
+process is running is automatically unavailable.
 
 ## Cleanup levels
 
@@ -54,82 +94,68 @@ Routine cleanup includes:
 - Telegram cached media and thumbnails; messages are not removed
 - Google application and browser caches; profiles are not removed
 
-The following items are reported but not cleaned by default because using their
-tools later can require a large download:
+The following regenerable downloads are visible but unavailable by default:
 
 - Playwright and Playwright Go browser binaries
 - temporary `npx` package installations
 - Chrome DevTools MCP downloads
 - Codex runtimes
 
-Include those items with:
+Press `i` in the TUI or start with `--include-reinstallable` to make those items
+eligible. Using their associated tools later may trigger a large download.
+
+## Automation and plain output
+
+When input or output is redirected, the app automatically emits line-oriented
+plain text. `--no-tui` forces that behavior. Analysis remains read-only:
 
 ```bash
-./mac-cleanup.sh --clean --include-reinstallable
+./mac-cleanup.sh --analyze --no-tui --verbose
 ```
 
-The script normally asks before each deletion. For unattended use, `--yes`
-accepts every eligible candidate, while process, path, and symlink checks remain
-active:
+For unattended cleanup, `--yes` clears every currently eligible item without
+opening the TUI. Path, symlink, type, allowlist, and process checks still apply:
 
 ```bash
 ./mac-cleanup.sh --clean --yes
 ./mac-cleanup.sh --clean --include-reinstallable --yes
 ```
 
-Because `--yes` causes permanent deletion without individual prompts, run the
-read-only report immediately beforehand and review its `Ready to clean`
-total.
-
-## Understanding the report
-
-| Status | Meaning |
-| --- | --- |
-| `READY` | The directory exists and all current safeguards passed. |
-| `OPTIONAL` | Regenerable, but requires `--include-reinstallable`. |
-| `IN USE` | A related application or package manager appears active. |
-| `SYMLINK` | The cache path redirects elsewhere and will never be cleared. |
-| `INVALID` | The allowlisted path is an unexpected file type. |
-| `MISSING` | There is nothing to clean at that path. |
-
-Use `--verbose` to display every exact allowlisted path, including missing
-ones:
-
-```bash
-./mac-cleanup.sh --analyze --verbose
-```
-
-## Safety model
-
-- Analysis is the default and does not modify files.
-- Cleanup refuses to run as root or through `sudo`.
-- Only exact paths coded into the script's allowlist can be cleared.
-- Cache-directory symlinks are refused so deletion cannot be redirected.
-- Related running applications and package managers cause an item to be
-  skipped. The process check is repeated immediately before deletion.
-- The cache directory itself is retained; only its contents are removed.
-- Large runtimes and browser binaries require `--include-reinstallable`.
-- Documents, projects, messages, browser profiles, Application Support,
-  containers, and macOS system files are outside the allowlist.
-
-Deletion is permanent rather than moving data to Trash because files in Trash
-continue occupying disk space. Cleared caches and downloaded tools can be
-recreated by their applications, but deleted cache contents cannot be restored
-by this script.
+Because `--yes` permanently deletes contents without individual selection,
+review a fresh analysis immediately beforehand.
 
 ## Options
 
 ```text
 --analyze                 Read-only report (default)
---clean                   Clean eligible caches after confirmation
+--clean                   Select and clear eligible cache contents
 --include-reinstallable   Include browser binaries and tool runtimes
---yes                     Confirm all eligible candidates
---verbose                 Show skipped and missing candidates and their paths
---no-color                Disable terminal colors
+--volume <PATH>           Scan known cache paths relative to this volume
+--yes                     Clear all eligible items without the TUI
+--verbose                 Show missing items and exact paths in plain output
+--no-color                Disable colored output
+--no-tui                  Force line-oriented output
 -h, --help                Show command help
+-V, --version             Show the application version
 ```
 
-The final summary distinguishes the measured cache contents removed from the
-change in filesystem free space. These values can differ slightly because apps
-may create files during cleanup and APFS updates free-space accounting
-asynchronously.
+## Safety model
+
+- Analysis is the default and cannot modify files.
+- Cleanup refuses to run as root or through `sudo`.
+- Only exact paths constructed from the selected root and compiled allowlist can
+  be cleared.
+- Volume roots are canonicalized, and symlink roots are rejected.
+- The app rejects a cache if it or any path component is a symlink.
+- Related running applications and package managers block cleanup. The process
+  check is repeated immediately before deletion.
+- The cache directory itself is retained; only its contents are removed.
+- Symlinks inside an eligible cache are unlinked without following them.
+- Large runtimes and browser binaries require explicit opt-in.
+- Documents, projects, messages, browser profiles, Application Support,
+  containers, and macOS system files are outside the allowlist.
+
+Deletion is permanent rather than moving data to Trash because files in Trash
+continue occupying disk space. The final summary distinguishes measured cache
+contents removed from the filesystem free-space change; APFS accounting and
+concurrent app activity can make those values differ slightly.
