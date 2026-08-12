@@ -4,8 +4,9 @@ Mac Cleanup finds disk space that can be reclaimed safely: files already in
 Trash or a volume recycle bin, temporary data, development artifacts, package
 caches, and other regenerable downloads. It also identifies large app-managed
 storage that may be worth reviewing without treating it as disposable. Its full-screen
-[Ratatui](https://ratatui.rs/) interface makes no changes unless cleanup mode is
-explicitly requested and the user confirms a selection.
+[Ratatui](https://ratatui.rs/) interface starts read-only and makes no changes
+unless cleanup is explicitly requested in the UI or with `--clean`, and the
+user confirms a selection.
 
 The default mode is read-only. Do not run the app with `sudo`.
 
@@ -18,7 +19,9 @@ cargo build --release
 ./target/release/mac-cleanup
 ```
 
-Open the interactive cleanup screen with:
+The default interactive screen can move from analysis to cleanup without a
+restart. Press `c` after the scan to review and confirm all currently safe
+`READY` items. To start directly in cleanup mode instead, use:
 
 ```bash
 ./target/release/mac-cleanup --clean
@@ -42,7 +45,8 @@ and `.TemporaryItems`. Personal files are never inferred to be waste.
 | `↑` / `↓` or `j` / `k` | Move through findings. |
 | `Space` | Select or deselect the highlighted eligible item. |
 | `a` | Select or deselect all eligible items. |
-| `d` | Begin advanced deletion for the single highlighted `REVIEW` item (clean mode only). |
+| `c` | Select all safe `READY` items and open the cleanup confirmation. |
+| `d` | Begin advanced deletion for the single highlighted `REVIEW` item. |
 | `i` | Toggle large reinstallable items and rescan. |
 | `v` | Return to the home/volume picker. |
 | `r` | Rescan all allowlisted locations. |
@@ -57,14 +61,16 @@ through the active category but does not cross the next category boundary until
 that work finishes. `Esc` cancels the scan and returns to the location picker;
 `q` quits.
 
-Analysis mode supports navigation, an Enter-opened details dialog,
-reinstallable-item toggling, and rescanning, but does not expose selection or
-cleanup actions.
+The default TUI starts in analysis mode. `c` opts into ordinary safe cleanup,
+and `d` opts into a guarded single-item `REVIEW` deletion. Passing `--analyze`
+explicitly locks the entire run to read-only analysis and hides both actions.
 
 ## Scan another volume
 
 Use the location picker in the TUI, or pass the mounted volume path explicitly
-for line-oriented output and automation:
+for line-oriented output and automation. NAS/server-managed recycle directories
+are separate from the Trash shown by Finder, so an empty Finder Trash does not
+mean a share's `#recycle` or `@Recycle` directory is empty:
 
 ```bash
 ./target/release/mac-cleanup --volume "/Volumes/Work Drive"
@@ -125,12 +131,12 @@ Large app-managed areas are also shown as `REVIEW` findings when present:
 These locations can contain valuable state. They are never included in normal
 selection, “select all,” or unattended cleanup and should preferably be reduced
 using the controls in Xcode, Cursor, OrbStack, or Telegram. Clean mode also
-offers advanced deletion for one highlighted `REVIEW` item at a time: press
-`d`, inspect the exact path and impact, then type `DELETE`. This permanently
-clears everything inside that app-managed directory and can remove settings,
-history, containers, simulator apps, or local account data. The related app
-must be closed, and the same path, symlink, type, and allowlist checks are
-repeated immediately before deletion.
+offers advanced deletion for one highlighted `REVIEW` item at a time: highlight
+it and press `d`, inspect the exact path and impact, then type `DELETE`. This
+permanently clears everything inside that app-managed directory and can remove
+settings, history, containers, simulator apps, or local account data. The
+related app must be closed, and the same path, symlink, type, and allowlist
+checks are repeated immediately before deletion.
 
 ## Automation and plain output
 

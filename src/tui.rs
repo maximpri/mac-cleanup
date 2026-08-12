@@ -157,6 +157,7 @@ impl DirectoryScan {
 
 struct App {
     mode: Mode,
+    analysis_only: bool,
     account_home: PathBuf,
     scan_root: PathBuf,
     locations: Vec<ScanLocation>,
@@ -206,6 +207,7 @@ impl App {
             .unwrap_or(0);
         Ok(Self {
             mode: cli.mode(),
+            analysis_only: cli.analyze,
             account_home: home.to_path_buf(),
             scan_root: scan_root.clone(),
             locations,
@@ -377,9 +379,13 @@ impl App {
             Phase::Review => self.handle_review_key(key.code),
             Phase::Details => match key.code {
                 KeyCode::Char('d') | KeyCode::Char('D')
-                    if self.mode == Mode::Clean && self.current_is_review_data() =>
+                    if !self.analysis_only && self.current_is_review_data() =>
                 {
+                    self.mode = Mode::Clean;
                     self.start_review_confirmation();
+                }
+                KeyCode::Char('c') | KeyCode::Char('C') if !self.analysis_only => {
+                    self.prepare_safe_cleanup();
                 }
                 KeyCode::Enter | KeyCode::Esc => self.phase = Phase::Review,
                 KeyCode::Char('q') => self.quit = true,
@@ -439,9 +445,13 @@ impl App {
             KeyCode::Char(' ') if self.mode == Mode::Clean => self.toggle_current(),
             KeyCode::Char('a') if self.mode == Mode::Clean => self.toggle_all(),
             KeyCode::Char('d') | KeyCode::Char('D')
-                if self.mode == Mode::Clean && self.current_is_review_data() =>
+                if !self.analysis_only && self.current_is_review_data() =>
             {
+                self.mode = Mode::Clean;
                 self.start_review_confirmation();
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') if !self.analysis_only => {
+                self.prepare_safe_cleanup();
             }
             KeyCode::Char('i') => {
                 self.include_reinstallable = !self.include_reinstallable;
@@ -478,6 +488,20 @@ impl App {
         } else {
             self.selected.extend(selectable);
         }
+    }
+
+    fn prepare_safe_cleanup(&mut self) {
+        self.mode = Mode::Clean;
+        self.selected.clear();
+        let selectable: Vec<usize> = (0..self.entries.len())
+            .filter(|&index| self.is_selectable(index))
+            .collect();
+        self.selected.extend(selectable);
+        self.phase = if self.selected.is_empty() {
+            Phase::Review
+        } else {
+            Phase::Confirm
+        };
     }
 
     fn is_selectable(&self, index: usize) -> bool {
@@ -1002,10 +1026,14 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
             );
         }
         Phase::Review => {
-            let help = if app.mode == Mode::Clean {
-                "↑↓/jk move   space select   a all   d delete REVIEW   enter details/continue   i opt-in   v volume   r rescan   q quit"
-            } else {
+            let help = if app.analysis_only {
                 "↑↓/jk move   enter details   i reinstallables   v volume   r rescan   q quit"
+            } else if app.mode == Mode::Clean {
+                "↑↓/jk move   space select   a all safe   c clean all safe   d delete REVIEW   enter details/continue   i opt-in   v volume   r rescan   q quit"
+            } else if app.current_is_review_data() {
+                "d delete this REVIEW   c clean all safe   enter details   i opt-in   v volume   r rescan   q quit"
+            } else {
+                "c clean all safe   enter details   i opt-in   v volume   r rescan   q quit"
             };
             frame.render_widget(
                 Paragraph::new(help)
@@ -1198,8 +1226,10 @@ fn render_entry_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ]),
         Line::from(""),
         Line::from(
-            if app.mode == Mode::Clean && entry.status == CacheStatus::Review {
-                "d advanced delete   •   Enter/Esc close details   •   q quit"
+            if !app.analysis_only && entry.status == CacheStatus::Review {
+                "d advanced delete   •   c clean all safe   •   Enter/Esc close"
+            } else if !app.analysis_only && app.mode == Mode::Analyze {
+                "c clean all safe   •   Enter/Esc close details   •   q quit"
             } else {
                 "Enter/Esc close details   •   q quit"
             },
@@ -1582,6 +1612,129 @@ mod tests {
 
         assert_eq!(app.phase, Phase::Confirm);
         assert!(!app.quit);
+    }
+
+    #[test]
+    fn default_tui_can_prepare_all_safe_items_without_a_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = Cli {
+            analyze: false,
+            clean: false,
+            include_reinstallable: false,
+            volume: None,
+            yes: false,
+            verbose: false,
+            no_color: true,
+            no_tui: false,
+        };
+        let mut app = App::new(&cli, temp.path()).unwrap();
+        app.entries = vec![
+            CacheEntry {
+                spec: app.specs[0].clone(),
+                status: CacheStatus::Ready,
+                size_kb: 10,
+                outcome: None,
+            },
+            CacheEntry {
+                spec: app.specs[1].clone(),
+                status: CacheStatus::InUse,
+                size_kb: 20,
+                outcome: None,
+            },
+            CacheEntry {
+                spec: app.specs[2].clone(),
+                status: CacheStatus::Review,
+                size_kb: 30,
+                outcome: None,
+            },
+        ];
+        app.phase = Phase::Details;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+
+        assert_eq!(app.mode, Mode::Clean);
+        assert_eq!(app.phase, Phase::Confirm);
+        assert_eq!(app.selected, BTreeSet::from([0]));
+    }
+
+    #[test]
+    fn explicit_analyze_mode_keeps_safe_cleanup_locked() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = Cli {
+            analyze: true,
+            clean: false,
+            include_reinstallable: false,
+            volume: None,
+            yes: false,
+            verbose: false,
+            no_color: true,
+            no_tui: false,
+        };
+        let mut app = App::new(&cli, temp.path()).unwrap();
+        app.entries = vec![CacheEntry {
+            spec: app.specs[0].clone(),
+            status: CacheStatus::Ready,
+            size_kb: 10,
+            outcome: None,
+        }];
+        app.phase = Phase::Review;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+
+        assert_eq!(app.mode, Mode::Analyze);
+        assert_eq!(app.phase, Phase::Review);
+        assert!(app.selected.is_empty());
+    }
+
+    #[test]
+    fn default_tui_shows_and_accepts_review_deletion_shortcut() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli = Cli {
+            analyze: false,
+            clean: false,
+            include_reinstallable: false,
+            volume: None,
+            yes: false,
+            verbose: false,
+            no_color: true,
+            no_tui: false,
+        };
+        let mut app = App::new(&cli, temp.path()).unwrap();
+        let review_spec = app
+            .specs
+            .iter()
+            .find(|spec| spec.label == "Cursor user data")
+            .unwrap()
+            .clone();
+        app.entries = vec![CacheEntry {
+            spec: review_spec,
+            status: CacheStatus::Review,
+            size_kb: 10,
+            outcome: None,
+        }];
+        app.phase = Phase::Details;
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let rendered =
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .fold(String::new(), |mut text, cell| {
+                    text.push_str(cell.symbol());
+                    text
+                });
+        assert!(rendered.contains("d advanced delete"));
+        assert!(rendered.contains("c clean all safe"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+
+        assert_eq!(app.mode, Mode::Clean);
+        assert_eq!(app.phase, Phase::ReviewConfirm);
+        assert_eq!(app.review_target, Some(0));
     }
 
     #[test]

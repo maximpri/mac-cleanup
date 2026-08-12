@@ -344,18 +344,18 @@ fn volume_specs(root: &Path) -> Vec<CacheSpec> {
         ),
         (
             "#recycle",
-            "Recycle bin",
-            "files already moved to this volume's recycle bin",
+            "NAS recycle bin",
+            "server-managed deleted files; this is separate from Finder Trash",
         ),
         (
             "@Recycle",
-            "Recycle bin",
-            "files already moved to this volume's recycle bin",
+            "NAS recycle bin",
+            "server-managed deleted files; this is separate from Finder Trash",
         ),
         (
             "$RECYCLE.BIN",
             "Windows recycle bin",
-            "files already moved to this volume's recycle bin",
+            "Windows-managed deleted files; this is separate from Finder Trash",
         ),
         (
             ".TemporaryItems",
@@ -959,6 +959,8 @@ mod tests {
             .unwrap();
         let entry = scan_cache(&spec, false);
 
+        assert_eq!(entry.spec.label, "NAS recycle bin");
+        assert!(entry.spec.note.contains("separate from Finder Trash"));
         assert_eq!(entry.status, CacheStatus::Ready);
         assert!(entry.size_kb > 0);
     }

@@ -16,7 +16,7 @@ pub enum Mode {
     after_help = "Cleanup is permanent. Close related apps first, and never run this command with sudo."
 )]
 pub struct Cli {
-    /// Read-only report (the default)
+    /// Keep the entire run read-only (the TUI defaults to analysis but can opt into cleanup)
     #[arg(long, conflicts_with = "clean")]
     pub analyze: bool,
 
