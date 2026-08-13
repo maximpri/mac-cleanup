@@ -25,8 +25,9 @@ cargo build --release
 ```
 
 The default interactive screen can move from analysis to cleanup without a
-restart. Press `c` after the scan to review and confirm all currently safe
-`READY` items. To start directly in cleanup mode instead, use:
+restart. Highlight a safe `READY` item and press `d` to delete just that item,
+or press `c` to review and confirm all currently safe items. To start directly
+in cleanup mode instead, use:
 
 ```bash
 ./target/release/mac-cleanup --clean
@@ -54,7 +55,7 @@ default. Personal files are never inferred to be waste.
 | `Space` | Select or deselect the highlighted eligible item. |
 | `a` | Select or deselect all eligible items. |
 | `c` | Select all safe `READY` items and open the cleanup confirmation. |
-| `d` | Begin advanced deletion for the single highlighted `REVIEW` item. |
+| `d` | Delete the highlighted safe item, or begin guarded deletion for a highlighted `REVIEW` item. |
 | `o` | Reveal the highlighted exact path in Finder. |
 | `i` | Toggle large reinstallable items and rescan. |
 | `v` | Return to the home/volume picker. |
@@ -74,9 +75,10 @@ location picker; `q` quits.
 After cleanup, the final summary closes automatically after five seconds.
 Press `Enter`, `q`, or `Esc` to close it immediately.
 
-The default TUI starts in analysis mode. `c` opts into ordinary safe cleanup,
-and `d` opts into a guarded single-item `REVIEW` deletion. Passing `--analyze`
-explicitly locks the entire run to read-only analysis and hides both actions.
+The default TUI starts in analysis mode. `d` opens confirmation for the single
+highlighted safe item, while `c` selects all safe items. On a `REVIEW` finding,
+`d` instead starts the guarded typed-confirmation flow. Passing `--analyze`
+explicitly locks the entire run to read-only analysis and hides these actions.
 
 ## Scan another volume
 
