@@ -53,7 +53,7 @@ use crate::{
     },
     relocation::{self, RelocationPlan, RelocationReport, RelocationStatus},
     retention::TempRetentionScan,
-    storage::{StorageInventory, StorageItem, StorageItemKind},
+    storage::{StorageCategory, StorageInventory, StorageItem, StorageItemKind},
     whitelist::Whitelist,
 };
 

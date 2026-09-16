@@ -70,11 +70,14 @@ Each level shows allocated size, percentage of its measured children, and size
 bars on wide screens. Folder totals include their children; each list contains
 one level rather than overlapping ancestors and descendants.
 
-Use the three storage tabs, their letter shortcuts, or `[` / `]`:
+Use the four storage tabs, their letter shortcuts, or `[` / `]`:
 
 - **e Explore folders** — follow the space usage down to individual files.
+- **h Storage heatmap** — compare direct children at a glance. Each tile is
+  proportional to allocated space; colors label cleanable, optional, and
+  review-only data. Select a tile and press `Enter` to drill into it.
 - **f Cleanup decisions** — inspect findings, removal impact, recovery, and the
-  recommended next step. From Explore, this selects an exact matching finding
+  recommended next step. From Explore or Heatmap, this selects an exact matching finding
   or a finding inside the selected folder when available. `e` opens the selected
   finding's contents when they were measured. Space selects a safe item;
   Enter reviews the selection. `c` reviews all safe items; `d` reviews one item.
@@ -133,15 +136,15 @@ remain visible.
 | `F9` / `F10` | Open the commands menu / quit. `Alt+F`, `Alt+N`, `Alt+A`, and `Alt+H` open File, Navigate, Actions, and Help. |
 | Mouse | Click the left menu or visible table rows; use the wheel to scroll lists and dialogs. |
 | `↑` / `↓` or `j` / `k` | Move through the current list. |
-| `e` / `f` / `v` | Explore folders / cleanup decisions / scan coverage. `[` / `]` cycles these views. |
-| `←` / `Backspace` | Return to the parent in Explore. |
+| `e` / `h` / `f` / `v` | Explore folders / storage heatmap / cleanup decisions / scan coverage. `[` / `]` cycles these views. |
+| `←` / `Backspace` | Return to the parent in Explore or Heatmap. |
 | `Space` | In Cleanup decisions, select or deselect the highlighted eligible item; available from default mode. |
 | `a` | Select or deselect all eligible items. |
 | `c` | Select all safe `READY` items and open the cleanup confirmation. |
 | `d` | Delete the highlighted safe item, opt in to one highlighted `OPTIONAL` item, or begin guarded deletion for a highlighted `REVIEW` item. |
 | `m` | Open the largest-consumer relocation flow and move selected useful data to an external volume. |
 | `o` | Reveal the highlighted exact path in Finder. |
-| `i` | Explore: open scrollable item information. Cleanup decisions: toggle reinstallable items and rescan. |
+| `i` | Explore or Heatmap: open scrollable item information. Cleanup decisions: toggle reinstallable items and rescan. |
 | `r` | Rescan storage, or refresh the process list from process review. |
 | `Enter` | Open the highlighted task, show details, or review selected cleanup items. |
 | `y` | Confirm the permanent deletion in the confirmation dialog. |

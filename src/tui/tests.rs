@@ -1813,6 +1813,7 @@ fn storage_tabs_mouse_and_coverage_work_at_supported_sizes() {
     for (width, height) in [(60, 16), (80, 24), (120, 30), (160, 40)] {
         for (name, tab) in [
             ("explore", StorageTab::Explore),
+            ("heatmap", StorageTab::Heatmap),
             ("decisions", StorageTab::Decisions),
             ("coverage", StorageTab::Coverage),
         ] {
@@ -1820,10 +1821,15 @@ fn storage_tabs_mouse_and_coverage_work_at_supported_sizes() {
             let buffer = draw_fixture(&mut app, width, height);
             let text = buffer_text(&buffer);
             assert!(text.contains("e Explore"));
+            assert!(text.contains("h Heatmap") || text.contains("h Storage heatmap"));
             assert!(text.contains("f Cleanup"));
             assert!(text.contains("v Coverage") || text.contains("v Scan coverage"));
             if tab == StorageTab::Explore {
                 assert!(text.contains("FOLDER / FILE"));
+            }
+            if tab == StorageTab::Heatmap {
+                assert!(text.contains("STORAGE HEATMAP"));
+                assert!(text.contains("ACTIONS"));
             }
             if tab == StorageTab::Coverage {
                 assert!(text.contains("Partial scan"));
@@ -1864,9 +1870,36 @@ fn storage_tabs_mouse_and_coverage_work_at_supported_sizes() {
     app.handle_review_key(KeyCode::Left);
     assert_eq!(app.explorer_cursor, 1);
     app.handle_review_key(KeyCode::Char(']'));
+    assert_eq!(app.storage_tab, StorageTab::Heatmap);
+    app.handle_review_key(KeyCode::Char(']'));
     assert_eq!(app.storage_tab, StorageTab::Decisions);
     app.handle_review_key(KeyCode::Char('['));
-    assert_eq!(app.storage_tab, StorageTab::Explore);
+    assert_eq!(app.storage_tab, StorageTab::Heatmap);
+    app.handle_review_key(KeyCode::Char('h'));
+    assert_eq!(app.storage_tab, StorageTab::Heatmap);
+    app.explorer_cursor = 0;
+    draw_fixture(&mut app, 160, 40);
+    let (area, _) = *app
+        .hit_regions
+        .borrow()
+        .iter()
+        .find(|(_, target)| matches!(target, HitTarget::Consumer(1)))
+        .unwrap();
+    app.handle_left_click(area.x + 2, area.y);
+    assert_eq!(app.explorer_cursor, 1);
+    app.handle_left_click(area.x + 2, area.y);
+    assert_eq!(
+        app.explorer_path.as_deref(),
+        Some(Path::new("/Users/demo/Projects"))
+    );
+}
+
+#[test]
+fn heatmap_tiles_preserve_size_weight_and_fill_the_grid() {
+    let counts = heatmap_tile_counts(&[40, 35, 25], 100, 7);
+    assert_eq!(counts.iter().sum::<usize>(), 7);
+    assert_eq!(counts, vec![3, 2, 2]);
+    assert_eq!(heatmap_tile_counts(&[0, 0], 0, 4), vec![0, 0]);
 }
 
 #[test]

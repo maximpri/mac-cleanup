@@ -12,6 +12,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   storage audit automatically and opens the Storage audit when it is ready;
   the persistent menu contains Storage, Process health, and Move data.
 
+- Added a proportional Storage heatmap (`h`) so large folders and cleanable
+  areas are visible before an operator makes a cleanup decision.
+
 - Made sidebar menu items and their selection highlight occupy one row, with
   mouse targets aligned to the compact menu.
 

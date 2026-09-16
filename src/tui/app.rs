@@ -772,7 +772,7 @@ impl App {
 
     pub(super) fn reveal_current(&mut self) {
         let path = if self.phase == Phase::Review
-            && self.storage_tab == StorageTab::Explore
+            && matches!(self.storage_tab, StorageTab::Explore | StorageTab::Heatmap)
             && self.inventory.is_some()
         {
             let Some(item) = self.explorer_items().get(self.explorer_cursor).cloned() else {

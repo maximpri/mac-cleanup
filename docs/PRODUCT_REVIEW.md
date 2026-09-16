@@ -143,7 +143,8 @@ available from the findings that populate it. This is a proposed destination map
 it does not imply those screens already exist.
 
 The main pane leads with a plain-language conclusion, the measurements supporting
-it, and available next actions. Exact implementation details belong in inspection
+it, the proportional storage heatmap makes large and potentially cleanable areas
+visible at a glance, and available next actions. Exact implementation details belong in inspection
 and review. User-facing action names should describe the outcome: review cleanup,
 quit this app, inspect this folder, or move this folder. Preserve stable shortcuts
 and keep all essential actions visible and reachable by mouse or keyboard.

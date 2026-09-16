@@ -38,7 +38,7 @@ that one menu pattern is universally best.
 | 1–3 | Open a section directly, when navigation is available. |
 | Click | Focus the clicked pane; a menu row also opens that section. |
 | Mouse wheel | Scroll the pane under the pointer. |
-| e / f / v or [ / ] in storage content | Choose a storage view. |
+| e / h / f / v or [ / ] in storage content | Choose Explore, Heatmap, Cleanup decisions, or Scan coverage. |
 | F9 / ? | Commands / keyboard help. |
 
 The open section remains marked when the menu cursor moves elsewhere. Only the

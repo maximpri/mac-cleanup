@@ -71,8 +71,8 @@ pub(super) fn render_help_overlay_if_open(frame: &mut Frame<'_>, area: Rect, app
     let rows = [
         ("1 / 2 / 3", "Storage / processes / move data"),
         (
-            "e / f / v",
-            "Explore folders / cleanup decisions / scan coverage",
+            "e / h / f / v",
+            "Explore folders / storage heatmap / cleanup decisions / scan coverage",
         ),
         ("F8", "Switch pane (alternative to Tab)"),
         (

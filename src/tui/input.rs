@@ -328,7 +328,8 @@ impl App {
                 });
             }
             Phase::Review
-                if self.inventory.is_some() && self.storage_tab == StorageTab::Explore =>
+                if self.inventory.is_some()
+                    && matches!(self.storage_tab, StorageTab::Explore | StorageTab::Heatmap) =>
             {
                 let length = self.explorer_items().len();
                 move_cursor(&mut self.explorer_cursor, length);

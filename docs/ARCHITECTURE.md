@@ -48,8 +48,10 @@ and focus markers communicate state independently of color. Terminal font choice
 remains under the user's control.
 
 - **Storage audit:** location selection, visible scan stages, readable findings,
-  and separate reclaimable/selected totals. Wide terminals have a persistent
-  inspector; normal terminals use a lower details panel and an expandable dialog.
+  and separate reclaimable/selected totals. Explore, Heatmap, Cleanup decisions,
+  and Scan coverage share one inventory and drill-down state. Wide terminals have
+  a persistent inspector; normal terminals use a lower details panel and an
+  expandable dialog.
 - **Process health:** current-account process inventory with explicit abnormal
   states and separate graceful/force signal choices.
 - **Move data:** source review, destination input, validation, confirmation,
