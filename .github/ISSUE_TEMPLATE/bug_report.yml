@@ -1,0 +1,82 @@
+name: Bug report
+description: Report reproducible incorrect or unsafe behavior.
+title: "bug: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for the report. Remove usernames, personal paths, filenames,
+        tokens, cookies, and other private data before submitting logs or images.
+
+  - type: input
+    id: version
+    attributes:
+      label: Mac Cleanup version
+      description: Run `mac-cleanup --version` or provide the commit SHA.
+      placeholder: mac-cleanup 0.2.0
+    validations:
+      required: true
+
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version and architecture
+      placeholder: macOS 15.x, Apple silicon
+    validations:
+      required: true
+
+  - type: dropdown
+    id: interface
+    attributes:
+      label: Interface
+      options:
+        - TUI
+        - Plain text
+        - JSON
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - Analyze
+        - Interactive cleanup
+        - Unattended cleanup with --yes
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Use disposable data and include sanitized commands or key presses.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and sanitized output
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I did not run Mac Cleanup with `sudo` or as root.
+          required: true
+        - label: I removed personal and secret data from this report.
+          required: true
+        - label: This report does not disclose a vulnerability that could put users' data at risk.
+          required: true

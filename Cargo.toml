@@ -1,15 +1,25 @@
 [package]
 name = "mac-cleanup"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
-description = "A conservative macOS cache cleaner with a Ratatui interface"
+description = "Conservative macOS process health and storage maintenance in a Ratatui interface"
+authors = ["Maxim Priezjev"]
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/maximpri/mac-cleanup"
+homepage = "https://github.com/maximpri/mac-cleanup"
+keywords = ["macos", "process", "cleanup", "system", "tui"]
+categories = ["command-line-utilities"]
+# Another project already owns `mac-cleanup` on crates.io. Keep source and
+# GitHub releases publishable without allowing an accidental registry upload.
+publish = false
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
 crossterm = "0.29.0"
-ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
+# Pinned because wrapped-dialog measurement uses rendered-line-info.
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm_0_29", "layout-cache", "unstable-rendered-line-info"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 

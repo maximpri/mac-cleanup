@@ -1,0 +1,33 @@
+name: Feature request
+description: Propose a focused improvement or a new cleanup target.
+title: "feature: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user need is not currently addressed?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Explain the interface and expected safety behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: target
+    attributes:
+      label: Cleanup-target details
+      description: If applicable, identify the owning app, exact path pattern, data type, recovery path, process name, and official cleanup command.
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety classification
+      options:
+        - label: I have explained whether the data is regenerable, reinstallable, or personal/app-managed.
+        - label: I have identified any data-loss or re-download impact.

@@ -1,1 +1,7 @@
 /target/
+.DS_Store
+*.profraw
+*.swp
+cleanup-report*.json
+
+/scripts/__pycache__/

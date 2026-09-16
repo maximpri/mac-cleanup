@@ -13,7 +13,8 @@ fn main() -> ExitCode {
         }
     };
 
-    let result = if !cli.json && !cli.no_tui && !cli.yes && tui::can_run() {
+    let result = if !cli.json && !cli.no_tui && !cli.yes && cli.relocate.is_none() && tui::can_run()
+    {
         tui::run(&cli, &home)
     } else {
         plain::run(&cli, &home)
@@ -33,7 +34,7 @@ fn print_error(cli: &Cli, error: &str) {
         println!(
             "{}",
             serde_json::json!({
-                "schema_version": 1,
+                "schema_version": 5,
                 "error": error,
             })
         );
