@@ -407,6 +407,12 @@ impl App {
                         self.explorer_cursor = index;
                     }
                 }
+                HitTarget::MapNode(index) if self.phase == Phase::Review => {
+                    let path = self.map_paths.borrow().get(index).cloned();
+                    if let Some(path) = path {
+                        self.open_map_path(&path);
+                    }
+                }
                 HitTarget::Finding(index) if self.phase == Phase::Review => self.cursor = index,
                 HitTarget::Location(index) if self.phase == Phase::Location => {
                     self.location_cursor = index

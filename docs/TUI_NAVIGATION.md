@@ -39,6 +39,9 @@ that one menu pattern is universally best.
 | Click | Focus the clicked pane; a menu row also opens that section. |
 | Mouse wheel | Scroll the pane under the pointer. |
 | e / h / f / v or [ / ] in storage content | Choose Explore, Heatmap, Cleanup decisions, or Scan coverage. |
+| Click a storage-map rectangle | Open that exact folder or inspect that file; preserve cleanup selection. |
+| h / e in storage content | Expand the selected item’s map / return to the folder browser. |
+| i in storage content | Read full information and decision guidance for the selection. |
 | F9 / ? | Commands / keyboard help. |
 
 The open section remains marked when the menu cursor moves elsewhere. Only the

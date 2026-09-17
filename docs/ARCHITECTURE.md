@@ -50,9 +50,13 @@ remains under the user's control.
 - **Storage audit:** location selection, visible scan stages, readable findings,
   and separate reclaimable/selected totals. Explore, Heatmap, Cleanup decisions,
   and Scan coverage share one inventory and drill-down state. Wide terminals have
-  a persistent inspector; normal terminals use a lower details panel and an
-  expandable dialog. The persistent sidebar renders a compact space map from
-  the same current-level children and cleanup classifications.
+  a nested treemap beside the folder browser; `h` expands it at every supported
+  width, and `i` opens full decision details. `folder_map.rs` partitions terminal
+  rectangles by allocated size and reads descendants from the existing inventory.
+  Nested rectangles register their exact paths before parent hit regions, so
+  clicking a child opens that child. Branch colors never imply cleanup eligibility.
+  Small items are aggregated; unexplained parent bytes retain their own area.
+  The left sidebar shows scan status instead of duplicating the chart.
 - **Process health:** current-account process inventory with explicit abnormal
   states and separate graceful/force signal choices.
 - **Move data:** source review, destination input, validation, confirmation,

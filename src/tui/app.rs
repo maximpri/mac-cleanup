@@ -120,6 +120,7 @@ impl App {
             dialog_scroll: 0,
             dialog_max_scroll: std::cell::Cell::new(0),
             hit_regions: std::cell::RefCell::new(Vec::new()),
+            map_paths: std::cell::RefCell::new(Vec::new()),
             quit: false,
         })
     }

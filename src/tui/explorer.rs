@@ -8,16 +8,6 @@ pub(super) enum StorageTab {
     Coverage,
 }
 
-const MAX_HEATMAP_SEGMENTS: usize = 20;
-
-struct HeatmapSegment {
-    item_index: Option<usize>,
-    name: String,
-    size_kb: u64,
-    action: &'static str,
-    color: Color,
-}
-
 impl App {
     pub(super) fn explorer_items(&self) -> Vec<&StorageItem> {
         let Some(inventory) = &self.inventory else {
@@ -263,7 +253,7 @@ pub(super) fn render_storage_workspace(frame: &mut Frame<'_>, area: Rect, app: &
     let regions = Layout::vertical([
         Constraint::Length(if compact { 3 } else { 4 }),
         Constraint::Length(if compact { 2 } else { 3 }),
-        Constraint::Length(if compact { 1 } else { 2 }),
+        Constraint::Length(1),
         Constraint::Length(if compact { 1 } else { 3 }),
         Constraint::Min(2),
         Constraint::Length(if compact { 2 } else { 3 }),
@@ -298,7 +288,7 @@ pub(super) fn render_storage_workspace(frame: &mut Frame<'_>, area: Rect, app: &
             } else {
                 Style::default().fg(app.color(MUTED))
             }),
-            tabs[index],
+            Rect::new(tabs[index].x, tabs[index].y, tabs[index].width, 1),
         );
         app.hit_regions
             .borrow_mut()
@@ -320,7 +310,7 @@ pub(super) fn render_storage_workspace(frame: &mut Frame<'_>, area: Rect, app: &
                 format_kb(inventory.scanned_kb)
             ),
             StorageTab::Heatmap => format!(
-                "Where is the waste?  {} measured · larger blocks use more space",
+                "Storage map · {} measured · larger areas use more space",
                 format_kb(inventory.scanned_kb)
             ),
             StorageTab::Decisions => format!(
@@ -335,10 +325,10 @@ pub(super) fn render_storage_workspace(frame: &mut Frame<'_>, area: Rect, app: &
     };
     let subtitle = match app.storage_tab {
         StorageTab::Explore => {
-            "Enter opens a folder. Each row is a direct child; parent totals are never added to children."
+            "Choose a folder to see inside it. Enter opens it; ← returns to the parent."
         }
         StorageTab::Heatmap => {
-            "Each tile is proportional to allocated space. Colors show cleanable, optional, or review-only data."
+            "Area shows size. Folder colors help you navigate; cleanup eligibility is reviewed separately."
         }
         StorageTab::Decisions => {
             "Select a finding to see its impact and recovery options. Enter reviews details or your selection."
@@ -377,7 +367,7 @@ pub(super) fn render_storage_workspace(frame: &mut Frame<'_>, area: Rect, app: &
                 render_consumer_inspector(frame, regions[4], app);
             } else if area.width >= 90 {
                 let body =
-                    Layout::horizontal([Constraint::Percentage(64), Constraint::Percentage(36)])
+                    Layout::horizontal([Constraint::Percentage(48), Constraint::Percentage(52)])
                         .spacing(1)
                         .split(regions[4]);
                 render_explorer(frame, body[0], app);
@@ -401,18 +391,7 @@ pub(super) fn render_storage_workspace(frame: &mut Frame<'_>, area: Rect, app: &
             );
         }
         StorageTab::Heatmap => {
-            if app.explorer_details {
-                render_consumer_inspector(frame, regions[4], app);
-            } else if area.width >= 90 {
-                let body =
-                    Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)])
-                        .spacing(1)
-                        .split(regions[4]);
-                render_heatmap(frame, body[0], app);
-                render_consumer_inspector(frame, body[1], app);
-            } else {
-                render_heatmap(frame, regions[4], app);
-            }
+            render_consumer_inspector(frame, regions[4], app);
             render_command_bar(
                 frame,
                 regions[5],
@@ -589,340 +568,25 @@ fn render_explorer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     render_vertical_scrollbar(frame, area, items.len(), app.explorer_cursor, app);
 }
 
-fn render_heatmap(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let path = app
-        .explorer_path
-        .as_ref()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "All scanned locations".into());
-    let title = format!(
-        " STORAGE HEATMAP · {} ",
-        truncate_middle(&path, area.width.saturating_sub(24) as usize)
-    );
-    let block = panel(app, title);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.width < 12 || inner.height < 4 {
-        frame.render_widget(
-            label(app, "Expand the terminal to see the storage heatmap."),
-            inner,
-        );
-        return;
-    }
-
-    let items = app.explorer_items();
-    if items.is_empty() {
-        frame.render_widget(
-            Paragraph::new(vec![
-                heading(app, "No measured children"),
-                label(
-                    app,
-                    "This folder may be empty, unreadable, or outside scan coverage.",
-                ),
-                label(app, "Run a rescan or open Scan coverage for missing space."),
-            ])
-            .wrap(Wrap { trim: true }),
-            inner,
-        );
-        return;
-    }
-
-    let top = Rect::new(inner.x, inner.y, inner.width, 1);
-    frame.render_widget(
-        label(
-            app,
-            "Larger tiles use more allocated space · select one to inspect or open it",
-        ),
-        top,
-    );
-    let body = Rect::new(
-        inner.x,
-        inner.y.saturating_add(1),
-        inner.width,
-        inner.height.saturating_sub(1),
-    );
-    let columns = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .spacing(1)
-        .split(body);
-    let chart = columns[0];
-    let legend = columns[1];
-    let segments = heatmap_segments(app);
-    let tile_columns = (chart.width / 2) as usize;
-    let tile_rows = chart.height as usize;
-    if tile_columns == 0 || tile_rows == 0 {
-        return;
-    }
-    let tile_count = tile_columns.saturating_mul(tile_rows);
-    let sizes: Vec<u64> = segments.iter().map(|segment| segment.size_kb).collect();
-    let total = sizes.iter().sum();
-    let counts = heatmap_tile_counts(&sizes, total, tile_count);
-    let mut owners = Vec::with_capacity(tile_count);
-    for (index, count) in counts.iter().enumerate() {
-        owners.extend(std::iter::repeat_n(index, *count));
-    }
-    owners.resize(tile_count, segments.len().saturating_sub(1));
-
-    let lines = (0..tile_rows)
-        .map(|row| {
-            let mut spans = Vec::with_capacity(tile_columns);
-            for col in 0..tile_columns {
-                let owner = owners[row * tile_columns + col];
-                let segment = &segments[owner];
-                let mut style = Style::default().fg(app.color(segment.color));
-                if segment.item_index == Some(app.explorer_cursor) {
-                    style = style.add_modifier(Modifier::BOLD | Modifier::REVERSED);
-                }
-                spans.push(Span::styled(heatmap_marker(segment.action), style));
-            }
-            Line::from(spans)
-        })
-        .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(lines), chart);
-
-    let legend_width = legend.width.saturating_sub(3) as usize;
-    let selected_line = app
-        .explorer_items()
-        .get(app.explorer_cursor)
-        .map(|item| {
-            format!(
-                "Selected: {}",
-                truncate_middle(&item.path.display().to_string(), legend_width)
-            )
-        })
-        .unwrap_or_else(|| "Select a tile to see its exact path.".into());
-    let mut legend_lines = vec![
-        heading(app, "ACTIONS · TOP CONSUMERS"),
-        label(app, selected_line),
-        Line::from(""),
-    ];
-    for segment in &segments {
-        let percent = if total == 0 {
-            0.0
-        } else {
-            segment.size_kb as f64 * 100.0 / total as f64
-        };
-        let marker_style = Style::default().fg(app.color(segment.color));
-        let selected = segment.item_index == Some(app.explorer_cursor);
-        let prefix = if selected { "›" } else { " " };
-        let details = truncate_middle(
-            &format!("{percent:>5.1}% {} · {}", segment.name, segment.action),
-            legend_width,
-        );
-        legend_lines.push(Line::from(vec![
-            Span::styled(
-                prefix,
-                if selected {
-                    selected_row_style(app)
-                } else {
-                    Style::default()
-                },
-            ),
-            Span::styled(heatmap_marker(segment.action), marker_style),
-            Span::raw(format!(" {details}")),
-        ]));
-    }
-    frame.render_widget(Paragraph::new(legend_lines), legend);
-
-    let mut cursor = 0usize;
-    for (segment, count) in segments.iter().zip(counts) {
-        let Some(item_index) = segment.item_index else {
-            cursor += count;
-            continue;
-        };
-        let end = cursor.saturating_add(count);
-        while cursor < end {
-            let row = cursor / tile_columns;
-            let col = cursor % tile_columns;
-            let run = (end - cursor).min(tile_columns - col);
-            if run > 0 {
-                app.hit_regions.borrow_mut().push((
-                    Rect::new(
-                        chart.x + (col as u16).saturating_mul(2),
-                        chart.y + row as u16,
-                        (run as u16).saturating_mul(2).min(chart.width),
-                        1,
-                    ),
-                    HitTarget::Consumer(item_index),
-                ));
-            }
-            cursor += run;
-        }
-    }
-}
-
-fn heatmap_segments(app: &App) -> Vec<HeatmapSegment> {
-    let mut indexed = app
-        .explorer_items()
-        .into_iter()
-        .enumerate()
-        .collect::<Vec<_>>();
-    indexed.sort_by(|(_, left), (_, right)| {
-        right
-            .size_kb
-            .cmp(&left.size_kb)
-            .then_with(|| left.path.cmp(&right.path))
-    });
-    let keep = if indexed.len() > MAX_HEATMAP_SEGMENTS {
-        MAX_HEATMAP_SEGMENTS.saturating_sub(1)
-    } else {
-        indexed.len()
-    };
-    let mut segments = indexed
-        .iter()
-        .take(keep)
-        .map(|(item_index, item)| {
-            let (action, color) = heatmap_action(app, item);
-            HeatmapSegment {
-                item_index: Some(*item_index),
-                name: heatmap_item_name(item),
-                size_kb: item.size_kb,
-                action,
-                color,
-            }
-        })
-        .collect::<Vec<_>>();
-    if keep < indexed.len() {
-        let remainder = indexed
-            .iter()
-            .skip(keep)
-            .map(|(_, item)| item.size_kb)
-            .sum();
-        segments.push(HeatmapSegment {
-            item_index: None,
-            name: format!("{} smaller items", indexed.len() - keep),
-            size_kb: remainder,
-            action: "OTHER MEASURED",
-            color: MUTED,
-        });
-    }
-    segments
-}
-
-fn heatmap_item_name(item: &StorageItem) -> String {
-    item.path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| item.path.display().to_string())
-}
-
-pub(super) fn heatmap_action(app: &App, item: &StorageItem) -> (&'static str, Color) {
-    let exact_status = app
-        .entries
-        .iter()
-        .find(|entry| entry.spec.path == item.path)
-        .map(|entry| entry.status);
-    if let Some(status) = exact_status {
-        return match status {
-            CacheStatus::Ready => ("CLEANABLE", MINT),
-            CacheStatus::Optional => ("OPTIONAL", AMBER),
-            CacheStatus::Review => ("REVIEW / KEEP", CORAL),
-            CacheStatus::InUse => ("IN USE", AMBER),
-            CacheStatus::Whitelisted => ("PROTECTED", BLUE),
-            _ => heatmap_category_action(item.category),
-        };
-    }
-    let descendants = app
-        .entries
-        .iter()
-        .filter(|entry| entry.spec.path != item.path && entry.spec.path.starts_with(&item.path));
-    let mut has_ready = false;
-    let mut has_optional = false;
-    let mut has_review = false;
-    for entry in descendants {
-        has_ready |= entry.status == CacheStatus::Ready;
-        has_optional |= entry.status == CacheStatus::Optional;
-        has_review |= entry.status == CacheStatus::Review;
-    }
-    if has_ready {
-        ("CLEANABLE BELOW", MINT)
-    } else if has_optional {
-        ("OPTIONAL BELOW", AMBER)
-    } else if has_review {
-        ("REVIEW BELOW", CORAL)
-    } else {
-        heatmap_category_action(item.category)
-    }
-}
-
-fn heatmap_category_action(category: StorageCategory) -> (&'static str, Color) {
-    match category {
-        StorageCategory::TemporaryData => ("TEMPORARY", MINT),
-        StorageCategory::DeveloperData => ("DEVELOPER", BLUE),
-        StorageCategory::ApplicationData => ("APP DATA", ORCHID),
-        StorageCategory::Applications => ("APPLICATIONS", BLUE),
-        StorageCategory::PersonalData => ("PERSONAL / KEEP", CORAL),
-        StorageCategory::SystemData => ("SYSTEM / KEEP", MUTED),
-        StorageCategory::Other => ("REVIEW", MUTED),
-    }
-}
-
-pub(super) fn heatmap_marker(action: &str) -> &'static str {
-    if action.contains("CLEANABLE") || action == "TEMPORARY" {
-        "██"
-    } else if action.contains("OPTIONAL") || action == "IN USE" {
-        "▓▓"
-    } else if action.contains("REVIEW") || action.contains("KEEP") {
-        "░░"
-    } else if matches!(action, "DEVELOPER" | "APP DATA" | "APPLICATIONS") {
-        "▒▒"
-    } else {
-        "··"
-    }
-}
-
-pub(super) fn heatmap_tile_counts(sizes: &[u64], total: u64, tiles: usize) -> Vec<usize> {
-    if sizes.is_empty() || total == 0 || tiles == 0 {
-        return vec![0; sizes.len()];
-    }
-    let total_u128 = u128::from(total);
-    let tiles_u128 = tiles as u128;
-    let mut counts = sizes
-        .iter()
-        .map(|size| (u128::from(*size) * tiles_u128 / total_u128) as usize)
-        .collect::<Vec<_>>();
-    let nonzero = sizes.iter().filter(|size| **size > 0).count();
-    if nonzero <= tiles {
-        for (size, count) in sizes.iter().zip(&mut counts) {
-            if *size > 0 && *count == 0 {
-                *count = 1;
-            }
-        }
-    }
-    while counts.iter().sum::<usize>() > tiles {
-        let Some(index) = counts
-            .iter()
-            .enumerate()
-            .filter(|(_, count)| **count > 1)
-            .min_by_key(|(index, _)| sizes[*index])
-            .map(|(index, _)| index)
-        else {
-            break;
-        };
-        counts[index] -= 1;
-    }
-    let missing = tiles.saturating_sub(counts.iter().sum::<usize>());
-    if missing > 0 {
-        let mut order = (0..sizes.len()).collect::<Vec<_>>();
-        order.sort_by(|left, right| {
-            let left_remainder = (u128::from(sizes[*left]) * tiles_u128) % total_u128;
-            let right_remainder = (u128::from(sizes[*right]) * tiles_u128) % total_u128;
-            right_remainder
-                .cmp(&left_remainder)
-                .then_with(|| sizes[*right].cmp(&sizes[*left]))
-        });
-        for step in 0..missing {
-            counts[order[step % order.len()]] += 1;
-        }
-    }
-    counts
-}
-
 fn render_consumer_inspector(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let items = app.explorer_items();
     let Some(item) = items.get(app.explorer_cursor) else {
+        frame.render_widget(
+            Paragraph::new(vec![
+                heading(app, "No measured contents"),
+                label(app, "This folder may be empty or unreadable."),
+                label(app, "← Back    v Scan coverage"),
+            ])
+            .wrap(Wrap { trim: true })
+            .block(panel(app, " STORAGE MAP ")),
+            area,
+        );
         return;
     };
+    if !app.explorer_details {
+        super::folder_map::render_folder_map(frame, area, app, item);
+        return;
+    }
     let matched = app
         .entries
         .iter()
@@ -977,128 +641,7 @@ fn render_consumer_inspector(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let children = if item.kind == StorageItemKind::Directory {
-        app.inventory
-            .as_ref()
-            .and_then(|inventory| inventory.children.get(&item.path))
-    } else {
-        None
-    };
-    if !app.explorer_details
-        && children.is_some_and(|children| !children.is_empty())
-        && inner.height >= 12
-    {
-        let map_height = if inner.height >= 20 { 9 } else { 7 };
-        let body =
-            Layout::vertical([Constraint::Length(map_height), Constraint::Min(1)]).split(inner);
-        render_children_heatmap(frame, body[0], app, item, children.unwrap());
-        render_inspector_text(frame, body[1], app, lines);
-    } else {
-        render_inspector_text(frame, inner, app, lines);
-    }
-}
-
-fn render_children_heatmap(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &App,
-    parent: &StorageItem,
-    children: &[StorageItem],
-) {
-    let title = format!(
-        " CHILDREN HEATMAP · {} ",
-        truncate_middle(
-            &heatmap_item_name(parent),
-            area.width.saturating_sub(22) as usize
-        )
-    );
-    let block = panel(app, title);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.width < 12 || inner.height < 2 {
-        return;
-    }
-    let mut sorted = children.iter().collect::<Vec<_>>();
-    sorted.sort_by(|left, right| {
-        right
-            .size_kb
-            .cmp(&left.size_kb)
-            .then_with(|| left.path.cmp(&right.path))
-    });
-    let total: u64 = sorted.iter().map(|child| child.size_kb).sum();
-    let legend = Rect::new(inner.x, inner.y, inner.width, 1);
-    frame.render_widget(
-        label(
-            app,
-            "Size-weighted · ██ cleanable  ▓▓ optional  ░░ review/keep",
-        ),
-        legend,
-    );
-    let rows_area = Rect::new(
-        inner.x,
-        inner.y.saturating_add(1),
-        inner.width,
-        inner.height.saturating_sub(1),
-    );
-    let row_count = rows_area.height as usize;
-    let has_more = sorted.len() > row_count;
-    let visible_rows = if has_more {
-        row_count.saturating_sub(1)
-    } else {
-        row_count
-    };
-    let name_width = if rows_area.width >= 38 { 13 } else { 8 };
-    let value_width = 10usize;
-    let bar_width = (rows_area.width as usize).saturating_sub(name_width + value_width + 4);
-    for (row, child) in sorted.iter().take(visible_rows).enumerate() {
-        let (action, color) = heatmap_action(app, child);
-        let ratio = if total == 0 {
-            0.0
-        } else {
-            child.size_kb as f64 / total as f64
-        };
-        let fill = ((ratio * bar_width as f64).round() as usize)
-            .max(1)
-            .min(bar_width.max(1));
-        let marker = heatmap_marker(action).chars().next().unwrap_or('█');
-        let kind = match child.kind {
-            StorageItemKind::Directory => '▸',
-            StorageItemKind::Symlink => '@',
-            StorageItemKind::File => '·',
-        };
-        let name = truncate_middle(&format!("{kind} {}", heatmap_item_name(child)), name_width);
-        let percent = if total == 0 {
-            0.0
-        } else {
-            child.size_kb as f64 * 100.0 / total as f64
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    marker.to_string().repeat(fill),
-                    Style::default().fg(app.color(color)),
-                ),
-                Span::raw(" "),
-                Span::styled(name, Style::default().fg(app.color(MUTED))),
-                Span::raw(format!(" {:>8} {percent:>4.1}%", format_kb(child.size_kb))),
-            ])),
-            Rect::new(rows_area.x, rows_area.y + row as u16, rows_area.width, 1),
-        );
-    }
-    if has_more && row_count > 0 {
-        frame.render_widget(
-            label(
-                app,
-                format!("+ {} smaller children", sorted.len() - visible_rows),
-            ),
-            Rect::new(
-                rows_area.x,
-                rows_area.bottom().saturating_sub(1),
-                rows_area.width,
-                1,
-            ),
-        );
-    }
+    render_inspector_text(frame, inner, app, lines);
 }
 
 fn render_inspector_text(frame: &mut Frame<'_>, area: Rect, app: &App, lines: Vec<Line<'static>>) {

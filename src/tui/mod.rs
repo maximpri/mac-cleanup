@@ -53,13 +53,14 @@ use crate::{
     },
     relocation::{self, RelocationPlan, RelocationReport, RelocationStatus},
     retention::TempRetentionScan,
-    storage::{StorageCategory, StorageInventory, StorageItem, StorageItemKind},
+    storage::{StorageInventory, StorageItem, StorageItemKind},
     whitelist::Whitelist,
 };
 
 mod app;
 mod dialogs;
 mod explorer;
+mod folder_map;
 mod footer;
 mod helpers;
 mod input;
@@ -215,6 +216,7 @@ struct DirectoryScan {
 enum HitTarget {
     Finding(usize),
     Consumer(usize),
+    MapNode(usize),
     StorageTab(StorageTab),
     Location(usize),
     Process(usize),
@@ -293,6 +295,7 @@ struct App {
     dialog_scroll: u16,
     dialog_max_scroll: std::cell::Cell<u16>,
     hit_regions: std::cell::RefCell<Vec<(Rect, HitTarget)>>,
+    map_paths: std::cell::RefCell<Vec<PathBuf>>,
     quit: bool,
 }
 

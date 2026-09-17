@@ -69,18 +69,28 @@ children, so drilling down needs no terminal commands or repeated scans.
 Each level shows allocated size, percentage of its measured children, and size
 bars on wide screens. Folder totals include their children; each list contains
 one level rather than overlapping ancestors and descendants.
-The persistent left rail also shows a compact **Space map** of the largest
-children at the current level, so the biggest consumers remain visible while
-you review cleanup decisions.
-On wider terminals, **Understand & Decide** adds a children heatmap for the
-selected folder, including its measured subfolders and files.
+On wider terminals, the selected folder's **nested storage map** fills the right
+panel. Rectangle area represents allocated space; nested rectangles show its
+subfolders and files. Labels give names and sizes, with the largest children
+listed below. Click a rectangle to open that exact folder or inspect a file.
+`h` expands the selected item's map; `e` returns to the browser. Both share the
+same selection and navigation history. In narrow terminals, use `h` for the map
+and `i` for details.
+
+Colors distinguish folder branches, not cleanup eligibility. The map shows up
+to three child levels and ten named items per level; smaller items are grouped,
+while amounts missing from measured children appear as **Other / unmeasured**.
+Items too small for a terminal cell remain accessible in the folder browser.
+The map footer links to cleanup findings with `f` when available. The left menu
+shows scan coverage instead of a duplicate chart; menu rows and storage tabs
+use single-line highlights.
 
 Use the four storage tabs, their letter shortcuts, or `[` / `]`:
 
 - **e Explore folders** — follow the space usage down to individual files.
-- **h Storage heatmap** — compare direct children at a glance. Each tile is
-  proportional to allocated space; colors label cleanable, optional, and
-  review-only data. Select a tile and press `Enter` to drill into it.
+- **h Storage heatmap** — expand the selected folder's nested map. Use `↑` / `↓`
+  to select siblings, click a rectangle to open it, or `Enter` to open the
+  selected folder. `e` returns to the folder list.
 - **f Cleanup decisions** — inspect findings, removal impact, recovery, and the
   recommended next step. From Explore or Heatmap, this selects an exact matching finding
   or a finding inside the selected folder when available. `e` opens the selected

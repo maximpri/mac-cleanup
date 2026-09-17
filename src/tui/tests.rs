@@ -110,7 +110,7 @@ fn storage_review_shows_volume_usage_and_largest_consumer() {
     assert!(rendered.contains("/Users/maximp"));
     assert!(rendered.contains("/private/tmp"));
     assert!(rendered.contains("FOLDER / FILE"));
-    assert!(rendered.contains("CHILDREN HEATMAP"));
+    assert!(rendered.contains("SELECTED ITEM"));
     assert!(rendered.contains("Library"));
     assert!(!rendered.contains("/Users/maximp/Library"));
 
@@ -1822,7 +1822,7 @@ fn storage_tabs_mouse_and_coverage_work_at_supported_sizes() {
             app.switch_storage_tab(tab);
             let buffer = draw_fixture(&mut app, width, height);
             let text = buffer_text(&buffer);
-            assert!(text.contains("SPACE MAP"));
+            assert!(text.contains("THIS SCAN"));
             assert!(text.contains("e Explore"));
             assert!(text.contains("h Heatmap") || text.contains("h Storage heatmap"));
             assert!(text.contains("f Cleanup"));
@@ -1831,8 +1831,7 @@ fn storage_tabs_mouse_and_coverage_work_at_supported_sizes() {
                 assert!(text.contains("FOLDER / FILE"));
             }
             if tab == StorageTab::Heatmap {
-                assert!(text.contains("STORAGE HEATMAP"));
-                assert!(text.contains("ACTIONS"));
+                assert!(text.contains("STORAGE MAP"));
             }
             if tab == StorageTab::Coverage {
                 assert!(text.contains("Partial scan"));
@@ -1882,27 +1881,56 @@ fn storage_tabs_mouse_and_coverage_work_at_supported_sizes() {
     assert_eq!(app.storage_tab, StorageTab::Heatmap);
     app.explorer_cursor = 0;
     draw_fixture(&mut app, 160, 40);
-    let (area, _) = *app
+    let (area, index) = app
         .hit_regions
         .borrow()
         .iter()
-        .find(|(_, target)| matches!(target, HitTarget::Consumer(1)))
+        .find_map(|(area, target)| {
+            if let HitTarget::MapNode(index) = target {
+                Some((*area, *index))
+            } else {
+                None
+            }
+        })
         .unwrap();
-    app.handle_left_click(area.x + 2, area.y);
-    assert_eq!(app.explorer_cursor, 1);
-    app.handle_left_click(area.x + 2, area.y);
-    assert_eq!(
-        app.explorer_path.as_deref(),
-        Some(Path::new("/Users/demo/Projects"))
-    );
+    let path = app.map_paths.borrow()[index].clone();
+    app.handle_left_click(area.x, area.y);
+    assert_eq!(app.explorer_path.as_deref(), Some(path.as_path()));
+    assert!(app.selected.is_empty());
+    app.handle_review_key(KeyCode::Left);
+    assert!(app.explorer_path.is_none());
 }
 
 #[test]
-fn heatmap_tiles_preserve_size_weight_and_fill_the_grid() {
-    let counts = heatmap_tile_counts(&[40, 35, 25], 100, 7);
-    assert_eq!(counts.iter().sum::<usize>(), 7);
-    assert_eq!(counts, vec![3, 2, 2]);
-    assert_eq!(heatmap_tile_counts(&[0, 0], 0, 4), vec![0, 0]);
+fn treemap_geometry_covers_area_without_overlaps_or_inflating_zero_bytes() {
+    use super::folder_map::map_rects;
+    for (width, height) in [(1, 1), (3, 2), (70, 24)] {
+        for weights in [
+            vec![40, 35, 25],
+            vec![99, 1, 0],
+            vec![u64::MAX, u64::MAX, 1],
+        ] {
+            let area = Rect::new(5, 7, width, height);
+            let rects = map_rects(&weights, area);
+            let mut cells = std::collections::HashSet::new();
+            for (weight, rect) in weights.iter().zip(rects) {
+                if *weight == 0 {
+                    assert!(rect.is_empty());
+                }
+                for y in rect.y..rect.bottom() {
+                    for x in rect.x..rect.right() {
+                        assert!(area.contains((x, y).into()));
+                        assert!(cells.insert((x, y)), "overlapping rectangles");
+                    }
+                }
+            }
+            assert_eq!(cells.len(), usize::from(width) * usize::from(height));
+        }
+    }
+    assert!(map_rects(&[0], Rect::new(0, 0, 10, 10))[0].is_empty());
+    let rects = map_rects(&[75, 25], Rect::new(0, 0, 80, 20));
+    assert_eq!(rects[0].area(), 1200);
+    assert_eq!(rects[1].area(), 400);
 }
 
 #[test]
@@ -2054,4 +2082,147 @@ fn modal_decisions_keep_focus_and_state_when_tab_is_pressed() {
             assert!(!app.sidebar_focus);
         }
     }
+}
+
+#[test]
+fn nested_folder_map_opens_exact_paths_and_preserves_review_selection() {
+    let mut app = design_fixture();
+    app.phase = Phase::Review;
+    app.storage_tab = StorageTab::Explore;
+    app.selected.insert(0);
+    app.entries.truncate(2);
+    for (entry, gib) in app.entries.iter_mut().zip([18, 14]) {
+        entry.spec.path = Path::new("/").join(entry.spec.path.strip_prefix("/Users/demo").unwrap());
+        entry.size_kb = gib * 1_048_576;
+    }
+    let inventory = app.inventory.as_mut().unwrap();
+    inventory.scanned_kb = 148 * 1_048_576;
+    inventory.scanned_on_volume_kb = inventory.scanned_kb;
+    inventory.roots[0].size_kb = inventory.scanned_kb;
+    let volume = inventory.volume.as_mut().unwrap();
+    volume.used_kb = 154 * 1_048_576;
+    volume.free_kb = 358 * 1_048_576;
+    inventory.children.clear();
+    let folder = |path: &str, gib: u64| StorageItem {
+        path: PathBuf::from(path),
+        size_kb: gib * 1_048_576,
+        kind: StorageItemKind::Directory,
+        category: StorageCategory::ApplicationData,
+    };
+    inventory.children.insert(
+        PathBuf::from("/"),
+        vec![folder("/Library", 100), folder("/Applications", 48)],
+    );
+    for (parent, children) in [
+        (
+            "/Library",
+            vec![
+                ("/Library/Developer", 52),
+                ("/Library/Caches", 26),
+                ("/Library/Application Support", 18),
+                ("/Library/Logs", 4),
+            ],
+        ),
+        (
+            "/Library/Developer",
+            vec![
+                ("/Library/Developer/Xcode", 34),
+                ("/Library/Developer/CoreSimulator", 18),
+            ],
+        ),
+        (
+            "/Library/Developer/Xcode",
+            vec![
+                ("/Library/Developer/Xcode/DerivedData", 18),
+                ("/Library/Developer/Xcode/DeviceSupport", 16),
+            ],
+        ),
+        (
+            "/Library/Caches",
+            vec![
+                ("/Library/Caches/Homebrew", 14),
+                ("/Library/Caches/Browser", 8),
+            ],
+        ),
+    ] {
+        inventory.children.insert(
+            PathBuf::from(parent),
+            children
+                .into_iter()
+                .map(|(path, size)| folder(path, size))
+                .collect(),
+        );
+    }
+    inventory
+        .children
+        .get_mut(Path::new("/Library/Caches"))
+        .unwrap()
+        .push(StorageItem {
+            path: PathBuf::from("/Library/Caches/archive.bin"),
+            size_kb: 4 * 1_048_576,
+            kind: StorageItemKind::File,
+            category: StorageCategory::ApplicationData,
+        });
+    for (width, height) in [(120, 30), (160, 48), (220, 60)] {
+        let buffer = draw_fixture(&mut app, width, height);
+        let text = buffer_text(&buffer);
+        assert!(text.contains("SELECTED ITEM"));
+        assert!(text.contains("100.0 GiB"));
+        assert!(text.contains("Developer"));
+        if let Some(directory) = std::env::var_os("MAC_CLEANUP_RENDER_DIR") {
+            let directory = PathBuf::from(directory);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join(format!("folder-map-{width}.svg")),
+                buffer_svg(&buffer),
+            )
+            .unwrap();
+            fs::write(directory.join(format!("folder-map-{width}.txt")), text).unwrap();
+        }
+    }
+    let click_path = |app: &mut App, path: &str| {
+        let index = app
+            .map_paths
+            .borrow()
+            .iter()
+            .position(|p| p == Path::new(path))
+            .expect("nested path is clickable");
+        let area = app
+            .hit_regions
+            .borrow()
+            .iter()
+            .find_map(|(area, target)| {
+                matches!(target,HitTarget::MapNode(i) if *i==index).then_some(*area)
+            })
+            .unwrap();
+        app.handle_left_click(area.x + 1, area.y + 1);
+    };
+    click_path(&mut app, "/Library/Developer/Xcode");
+    assert_eq!(
+        app.explorer_path.as_deref(),
+        Some(Path::new("/Library/Developer/Xcode"))
+    );
+    app.handle_review_key(KeyCode::Left);
+    assert!(app.explorer_path.is_none());
+    assert_eq!(app.explorer_cursor, 0);
+    draw_fixture(&mut app, 220, 60);
+    click_path(&mut app, "/Library/Caches/archive.bin");
+    assert!(app.explorer_details);
+    assert_eq!(
+        app.explorer_items()[app.explorer_cursor].path,
+        Path::new("/Library/Caches/archive.bin")
+    );
+    app.handle_review_key(KeyCode::Esc);
+    app.handle_review_key(KeyCode::Left);
+    assert!(app.explorer_path.is_none());
+    assert_eq!(app.selected, BTreeSet::from([0]));
+    app.no_color = true;
+    let buffer = draw_fixture(&mut app, 160, 48);
+    assert!(buffer_text(&buffer).contains("Developer"));
+    assert!(
+        buffer
+            .content()
+            .iter()
+            .all(|c| !matches!(c.bg, Color::Rgb(..)))
+    );
 }

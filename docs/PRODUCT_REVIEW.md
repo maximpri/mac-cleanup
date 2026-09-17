@@ -142,9 +142,10 @@ Settings and advanced commands can remain secondary. A Review plan control is
 available from the findings that populate it. This is a proposed destination map;
 it does not imply those screens already exist.
 
-The main pane leads with a plain-language conclusion, the measurements supporting
-it, the proportional storage heatmap makes large and potentially cleanable areas
-visible at a glance, and available next actions. Exact implementation details belong in inspection
+The main pane pairs a size-sorted folder browser with a large nested storage map
+of the selected folder. Rectangle area shows size; branch colors distinguish
+folders. Cleanup eligibility is stated separately, with a link to the findings
+and their consequences. Size alone is never presented as evidence of waste. Exact implementation details belong in inspection
 and review. User-facing action names should describe the outcome: review cleanup,
 quit this app, inspect this folder, or move this folder. Preserve stable shortcuts
 and keep all essential actions visible and reachable by mouse or keyboard.
