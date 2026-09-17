@@ -375,7 +375,7 @@ pub(super) fn render_storage_workspace(frame: &mut Frame<'_>, area: Rect, app: &
         StorageTab::Explore => {
             if app.explorer_details {
                 render_consumer_inspector(frame, regions[4], app);
-            } else if area.width >= 110 {
+            } else if area.width >= 90 {
                 let body =
                     Layout::horizontal([Constraint::Percentage(64), Constraint::Percentage(36)])
                         .spacing(1)
@@ -403,7 +403,7 @@ pub(super) fn render_storage_workspace(frame: &mut Frame<'_>, area: Rect, app: &
         StorageTab::Heatmap => {
             if app.explorer_details {
                 render_consumer_inspector(frame, regions[4], app);
-            } else if area.width >= 100 {
+            } else if area.width >= 90 {
                 let body =
                     Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)])
                         .spacing(1)

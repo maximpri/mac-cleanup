@@ -72,6 +72,8 @@ one level rather than overlapping ancestors and descendants.
 The persistent left rail also shows a compact **Space map** of the largest
 children at the current level, so the biggest consumers remain visible while
 you review cleanup decisions.
+On wider terminals, **Understand & Decide** adds a children heatmap for the
+selected folder, including its measured subfolders and files.
 
 Use the four storage tabs, their letter shortcuts, or `[` / `]`:
 
