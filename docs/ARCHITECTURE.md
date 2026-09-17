@@ -56,7 +56,7 @@ remains under the user's control.
   Nested rectangles register their exact paths before parent hit regions, so
   clicking a child opens that child. Branch colors never imply cleanup eligibility.
   Small items are aggregated; unexplained parent bytes retain their own area.
-  The left sidebar shows scan status instead of duplicating the chart.
+  The top status bar shows scan status without duplicating the chart.
 - **Process health:** current-account process inventory with explicit abnormal
   states and separate graceful/force signal choices.
 - **Move data:** source review, destination input, validation, confirmation,
@@ -64,8 +64,8 @@ remains under the user's control.
 - **Confirmations:** exact targets and consequences scroll independently of the
   always-visible decision controls. They own keyboard and mouse interaction.
 
-A persistent sidebar is shown at every supported width, with shorter labels
-in narrow terminals. Tab switches focus between the sidebar and content.
+A persistent top menu is shown at every supported width, with shorter labels
+in narrow terminals. Tab switches focus between the top menu and content.
 Number keys 1–3 and mouse navigation share the same destinations. At less
 than 60 columns or 16 rows, the UI displays a resize message and blocks hidden
 actions while still allowing cancellation and exit handling.

@@ -54,7 +54,8 @@ processes, and moving data have disconnected flows. Storage further separates
 folders, cleanup findings, and coverage. The user still has to relate a symptom
 to evidence, translate a path into its meaning, and assemble a plan.
 
-The requested left-menu/right-content layout is appropriate and should remain.
+The requested top-menu/content layout is appropriate and keeps the full width
+available for storage evidence.
 The content and sequence need to answer the user's questions, rather than mirror
 the internal modules.
 
@@ -133,7 +134,7 @@ or resource problem returned.
 
 ## Navigation and information hierarchy
 
-Retain one persistent left menu. Storage is the first destination and the app
+Retain one persistent top menu with a status bar. Storage is the first destination and the app
 opens its audit automatically. The current destinations are Storage audit,
 Process health, and Move data. Future performance trends, cleanup planning, and
 history can be added as destinations once those measurements and actions exist.

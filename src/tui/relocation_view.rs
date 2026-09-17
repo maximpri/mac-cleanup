@@ -3,13 +3,8 @@ use super::*;
 pub(super) fn render_relocation_sources(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let page = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(8),
-            Constraint::Length(4),
-        ])
+        .constraints([Constraint::Min(8), Constraint::Length(4)])
         .split(area);
-    render_navigation(frame, page[0], app, "STORAGE CLEANUP");
 
     let outer = panel(
         app,
@@ -20,8 +15,8 @@ pub(super) fn render_relocation_sources(frame: &mut Frame<'_>, area: Rect, app: 
                 .add_modifier(Modifier::BOLD),
         ),
     );
-    let inner = outer.inner(page[1]);
-    frame.render_widget(outer, page[1]);
+    let inner = outer.inner(page[0]);
+    frame.render_widget(outer, page[0]);
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -125,20 +120,15 @@ pub(super) fn render_relocation_sources(frame: &mut Frame<'_>, area: Rect, app: 
         Paragraph::new("↑↓/jk move   enter choose source   esc back   q quit")
             .block(panel(app, " KEYS "))
             .alignment(Alignment::Center),
-        page[2],
+        page[1],
     );
 }
 
 pub(super) fn render_relocation_destination(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let page = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(8),
-            Constraint::Length(4),
-        ])
+        .constraints([Constraint::Min(8), Constraint::Length(4)])
         .split(area);
-    render_navigation(frame, page[0], app, "STORAGE CLEANUP");
 
     let outer = panel(
         app,
@@ -149,8 +139,8 @@ pub(super) fn render_relocation_destination(frame: &mut Frame<'_>, area: Rect, a
                 .add_modifier(Modifier::BOLD),
         ),
     );
-    let inner = outer.inner(page[1]);
-    frame.render_widget(outer, page[1]);
+    let inner = outer.inner(page[0]);
+    frame.render_widget(outer, page[0]);
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -241,20 +231,15 @@ pub(super) fn render_relocation_destination(frame: &mut Frame<'_>, area: Rect, a
         Paragraph::new("type path   enter validate   backspace edit   esc back   q quit")
             .block(panel(app, " KEYS "))
             .alignment(Alignment::Center),
-        page[2],
+        page[1],
     );
 }
 
 pub(super) fn render_relocation_progress(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let page = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(8),
-            Constraint::Length(4),
-        ])
+        .constraints([Constraint::Min(8), Constraint::Length(4)])
         .split(area);
-    render_navigation(frame, page[0], app, "STORAGE CLEANUP");
     let source = app
         .relocation_source
         .as_ref()
@@ -308,7 +293,7 @@ pub(super) fn render_relocation_progress(frame: &mut Frame<'_>, area: Rect, app:
         ])
         .block(panel(app, title))
         .wrap(Wrap { trim: true }),
-        page[1],
+        page[0],
     );
     frame.render_widget(
         Paragraph::new(
@@ -316,20 +301,15 @@ pub(super) fn render_relocation_progress(frame: &mut Frame<'_>, area: Rect, app:
         )
         .block(panel(app, " SAFETY "))
         .alignment(Alignment::Center),
-        page[2],
+        page[1],
     );
 }
 
 pub(super) fn render_relocation_result(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let page = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(8),
-            Constraint::Length(4),
-        ])
+        .constraints([Constraint::Min(8), Constraint::Length(4)])
         .split(area);
-    render_navigation(frame, page[0], app, "STORAGE CLEANUP");
     let Some(report) = &app.relocation_report else {
         return;
     };
@@ -397,12 +377,12 @@ pub(super) fn render_relocation_result(frame: &mut Frame<'_>, area: Rect, app: &
                     .title(title),
             )
             .wrap(Wrap { trim: true }),
-        page[1],
+        page[0],
     );
     frame.render_widget(
         Paragraph::new("Enter/Esc rescans storage   q quit")
             .block(panel(app, " KEYS "))
             .alignment(Alignment::Center),
-        page[2],
+        page[1],
     );
 }

@@ -153,13 +153,13 @@ def main():
         session.wait_for("SCANNING")
         session.send(b"\x1b")
         session.wait_for("AVAILABLE VOLUMES")
-        session.send(b"\x1b[19~")  # F8: focus the persistent left menu
-        session.wait_for("MENU · FOCUSED")
+        session.send(b"\x1b[19~")  # F8: focus the persistent top menu
+        session.wait_for("› Storage audit")
         session.send(b"\r")
         session.wait_for("AVAILABLE VOLUMES")
-        session.wait_for("Storage audit · FOCUSED")
+        session.wait_for("Storage audit")
         session.send(b"\x1b[Z")
-        session.wait_for("MENU · FOCUSED")
+        session.wait_for("› Storage audit")
         session.send(b"\x1b[B\r")
         session.wait_for("LIVE PROCESSES")
         session.send(b"?")

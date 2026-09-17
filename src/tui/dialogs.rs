@@ -74,10 +74,10 @@ pub(super) fn render_help_overlay_if_open(frame: &mut Frame<'_>, area: Rect, app
             "e / h / f / v",
             "Explore folders / storage heatmap / cleanup decisions / scan coverage",
         ),
-        ("F8", "Switch pane (alternative to Tab)"),
+        ("F8", "Switch focus between the top menu and content"),
         (
             "Tab / Shift+Tab",
-            "Switch focus between the menu and content",
+            "Switch focus between the top menu and content",
         ),
         ("Enter / ←", "Open folder / return to parent in Explore"),
         ("↑↓ or j / k", "Choose a task or move through a list"),

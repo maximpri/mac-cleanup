@@ -49,11 +49,11 @@ published only on this repository's Releases page.
 
 The workspace has one persistent menu on the left and the selected section on
 the right. Click Storage audit, Process health, or Move data, or use
-keys `1`–`3`. Press `Tab` or `Shift+Tab` to switch between the menu and content
+keys `1`–`3`. Press `Tab` or `Shift+Tab` to switch between the top menu and content
 (`F8` is an alternative). A FOCUSED label identifies the pane receiving keys.
 Use Up/Down to choose a menu item and Enter or Right to open it. The app starts
-the storage audit automatically; opening a section transfers focus to its content. The sidebar stays visible in smaller
-terminals; there are no duplicate task cards or horizontal section menus.
+the storage audit automatically; opening a section transfers focus to its content. A single-line top menu stays visible at
+every supported size, with a status bar beneath it and no duplicate task cards.
 Menu keys never trigger content actions. A mouse click focuses its pane, and
 scrolling operates on the pane under the pointer. Read-only sessions disable
 Move data in the menu. Storage returns to an existing audit when available. `F9` opens additional
@@ -81,9 +81,9 @@ Colors distinguish folder branches, not cleanup eligibility. The map shows up
 to three child levels and ten named items per level; smaller items are grouped,
 while amounts missing from measured children appear as **Other / unmeasured**.
 Items too small for a terminal cell remain accessible in the folder browser.
-The map footer links to cleanup findings with `f` when available. The left menu
-shows scan coverage instead of a duplicate chart; menu rows and storage tabs
-use single-line highlights.
+The map footer links to cleanup findings with `f` when available. The status bar
+shows the current scan state and the top menu keeps section navigation visible;
+menu items and storage tabs use single-line highlights.
 
 Use the four storage tabs, their letter shortcuts, or `[` / `]`:
 
@@ -147,9 +147,9 @@ remain visible.
 | Navigate menu | Open Storage, Process Health, or Move data from any non-modal screen. |
 | `?` | Open the in-app help overlay. |
 | `F1` | Open Help. |
-| `Tab` / `Shift+Tab` / `F8` | Switch focus between the left menu and content. |
+| `Tab` / `Shift+Tab` / `F8` | Switch focus between the top menu and content. |
 | `F9` / `F10` | Open the commands menu / quit. `Alt+F`, `Alt+N`, `Alt+A`, and `Alt+H` open File, Navigate, Actions, and Help. |
-| Mouse | Click the left menu or visible table rows; use the wheel to scroll lists and dialogs. |
+| Mouse | Click the top menu or visible table rows; use the wheel to scroll lists and dialogs. |
 | `↑` / `↓` or `j` / `k` | Move through the current list. |
 | `e` / `h` / `f` / `v` | Explore folders / storage heatmap / cleanup decisions / scan coverage. `[` / `]` cycles these views. |
 | `←` / `Backspace` | Return to the parent in Explore or Heatmap. |
@@ -191,7 +191,7 @@ plan, and confirm with `y`.
 
 ## Process review
 
-Choose Process Health from the persistent left menu, or from Navigate → Process
+Choose Process Health from the top menu, or from Navigate → Process
 Health on another screen. The scan begins only after that explicit selection.
 The screen lists current-account processes so a visibly hung app can still be
 found and terminated even when macOS reports an ordinary run state. Explicit

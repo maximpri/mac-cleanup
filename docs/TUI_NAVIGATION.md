@@ -1,6 +1,6 @@
 # TUI navigation decisions
 
-The application uses a persistent left navigation list and one content pane.
+The application uses a persistent top navigation bar and one content pane.
 It starts the read-only storage audit automatically, then opens the Storage
 audit when the inventory is ready. There is no separate Overview destination:
 the first screen is the work that produces the evidence needed for a decision.
@@ -29,7 +29,7 @@ that one menu pattern is universally best.
 
 | Input | Behavior |
 | --- | --- |
-| Tab / Shift+Tab | Move focus between menu and content, preserving content state. |
+| Tab / Shift+Tab | Move focus between the top menu and content, preserving content state. |
 | F8 | Alternative pane-focus shortcut. |
 | Up / Down, j / k | Move within the focused list; skip unavailable destinations. |
 | Home / End in menu | First / last available destination. |
@@ -45,10 +45,10 @@ that one menu pattern is universally best.
 | F9 / ? | Commands / keyboard help. |
 
 The open section remains marked when the menu cursor moves elsewhere. Only the
-focused menu row receives its strong highlight; pane headings and footer hints
-identify the keyboard target. The menu remains visible at the minimum 60×16
-viewport. Read-only sessions visibly disable Move data and skip it during menu
-navigation.
+focused top-menu item receives its strong single-line highlight; the status bar
+identifies the scan state and keyboard focus. The menu remains visible at the
+minimum 60×16 viewport. Read-only sessions visibly disable Move data and skip it
+during menu navigation.
 
 Ordinary menu input is fully consumed: c, d, Space, a, m, and storage-view
 shortcuts cannot operate on the content while the menu owns focus. Confirmation

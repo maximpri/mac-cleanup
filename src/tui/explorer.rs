@@ -251,7 +251,6 @@ impl App {
 pub(super) fn render_storage_workspace(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let compact = area.height < 26;
     let regions = Layout::vertical([
-        Constraint::Length(if compact { 3 } else { 4 }),
         Constraint::Length(if compact { 2 } else { 3 }),
         Constraint::Length(1),
         Constraint::Length(if compact { 1 } else { 3 }),
@@ -259,14 +258,14 @@ pub(super) fn render_storage_workspace(frame: &mut Frame<'_>, area: Rect, app: &
         Constraint::Length(if compact { 2 } else { 3 }),
     ])
     .split(area);
-    render_metrics(frame, regions[1], app);
+    render_metrics(frame, regions[0], app);
     let tabs = Layout::horizontal([
         Constraint::Percentage(25),
         Constraint::Percentage(25),
         Constraint::Percentage(25),
         Constraint::Percentage(25),
     ])
-    .split(regions[2]);
+    .split(regions[1]);
     let compact_labels = ["e Explore", "h Heatmap", "f Cleanup", "v Coverage"];
     for (index, (tab, title)) in [
         (StorageTab::Explore, "e Explore folders"),
@@ -359,25 +358,25 @@ pub(super) fn render_storage_workspace(frame: &mut Frame<'_>, area: Rect, app: &
                 Style::default().fg(app.color(AMBER)),
             )),
         ]),
-        regions[3],
+        regions[2],
     );
     match app.storage_tab {
         StorageTab::Explore => {
             if app.explorer_details {
-                render_consumer_inspector(frame, regions[4], app);
+                render_consumer_inspector(frame, regions[3], app);
             } else if area.width >= 90 {
                 let body =
                     Layout::horizontal([Constraint::Percentage(48), Constraint::Percentage(52)])
                         .spacing(1)
-                        .split(regions[4]);
+                        .split(regions[3]);
                 render_explorer(frame, body[0], app);
                 render_consumer_inspector(frame, body[1], app);
             } else {
-                render_explorer(frame, regions[4], app);
+                render_explorer(frame, regions[3], app);
             }
             render_command_bar(
                 frame,
-                regions[5],
+                regions[4],
                 app,
                 &[
                     ("Enter", "open"),
@@ -391,10 +390,10 @@ pub(super) fn render_storage_workspace(frame: &mut Frame<'_>, area: Rect, app: &
             );
         }
         StorageTab::Heatmap => {
-            render_consumer_inspector(frame, regions[4], app);
+            render_consumer_inspector(frame, regions[3], app);
             render_command_bar(
                 frame,
-                regions[5],
+                regions[4],
                 app,
                 &[
                     ("↑↓", "select"),
@@ -412,16 +411,16 @@ pub(super) fn render_storage_workspace(frame: &mut Frame<'_>, area: Rect, app: &
                 let body =
                     Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
                         .spacing(1)
-                        .split(regions[4]);
+                        .split(regions[3]);
                 render_cleanup_table(frame, body[0], app);
                 render_inspector(frame, body[1], app);
             } else {
-                render_cleanup_table(frame, regions[4], app);
+                render_cleanup_table(frame, regions[3], app);
             }
             if app.analysis_only {
                 render_command_bar(
                     frame,
-                    regions[5],
+                    regions[4],
                     app,
                     &[
                         ("Enter", "details"),
@@ -434,7 +433,7 @@ pub(super) fn render_storage_workspace(frame: &mut Frame<'_>, area: Rect, app: &
             } else {
                 render_command_bar(
                     frame,
-                    regions[5],
+                    regions[4],
                     app,
                     &[
                         ("Space", "select"),
@@ -448,7 +447,7 @@ pub(super) fn render_storage_workspace(frame: &mut Frame<'_>, area: Rect, app: &
         }
         StorageTab::Coverage => {
             let block = panel(app, " SCAN COVERAGE · ↑↓ scroll ");
-            let inner = block.inner(regions[4]);
+            let inner = block.inner(regions[3]);
             let paragraph = Paragraph::new(coverage_lines(app)).wrap(Wrap { trim: true });
             let max_scroll = paragraph
                 .line_count(inner.width)
@@ -459,11 +458,11 @@ pub(super) fn render_storage_workspace(frame: &mut Frame<'_>, area: Rect, app: &
                 paragraph
                     .scroll((app.coverage_scroll.min(max_scroll), 0))
                     .block(block),
-                regions[4],
+                regions[3],
             );
             render_command_bar(
                 frame,
-                regions[5],
+                regions[4],
                 app,
                 &[
                     ("p", "access settings"),

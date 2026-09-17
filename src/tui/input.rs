@@ -279,7 +279,7 @@ impl App {
             MouseEventKind::ScrollUp => {
                 if self.menu_open.is_some() {
                     self.move_menu_cursor(-1);
-                } else if mouse.column < sidebar_width(self.terminal_width) {
+                } else if mouse.row < TOP_BAR_HEIGHT {
                     if !self.sidebar_focus {
                         self.sidebar_cursor = active_section(self);
                     }
@@ -293,7 +293,7 @@ impl App {
             MouseEventKind::ScrollDown => {
                 if self.menu_open.is_some() {
                     self.move_menu_cursor(1);
-                } else if mouse.column < sidebar_width(self.terminal_width) {
+                } else if mouse.row < TOP_BAR_HEIGHT {
                     if !self.sidebar_focus {
                         self.sidebar_cursor = active_section(self);
                     }
@@ -379,13 +379,6 @@ impl App {
 
         if let Some(section) = navigation_at(column, row, self.terminal_width) {
             self.navigate_to(section);
-            return;
-        }
-        if !self.sidebar_focus && column < sidebar_width(self.terminal_width) {
-            self.sidebar_cursor = active_section(self);
-        }
-        self.sidebar_focus = column < sidebar_width(self.terminal_width);
-        if self.sidebar_focus {
             return;
         }
         let hit = self

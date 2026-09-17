@@ -2,19 +2,16 @@ use super::*;
 
 pub(super) const MIN_WIDTH: u16 = 60;
 pub(super) const MIN_HEIGHT: u16 = 16;
+pub(super) const TOP_BAR_HEIGHT: u16 = 3;
 
 /// A single geometry source for painting and pointer navigation.
 pub(super) fn content_area(area: Rect) -> Rect {
     Rect::new(
-        area.x + sidebar_width(area.width),
-        area.y,
-        area.width.saturating_sub(sidebar_width(area.width)),
-        area.height,
+        area.x,
+        area.y.saturating_add(TOP_BAR_HEIGHT),
+        area.width,
+        area.height.saturating_sub(TOP_BAR_HEIGHT),
     )
-}
-
-pub(super) fn sidebar_width(width: u16) -> u16 {
-    if width >= 80 { 23 } else { 18 }
 }
 
 pub(super) fn active_section(app: &App) -> usize {
@@ -30,30 +27,20 @@ pub(super) fn active_section(app: &App) -> usize {
     }
 }
 
-pub(super) fn sidebar_list_area(area: Rect) -> Rect {
-    Rect::new(
-        area.x,
-        area.y + 5,
-        sidebar_width(area.width).saturating_sub(1),
-        3,
-    )
-}
-
-pub(super) fn sidebar_summary_area(area: Rect) -> Rect {
-    let list = sidebar_list_area(area);
-    let top = list.bottom().saturating_add(1);
-    let bottom = area.bottom().saturating_sub(4);
-    Rect::new(
-        area.x + 1,
-        top,
-        sidebar_width(area.width).saturating_sub(3),
-        bottom.saturating_sub(top),
-    )
+pub(super) fn top_menu_item_area(area: Rect, index: usize) -> Rect {
+    let title_width = if area.width >= 90 { 16 } else { 14 };
+    let widths = if area.width >= 90 {
+        [20, 20, 16]
+    } else {
+        [14, 14, 13]
+    };
+    let x = area.x + title_width + widths[..index.min(widths.len())].iter().sum::<u16>();
+    Rect::new(x, area.y, widths[index.min(widths.len() - 1)], 1)
 }
 
 pub(super) fn navigation_at(column: u16, row: u16, width: u16) -> Option<usize> {
-    let list = sidebar_list_area(Rect::new(0, 0, width, MIN_HEIGHT));
-    rect_contains(list, column, row).then(|| (row - list.y) as usize)
+    let area = Rect::new(0, 0, width, TOP_BAR_HEIGHT);
+    (0..3).find(|index| rect_contains(top_menu_item_area(area, *index), column, row))
 }
 
 pub(super) fn render(frame: &mut Frame<'_>, app: &App) {
@@ -81,7 +68,7 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &App) {
         );
         return;
     }
-    render_sidebar(frame, area, app);
+    render_navigation(frame, area, app, "");
     let page = content_area(area);
     match app.phase {
         Phase::Location => render_location_picker(frame, page, app),
@@ -95,17 +82,6 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &App) {
         Phase::RelocationResult => render_relocation_result(frame, page, app),
         _ => render_workspace(frame, page, app),
     }
-    if app.sidebar_focus && app.menu_is_available() && app.menu_open.is_none() && !app.show_help {
-        let footer = Rect::new(page.x, page.bottom().saturating_sub(3), page.width, 3);
-        frame.render_widget(Clear, footer);
-        render_command_bar(
-            frame,
-            footer,
-            app,
-            &[("↑↓", "choose"), ("Enter", "open"), ("Tab", "content")],
-        );
-    }
-    render_navigation(frame, Rect::new(area.x, area.y, area.width, 3), app, "");
     match app.phase {
         Phase::Confirm => render_confirmation(frame, area, app),
         Phase::ReviewConfirm => render_review_confirmation(frame, area, app),
@@ -130,19 +106,10 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &App) {
     render_overlays(frame, area, app);
 }
 
-fn render_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let width = sidebar_width(area.width);
-    frame.render_widget(
-        Block::default()
-            .borders(Borders::RIGHT)
-            .border_style(Style::default().fg(app.color(FAINT)))
-            .style(Style::default().bg(app.color(SURFACE))),
-        Rect::new(area.x, area.y, width, area.height),
-    );
-    frame.render_widget(
-        Paragraph::new(heading(app, " MAC CLEANUP")),
-        Rect::new(area.x, area.y + 1, width - 1, 1),
-    );
+// Sidebar navigation was replaced by the top bar. The compatibility geometry
+// helpers above remain for serialized render snapshots.
+
+/* Legacy sidebar layout retained in this comment for historical render notes.
     let focused =
         app.sidebar_focus && app.menu_is_available() && app.menu_open.is_none() && !app.show_help;
     frame.render_widget(
@@ -251,49 +218,122 @@ fn render_sidebar_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
     frame.render_widget(Paragraph::new(lines), summary);
 }
+*/
 
 pub(super) fn render_navigation(frame: &mut Frame<'_>, area: Rect, app: &App, _active: &str) {
-    let page = content_area(area);
-    let title = ["Storage audit", "Process health", "Move data"][active_section(app)];
+    let focused =
+        app.sidebar_focus && app.menu_is_available() && app.menu_open.is_none() && !app.show_help;
+    let title_width = if area.width >= 90 { 16 } else { 14 };
     frame.render_widget(
-        Paragraph::new(heading(
-            app,
-            if !app.sidebar_focus
-                && app.menu_is_available()
-                && app.menu_open.is_none()
-                && !app.show_help
-            {
-                format!("{title} · FOCUSED")
-            } else {
-                title.into()
-            },
-        )),
-        Rect::new(page.x + 2, page.y + 1, page.width.saturating_sub(4), 1),
+        Block::default().style(Style::default().bg(app.color(SURFACE))),
+        Rect::new(area.x, area.y, area.width, TOP_BAR_HEIGHT),
     );
-    if page.width >= 65 {
+    frame.render_widget(
+        Paragraph::new(heading(app, " MAC CLEANUP")),
+        Rect::new(area.x, area.y, title_width, 1),
+    );
+    let names = if area.width >= 90 {
+        ["Storage audit", "Process health", "Move data"]
+    } else {
+        [
+            "Storage",
+            "Processes",
+            if app.analysis_only {
+                "Move (locked)"
+            } else {
+                "Move data"
+            },
+        ]
+    };
+    for (index, name) in names.iter().enumerate() {
+        let item_area = top_menu_item_area(area, index);
+        let active = index == active_section(app);
+        let selected = if focused {
+            app.sidebar_cursor
+        } else {
+            active_section(app)
+        };
+        let style = if index == selected && focused {
+            selected_row_style(app)
+                .fg(app.color(INK))
+                .add_modifier(Modifier::BOLD)
+        } else if active {
+            Style::default()
+                .fg(app.color(BLUE))
+                .add_modifier(Modifier::BOLD)
+        } else if index == 2 && app.analysis_only {
+            Style::default().fg(app.color(FAINT))
+        } else {
+            Style::default().fg(app.color(MUTED))
+        };
         frame.render_widget(
-            Paragraph::new(label(
-                app,
-                if app.analysis_only {
-                    "READ ONLY"
+            Paragraph::new(Line::from(format!(
+                "{}{}",
+                if index == selected && focused {
+                    "› "
                 } else {
-                    "REVIEW BEFORE ACTION"
+                    "  "
                 },
-            ))
-            .alignment(Alignment::Right),
-            Rect::new(page.right() - 25, page.y + 1, 23, 1),
+                name
+            )))
+            .style(style),
+            item_area,
         );
     }
+    let status = match app.phase {
+        Phase::Review if app.inventory.is_some() => {
+            let inventory = app.inventory.as_ref().unwrap();
+            format!(
+                "{} measured · {} safe to clean",
+                format_kb(inventory.scanned_kb),
+                format_kb(app.ready_kb())
+            )
+        }
+        Phase::Scanning => "SCANNING · read-only audit in progress".into(),
+        Phase::Location => "Choose a volume to begin the audit".into(),
+        _ => "Review before action".into(),
+    };
+    frame.render_widget(
+        Paragraph::new(label(app, status)),
+        Rect::new(
+            area.x + title_width,
+            area.y + 1,
+            area.width.saturating_sub(title_width + 16),
+            1,
+        ),
+    );
+    frame.render_widget(
+        Paragraph::new(label(
+            app,
+            if app.analysis_only {
+                "READ ONLY"
+            } else {
+                "STATUS"
+            },
+        ))
+        .alignment(Alignment::Right),
+        Rect::new(area.right().saturating_sub(14), area.y + 1, 13, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(
+            Line::from("─".repeat(area.width as usize))
+                .style(Style::default().fg(app.color(FAINT))),
+        ),
+        Rect::new(area.x, area.y + 2, area.width, 1),
+    );
 }
-
 pub(super) fn menu_popup_rect(area: Rect, _menu: MenuId, item_count: usize) -> Option<Rect> {
-    let page = content_area(area);
-    let width = page.width.saturating_sub(2).min(44);
+    let width = area.width.saturating_sub(2).min(44);
     let height = (item_count as u16 + 2).min(area.height.saturating_sub(1));
     if width < 12 || height < 3 {
         return None;
     }
-    Some(Rect::new(page.x + 1, area.y + 3, width, height))
+    Some(Rect::new(
+        area.x + 1,
+        area.y + TOP_BAR_HEIGHT,
+        width,
+        height,
+    ))
 }
 
 pub(super) fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
@@ -307,26 +347,25 @@ fn render_workspace(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
     let compact = area.height < 24;
     let regions = Layout::vertical([
-        Constraint::Length(4),
         Constraint::Length(3),
         Constraint::Min(4),
         Constraint::Length(3),
     ])
     .split(area);
-    render_metrics(frame, regions[1], app);
-    let wide = regions[2].width >= 100;
+    render_metrics(frame, regions[0], app);
+    let wide = regions[1].width >= 100;
     if wide {
         let body = Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)])
             .spacing(1)
-            .split(regions[2]);
+            .split(regions[1]);
         render_table(frame, body[0], app);
         render_inspector(frame, body[1], app);
     } else if !compact {
-        let body = Layout::vertical([Constraint::Min(4), Constraint::Length(6)]).split(regions[2]);
+        let body = Layout::vertical([Constraint::Min(4), Constraint::Length(6)]).split(regions[1]);
         render_table(frame, body[0], app);
         render_details(frame, body[1], app);
     } else {
-        render_table(frame, regions[2], app);
+        render_table(frame, regions[1], app);
     }
-    render_footer(frame, regions[3], app);
+    render_footer(frame, regions[2], app);
 }

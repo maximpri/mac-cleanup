@@ -428,10 +428,10 @@ fn mouse_operates_menus_and_home_task_choices() {
     app.handle_mouse(left_click(70, 10));
     assert_eq!(app.menu_open, None);
 
-    app.handle_mouse(left_click(10, 6));
+    app.handle_mouse(left_click(40, 0));
     assert_eq!(app.phase, Phase::Processes);
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-    app.handle_mouse(left_click(10, 5));
+    app.handle_mouse(left_click(20, 0));
     assert_eq!(app.phase, Phase::Location);
 }
 
@@ -1822,7 +1822,7 @@ fn storage_tabs_mouse_and_coverage_work_at_supported_sizes() {
             app.switch_storage_tab(tab);
             let buffer = draw_fixture(&mut app, width, height);
             let text = buffer_text(&buffer);
-            assert!(text.contains("THIS SCAN"));
+            assert!(text.contains("MAC CLEANUP"));
             assert!(text.contains("e Explore"));
             assert!(text.contains("h Heatmap") || text.contains("h Storage heatmap"));
             assert!(text.contains("f Cleanup"));
@@ -1949,7 +1949,7 @@ fn explorer_links_exact_cleanup_rule_without_changing_selection() {
 }
 
 #[test]
-fn left_menu_is_persistent_and_keyboard_focus_returns_to_content() {
+fn top_menu_is_persistent_and_keyboard_focus_returns_to_content() {
     let mut app = design_fixture();
     app.inventory = None;
     app.entries.clear();
@@ -1958,15 +1958,16 @@ fn left_menu_is_persistent_and_keyboard_focus_returns_to_content() {
     for (width, height) in [(60, 16), (80, 24), (160, 40), (280, 80)] {
         let buffer = draw_fixture(&mut app, width, height);
         let page = content_area(buffer.area);
-        assert!(page.x >= 18);
+        assert_eq!(page.x, 0);
+        assert_eq!(page.y, TOP_BAR_HEIGHT);
         let text = buffer_text(&buffer);
         assert!(text.contains("AVAILABLE VOLUMES"));
         assert!(!text.contains("YOUR NEXT STEP"));
         assert!(!text.contains("Enter to open"));
         assert!(!text.contains("WORKSPACE"));
-        for (row, section) in [(5, 0), (6, 1), (7, 2)] {
-            assert_eq!(navigation_at(3, row, width), Some(section));
-            assert_eq!(navigation_at(page.x, row, width), None);
+        for section in 0..3 {
+            let nav = top_menu_item_area(buffer.area, section);
+            assert_eq!(navigation_at(nav.x + 1, 0, width), Some(section));
         }
         if let Some(directory) = std::env::var_os("MAC_CLEANUP_RENDER_DIR") {
             let directory = PathBuf::from(directory);
@@ -2039,7 +2040,7 @@ fn mouse_focus_and_read_only_menu_items_follow_the_visible_pane() {
     app.handle_mouse(MouseEvent {
         kind: MouseEventKind::ScrollDown,
         column: 3,
-        row: 7,
+        row: 0,
         modifiers: KeyModifiers::NONE,
     });
     assert!(app.sidebar_focus);
@@ -2059,7 +2060,7 @@ fn mouse_focus_and_read_only_menu_items_follow_the_visible_pane() {
     assert_eq!(app.sidebar_cursor, 1);
     app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     assert_eq!(app.sidebar_cursor, 1);
-    app.handle_left_click(3, 7);
+    app.handle_left_click(60, 0);
     assert_eq!(app.phase, Phase::Review);
     assert!(app.status_message.as_ref().unwrap().contains("read-only"));
 }
