@@ -110,6 +110,8 @@ fn storage_review_shows_volume_usage_and_largest_consumer() {
     assert!(rendered.contains("/Users/maximp"));
     assert!(rendered.contains("/private/tmp"));
     assert!(rendered.contains("FOLDER / FILE"));
+    assert!(rendered.contains("CHILDREN HEATMAP"));
+    assert!(rendered.contains("Library"));
     assert!(!rendered.contains("/Users/maximp/Library"));
 
     // A populated cleanup list must not hide the rest of the disk.

@@ -976,10 +976,136 @@ fn render_consumer_inspector(frame: &mut Frame<'_>, area: Rect, app: &App) {
         },
     );
     let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let children = if item.kind == StorageItemKind::Directory {
+        app.inventory
+            .as_ref()
+            .and_then(|inventory| inventory.children.get(&item.path))
+    } else {
+        None
+    };
+    if !app.explorer_details
+        && children.is_some_and(|children| !children.is_empty())
+        && inner.height >= 12
+    {
+        let map_height = if inner.height >= 20 { 9 } else { 7 };
+        let body =
+            Layout::vertical([Constraint::Length(map_height), Constraint::Min(1)]).split(inner);
+        render_children_heatmap(frame, body[0], app, item, children.unwrap());
+        render_inspector_text(frame, body[1], app, lines);
+    } else {
+        render_inspector_text(frame, inner, app, lines);
+    }
+}
+
+fn render_children_heatmap(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    parent: &StorageItem,
+    children: &[StorageItem],
+) {
+    let title = format!(
+        " CHILDREN HEATMAP · {} ",
+        truncate_middle(
+            &heatmap_item_name(parent),
+            area.width.saturating_sub(22) as usize
+        )
+    );
+    let block = panel(app, title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width < 12 || inner.height < 2 {
+        return;
+    }
+    let mut sorted = children.iter().collect::<Vec<_>>();
+    sorted.sort_by(|left, right| {
+        right
+            .size_kb
+            .cmp(&left.size_kb)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let total: u64 = sorted.iter().map(|child| child.size_kb).sum();
+    let legend = Rect::new(inner.x, inner.y, inner.width, 1);
+    frame.render_widget(
+        label(
+            app,
+            "Size-weighted · ██ cleanable  ▓▓ optional  ░░ review/keep",
+        ),
+        legend,
+    );
+    let rows_area = Rect::new(
+        inner.x,
+        inner.y.saturating_add(1),
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
+    let row_count = rows_area.height as usize;
+    let has_more = sorted.len() > row_count;
+    let visible_rows = if has_more {
+        row_count.saturating_sub(1)
+    } else {
+        row_count
+    };
+    let name_width = if rows_area.width >= 38 { 13 } else { 8 };
+    let value_width = 10usize;
+    let bar_width = (rows_area.width as usize).saturating_sub(name_width + value_width + 4);
+    for (row, child) in sorted.iter().take(visible_rows).enumerate() {
+        let (action, color) = heatmap_action(app, child);
+        let ratio = if total == 0 {
+            0.0
+        } else {
+            child.size_kb as f64 / total as f64
+        };
+        let fill = ((ratio * bar_width as f64).round() as usize)
+            .max(1)
+            .min(bar_width.max(1));
+        let marker = heatmap_marker(action).chars().next().unwrap_or('█');
+        let kind = match child.kind {
+            StorageItemKind::Directory => '▸',
+            StorageItemKind::Symlink => '@',
+            StorageItemKind::File => '·',
+        };
+        let name = truncate_middle(&format!("{kind} {}", heatmap_item_name(child)), name_width);
+        let percent = if total == 0 {
+            0.0
+        } else {
+            child.size_kb as f64 * 100.0 / total as f64
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    marker.to_string().repeat(fill),
+                    Style::default().fg(app.color(color)),
+                ),
+                Span::raw(" "),
+                Span::styled(name, Style::default().fg(app.color(MUTED))),
+                Span::raw(format!(" {:>8} {percent:>4.1}%", format_kb(child.size_kb))),
+            ])),
+            Rect::new(rows_area.x, rows_area.y + row as u16, rows_area.width, 1),
+        );
+    }
+    if has_more && row_count > 0 {
+        frame.render_widget(
+            label(
+                app,
+                format!("+ {} smaller children", sorted.len() - visible_rows),
+            ),
+            Rect::new(
+                rows_area.x,
+                rows_area.bottom().saturating_sub(1),
+                rows_area.width,
+                1,
+            ),
+        );
+    }
+}
+
+fn render_inspector_text(frame: &mut Frame<'_>, area: Rect, app: &App, lines: Vec<Line<'static>>) {
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: true });
     let max_scroll = paragraph
-        .line_count(inner.width)
-        .saturating_sub(inner.height as usize)
+        .line_count(area.width)
+        .saturating_sub(area.height as usize)
         .min(u16::MAX as usize) as u16;
     let scroll = if app.explorer_details {
         app.dialog_max_scroll.set(max_scroll);
@@ -987,7 +1113,7 @@ fn render_consumer_inspector(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         0
     };
-    frame.render_widget(paragraph.scroll((scroll, 0)).block(block), area);
+    frame.render_widget(paragraph.scroll((scroll, 0)), area);
 }
 
 fn coverage_lines(app: &App) -> Vec<Line<'static>> {
