@@ -39,6 +39,18 @@ pub(super) fn sidebar_list_area(area: Rect) -> Rect {
     )
 }
 
+pub(super) fn sidebar_heatmap_area(area: Rect) -> Rect {
+    let list = sidebar_list_area(area);
+    let top = list.bottom().saturating_add(1);
+    let bottom = area.bottom().saturating_sub(4);
+    Rect::new(
+        area.x + 1,
+        top,
+        sidebar_width(area.width).saturating_sub(3),
+        bottom.saturating_sub(top),
+    )
+}
+
 pub(super) fn navigation_at(column: u16, row: u16, width: u16) -> Option<usize> {
     let list = sidebar_list_area(Rect::new(0, 0, width, MIN_HEIGHT));
     rect_contains(list, column, row).then(|| (row - list.y) as usize)
@@ -196,6 +208,7 @@ fn render_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App) {
         active_section(app)
     }));
     frame.render_stateful_widget(list, sidebar_list_area(area), &mut state);
+    render_sidebar_heatmap(frame, area, app);
     frame.render_widget(
         Paragraph::new(vec![
             label(app, " Tab Switch pane"),
@@ -211,6 +224,74 @@ fn render_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ]),
         Rect::new(area.x, area.bottom().saturating_sub(3), width - 1, 3),
     );
+}
+
+fn render_sidebar_heatmap(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let map_area = sidebar_heatmap_area(area);
+    if map_area.width < 8 || map_area.height == 0 {
+        return;
+    }
+    let mut lines = vec![heading(app, " SPACE MAP")];
+    let items = app.explorer_items();
+    if items.is_empty() {
+        lines.push(label(
+            app,
+            if app.inventory.is_some() {
+                "No measured children"
+            } else {
+                "Scanning storage…"
+            },
+        ));
+        frame.render_widget(Paragraph::new(lines), map_area);
+        return;
+    }
+    let mut indexed = items.into_iter().enumerate().collect::<Vec<_>>();
+    indexed.sort_by(|(_, left), (_, right)| {
+        right
+            .size_kb
+            .cmp(&left.size_kb)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let rows = (map_area.height.saturating_sub(1) as usize).min(6);
+    let max_size = indexed.first().map(|(_, item)| item.size_kb).unwrap_or(0);
+    let name_width: usize = if map_area.width >= 20 { 9 } else { 6 };
+    let bar_width = (map_area.width as usize).saturating_sub(name_width + 3);
+    for (item_index, item) in indexed.into_iter().take(rows) {
+        let (action, color) = heatmap_action(app, item);
+        let ratio = if max_size == 0 {
+            0.0
+        } else {
+            item.size_kb as f64 / max_size as f64
+        };
+        let fill = ((ratio * bar_width as f64).round() as usize)
+            .max(1)
+            .min(bar_width.max(1));
+        let marker = heatmap_marker(action).chars().next().unwrap_or('█');
+        let name = item
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| item.path.display().to_string());
+        let name = truncate_middle(&name, name_width);
+        let selected = item_index == app.explorer_cursor;
+        let mut style = Style::default().fg(app.color(color));
+        if selected {
+            style = style.add_modifier(Modifier::BOLD | Modifier::REVERSED);
+        }
+        lines.push(Line::from(vec![
+            Span::styled(marker.to_string().repeat(fill), style),
+            Span::raw(" "),
+            Span::styled(
+                name,
+                if selected {
+                    selected_row_style(app)
+                } else {
+                    Style::default().fg(app.color(MUTED))
+                },
+            ),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), map_area);
 }
 
 pub(super) fn render_navigation(frame: &mut Frame<'_>, area: Rect, app: &App, _active: &str) {

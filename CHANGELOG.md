@@ -15,6 +15,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Added a proportional Storage heatmap (`h`) so large folders and cleanable
   areas are visible before an operator makes a cleanup decision.
 
+- Added a compact Space map to the persistent sidebar. It follows the current
+  folder level and keeps the largest consumers visible during review.
+
 - Made sidebar menu items and their selection highlight occupy one row, with
   mouse targets aligned to the compact menu.
 

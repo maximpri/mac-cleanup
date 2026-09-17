@@ -1820,6 +1820,7 @@ fn storage_tabs_mouse_and_coverage_work_at_supported_sizes() {
             app.switch_storage_tab(tab);
             let buffer = draw_fixture(&mut app, width, height);
             let text = buffer_text(&buffer);
+            assert!(text.contains("SPACE MAP"));
             assert!(text.contains("e Explore"));
             assert!(text.contains("h Heatmap") || text.contains("h Storage heatmap"));
             assert!(text.contains("f Cleanup"));

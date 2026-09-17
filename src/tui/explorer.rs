@@ -806,7 +806,7 @@ fn heatmap_item_name(item: &StorageItem) -> String {
         .unwrap_or_else(|| item.path.display().to_string())
 }
 
-fn heatmap_action(app: &App, item: &StorageItem) -> (&'static str, Color) {
+pub(super) fn heatmap_action(app: &App, item: &StorageItem) -> (&'static str, Color) {
     let exact_status = app
         .entries
         .iter()
@@ -857,7 +857,7 @@ fn heatmap_category_action(category: StorageCategory) -> (&'static str, Color) {
     }
 }
 
-fn heatmap_marker(action: &str) -> &'static str {
+pub(super) fn heatmap_marker(action: &str) -> &'static str {
     if action.contains("CLEANABLE") || action == "TEMPORARY" {
         "██"
     } else if action.contains("OPTIONAL") || action == "IN USE" {

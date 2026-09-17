@@ -69,6 +69,9 @@ children, so drilling down needs no terminal commands or repeated scans.
 Each level shows allocated size, percentage of its measured children, and size
 bars on wide screens. Folder totals include their children; each list contains
 one level rather than overlapping ancestors and descendants.
+The persistent left rail also shows a compact **Space map** of the largest
+children at the current level, so the biggest consumers remain visible while
+you review cleanup decisions.
 
 Use the four storage tabs, their letter shortcuts, or `[` / `]`:
 
