@@ -193,6 +193,8 @@ pub(super) struct Workspace {
     insight_scope: Vec<String>,
     insight_inputs: Vec<ai::Subject>,
     ai_error: Option<String>,
+    ai_framework: ai::FrameworkStatus,
+    ai_framework_work: Option<Receiver<ai::FrameworkStatus>>,
     auto_requested: bool,
     auto_investigation_started: bool,
     investigation: Option<Investigation>,
@@ -236,6 +238,11 @@ impl Workspace {
     pub(super) fn new(app: &App) -> Self {
         let mut result = Self::empty();
         result.history = care::sessions(&app.account_home);
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(ai::framework_status());
+        });
+        result.ai_framework_work = Some(receiver);
         result.assessment = Some(care::assess(
             app.scan_root.clone(),
             app.account_home.clone(),
@@ -276,6 +283,8 @@ impl Workspace {
             insight_scope: vec![],
             insight_inputs: vec![],
             ai_error: None,
+            ai_framework: ai::FrameworkStatus::Detecting,
+            ai_framework_work: None,
             auto_requested: false,
             auto_investigation_started: false,
             investigation: None,
@@ -412,6 +421,14 @@ impl Workspace {
         }
     }
     pub(super) fn tick(&mut self, app: &mut App) {
+        if let Some(status) = self
+            .ai_framework_work
+            .as_ref()
+            .and_then(|receiver| receiver.try_recv().ok())
+        {
+            self.ai_framework = status;
+            self.ai_framework_work = None;
+        }
         let mut events = Vec::new();
         if let Some(assessment) = &self.assessment {
             while let Ok(event) = assessment.receiver.try_recv() {
@@ -1043,7 +1060,9 @@ impl Workspace {
         let flag = cancel.clone();
         let input = request.clone();
         let worker = thread::spawn(move || {
-            let _ = sender.send(ai::triage(&input, &flag));
+            let result =
+                ai::triage(&input, &flag).unwrap_or_else(|_| ai::deterministic_triage(&input));
+            let _ = sender.send(Ok(result));
         });
         self.triage_work = Some(TriageWork {
             receiver,
@@ -1903,8 +1922,9 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace
         .map(|v| format!("{} free", format_kb(v.disk_free_kb())))
         .unwrap_or_else(|| "Measuring disk".into());
     let status = format!(
-        " {}  ·  Memory {}  ·  {}{}",
+        " {}  ·  {}  ·  Memory {}  ·  {}{}",
         disk,
+        w.ai_framework.compact(),
         w.metrics.pressure_label(),
         w.stage,
         if app.analysis_only {
@@ -2381,13 +2401,14 @@ fn render_evidence(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) 
             )
         })
         .unwrap_or_default();
+    let framework_line = format!("Framework detected: {}", w.ai_framework.description());
     let ai_text = if active {
         format!(
-            "Reading measured evidence. Your findings and controls remain available.{investigation_summary}"
+            "{framework_line}\nReading measured evidence. Your findings and controls remain available.{investigation_summary}"
         )
     } else if let Some(insight) = &w.insight {
         format!(
-            "{}\nFor: {}{}",
+            "{framework_line}\n{}\nFor: {}{}",
             insight.summary,
             insight
                 .evidence_ids
@@ -2403,10 +2424,12 @@ fn render_evidence(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) 
         )
     } else if let Some(error) = &w.ai_error {
         format!(
-            "AI unavailable · {error}\nMeasured evidence remains available. i retries; A opens System Settings."
+            "{framework_line}\nAI unavailable · {error}\nMeasured evidence remains available. i retries; A opens System Settings."
         )
     } else {
-        "Insights will highlight useful next steps after the first measurements. No chat, no cloud upload.".into()
+        format!(
+            "{framework_line}\nInsights will highlight useful next steps after the first measurements. No chat, no cloud upload."
+        )
     };
     let block = panel(app, title).border_style(
         Style::default().fg(app.color(

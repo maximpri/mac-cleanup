@@ -31,6 +31,8 @@ Implemented in source:
 - Agentic investigation cases now retain competing hypotheses and typed evidence,
   automatically sequence fseventsd activity, volume context, and source research,
   and finish with a leading explanation or an explicit inconclusive state.
+- The workspace displays the detected Apple Foundation Models framework state and
+  keeps measured triage usable when a model response cannot be validated.
 - Completed action sessions can receive a bounded local AI outcome summary in
   History; raw action records and before/after measurements remain authoritative.
 - Per-action history, before/after resource windows, regrowth/restart observations,

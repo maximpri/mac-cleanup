@@ -15,6 +15,38 @@ use std::{
 /// Bump when the helper instructions or response interpretation changes.
 pub const PROMPT_VERSION: &str = "care-triage-v2";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrameworkStatus {
+    Detecting,
+    Available { detail: String },
+    Unavailable { detail: String },
+    Missing { detail: String },
+}
+
+impl FrameworkStatus {
+    pub fn description(&self) -> String {
+        match self {
+            Self::Detecting => "Apple Foundation Models · detecting".into(),
+            Self::Available { detail } => format!("Apple Foundation Models · available{detail}"),
+            Self::Unavailable { detail } => {
+                format!("Apple Foundation Models · unavailable · {detail}")
+            }
+            Self::Missing { detail } => {
+                format!("Apple Foundation Models · helper missing · {detail}")
+            }
+        }
+    }
+
+    pub fn compact(&self) -> &'static str {
+        match self {
+            Self::Detecting => "AI detecting",
+            Self::Available { .. } => "AI ready",
+            Self::Unavailable { .. } => "AI unavailable",
+            Self::Missing { .. } => "AI helper missing",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Subject {
     pub id: String,
@@ -61,6 +93,128 @@ struct Response {
     error: Option<String>,
     insight: Option<Insight>,
     triage: Option<Triage>,
+}
+
+/// Detect the framework used by the bundled local model helper without starting
+/// an inference request. This runs on a worker because model availability may
+/// involve checking downloaded Apple Intelligence assets.
+pub fn framework_status() -> FrameworkStatus {
+    let helper = match std::env::current_exe() {
+        Ok(path) => path.with_file_name("mac-cleanup-ai"),
+        Err(error) => {
+            return FrameworkStatus::Missing {
+                detail: display_text(&error.to_string()),
+            };
+        }
+    };
+    if !helper.is_file() {
+        return FrameworkStatus::Missing {
+            detail: "build or install the release bundle".into(),
+        };
+    }
+    let mut child = match Command::new(helper)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return FrameworkStatus::Unavailable {
+                detail: display_text(&error.to_string()),
+            };
+        }
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return FrameworkStatus::Unavailable {
+            detail: "helper input unavailable".into(),
+        };
+    };
+    if writeln!(stdin, "{{\"protocol\":1,\"operation\":\"availability\"}}").is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return FrameworkStatus::Unavailable {
+            detail: "helper request failed".into(),
+        };
+    }
+    drop(stdin);
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return FrameworkStatus::Unavailable {
+            detail: "helper output unavailable".into(),
+        };
+    };
+    let reader = thread::spawn(move || {
+        let mut output = String::new();
+        stdout
+            .take(8_193)
+            .read_to_string(&mut output)
+            .map(|_| output)
+    });
+    let started = Instant::now();
+    loop {
+        if started.elapsed() > Duration::from_secs(3) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            return FrameworkStatus::Unavailable {
+                detail: "availability check timed out".into(),
+            };
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let output = match reader.join() {
+                    Ok(Ok(output)) => output,
+                    _ => {
+                        return FrameworkStatus::Unavailable {
+                            detail: "helper response could not be read".into(),
+                        };
+                    }
+                };
+                if !status.success() {
+                    return FrameworkStatus::Unavailable {
+                        detail: "availability helper failed".into(),
+                    };
+                }
+                let response: Response = match serde_json::from_str(output.trim()) {
+                    Ok(response) => response,
+                    Err(_) => {
+                        return FrameworkStatus::Unavailable {
+                            detail: "invalid availability response".into(),
+                        };
+                    }
+                };
+                if response.protocol != 1 {
+                    return FrameworkStatus::Unavailable {
+                        detail: "helper protocol mismatch".into(),
+                    };
+                }
+                return if response.available {
+                    FrameworkStatus::Available {
+                        detail: String::new(),
+                    }
+                } else {
+                    FrameworkStatus::Unavailable {
+                        detail: display_text(&response.error.unwrap_or_else(|| {
+                            "enable Apple Intelligence in System Settings".into()
+                        })),
+                    }
+                };
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return FrameworkStatus::Unavailable {
+                    detail: display_text(&error.to_string()),
+                };
+            }
+        }
+    }
 }
 
 /// Inspected labels are data, including control and bidirectional characters.
@@ -149,6 +303,48 @@ pub fn validate_triage(request: &Request, triage: &Triage) -> Result<(), String>
         return Err("AI returned unsupported triage references.".into());
     }
     Ok(())
+}
+
+/// Keep the measured ordering usable when the local model returns malformed
+/// references or is unavailable. This path never invents a recommendation.
+pub fn deterministic_triage(request: &Request) -> Triage {
+    let mut quick = request
+        .subjects
+        .iter()
+        .filter(|subject| subject.quick_win)
+        .collect::<Vec<_>>();
+    let mut areas = request
+        .subjects
+        .iter()
+        .filter(|subject| !subject.quick_win)
+        .collect::<Vec<_>>();
+    let order = |left: &&Subject, right: &&Subject| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| left.id.cmp(&right.id))
+    };
+    quick.sort_by(order);
+    areas.sort_by(order);
+    let quick_win_ids = quick
+        .into_iter()
+        .take(3)
+        .map(|subject| subject.id.clone())
+        .collect::<Vec<_>>();
+    let key_area_ids = areas
+        .into_iter()
+        .take(5)
+        .map(|subject| subject.id.clone())
+        .collect::<Vec<_>>();
+    let reasons = quick_win_ids
+        .iter()
+        .chain(key_area_ids.iter())
+        .map(|_| "Measured policy order; local AI did not return a usable ranking.".into())
+        .collect();
+    Triage {
+        key_area_ids,
+        quick_win_ids,
+        reasons,
+    }
 }
 pub fn explain(request: &Request, cancelled: &Arc<AtomicBool>) -> Result<Insight, String> {
     match explain_once(request, cancelled) {

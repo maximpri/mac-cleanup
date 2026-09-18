@@ -84,6 +84,9 @@ has a timeout and pauses under critical memory pressure. A cyan/violet sweep
 runs only during actual inference or investigation; completion briefly accents
 the result. `M`, `REDUCE_MOTION`, and `NO_COLOR` provide static presentation.
 Animation stops when the terminal reports focus loss.
+The top status line and AI pane show the detected Apple Foundation Models
+framework state: detecting, available, unavailable, or helper missing. If a
+triage response is malformed, the app falls back to measured policy ordering.
 
 **Review plan** lists exact cleanup paths, process identities and signals, and
 relocation destinations with tradeoffs. `Space` adds/removes a finding's action;
