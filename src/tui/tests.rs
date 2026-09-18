@@ -1706,7 +1706,7 @@ fn exact_paths_scroll_in_confirmations_and_no_color_is_respected() {
     assert_ne!(before, buffer_text(&last));
 }
 
-fn buffer_svg(buffer: &ratatui::buffer::Buffer) -> String {
+pub(super) fn buffer_svg(buffer: &ratatui::buffer::Buffer) -> String {
     let rgb = |color: Color| match color {
         Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
         Color::Black => "#161817".into(),

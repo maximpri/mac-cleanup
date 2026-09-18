@@ -19,7 +19,9 @@ name there.
    cargo clippy --all-targets --all-features --locked -- -D warnings
    cargo test --all-targets --locked
    cargo doc --no-deps --document-private-items
-   cargo build --release --locked
+   sh scripts/build-release.sh
+   python3 scripts/check_ai_helper.py
+   python3 scripts/smoke_tui.py
    cargo package --locked
    ```
 
@@ -34,8 +36,14 @@ name there.
 4. Create a GitHub Release from the tag and copy its changelog section into the
    release notes.
 
-For prebuilt binaries, build separate `aarch64-apple-darwin` and
-`x86_64-apple-darwin` artifacts on trusted macOS systems. Record SHA-256
+The AI-enabled release targets Apple silicon and macOS 26+. Package both
+`mac-cleanup` and `mac-cleanup-ai` in the same directory. Run
+`python3 scripts/check_ai_helper.py --live` on a compatible development Mac,
+and complete the model-quality and performance gates in
+`docs/IMPLEMENTATION_PLAN.md` before promoting this implementation to a release.
+CI verifies compilation and availability framing; hosted runners need not have
+Apple Intelligence assets. Rust-only Intel builds have no local AI provider.
+Record SHA-256
 checksums beside every artifact. Code signing and notarization require an Apple
 Developer identity and should be completed before calling a binary trusted or
 installer-ready.

@@ -68,6 +68,10 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &App) {
         );
         return;
     }
+    if let Some(workspace) = &app.care {
+        care_view::render(frame, area, app, workspace);
+        return;
+    }
     render_navigation(frame, area, app, "");
     let page = content_area(area);
     match app.phase {

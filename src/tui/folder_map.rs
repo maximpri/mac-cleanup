@@ -17,10 +17,12 @@ struct Tile<'a> {
 }
 
 fn name(item: &StorageItem) -> String {
-    item.path
+    let value = item
+        .path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| item.path.display().to_string())
+        .unwrap_or_else(|| item.path.display().to_string());
+    crate::ai::display_text(&value)
 }
 
 fn size_label(size: u64, width: u16) -> String {
@@ -202,9 +204,17 @@ fn draw_tiles(
 }
 
 pub(super) fn render_folder_map(frame: &mut Frame<'_>, area: Rect, app: &App, item: &StorageItem) {
+    render_map(frame, area, app, item, false);
+}
+pub(super) fn render_care_map(frame: &mut Frame<'_>, area: Rect, app: &App, item: &StorageItem) {
+    render_map(frame, area, app, item, true);
+}
+fn render_map(frame: &mut Frame<'_>, area: Rect, app: &App, item: &StorageItem, care: bool) {
     let block = panel(
         app,
-        if app.storage_tab == StorageTab::Heatmap {
+        if care {
+            " FOLDER MAP · d expand evidence "
+        } else if app.storage_tab == StorageTab::Heatmap {
             " STORAGE MAP · e back to list "
         } else {
             " SELECTED ITEM · h expand "
@@ -219,7 +229,10 @@ pub(super) fn render_folder_map(frame: &mut Frame<'_>, area: Rect, app: &App, it
         heading(app, format!("{}   {}", name(item), format_kb(item.size_kb))),
         label(
             app,
-            truncate_middle(&item.path.display().to_string(), inner.width as usize),
+            truncate_middle(
+                &crate::ai::display_text(&item.path.display().to_string()),
+                inner.width as usize,
+            ),
         ),
         label(app, "Area = disk space · colors identify folders"),
     ];
@@ -266,7 +279,9 @@ pub(super) fn render_folder_map(frame: &mut Frame<'_>, area: Rect, app: &App, it
     let mut lines = vec![
         heading(
             app,
-            if item.kind == StorageItemKind::Directory {
+            if care {
+                "Enter  Explore    o  Finder    d  Evidence"
+            } else if item.kind == StorageItemKind::Directory {
                 "Enter  Open folder    i  Details"
             } else {
                 "o  Reveal file    i  Details"

@@ -1,17 +1,31 @@
-# Product review: improve performance and clean up waste
+# Product direction: a unified AI-assisted Mac cleanup utility
+
+The [implementation plan](IMPLEMENTATION_PLAN.md) defines the current release
+scope and acceptance gates: fast progressive triage, Key areas and Quick wins,
+AI included in the first release, and macOS 26+ on compatible Apple silicon.
+It supersedes earlier milestone ordering and optional-platform assumptions in
+this review. These documents describe proposed work, not shipped capabilities.
 
 ## Goal and scope
 
-The user's clarified goal is **improve Mac performance and remove waste**.
-Understanding storage is part of that journey. Performance diagnosis is also a
-primary capability; the previous proposal to make it a secondary tool was too
-narrow and is superseded by this review.
+The product goal is **improve Mac performance and remove waste through one
+coherent experience**. Storage measurements, process observations, and application
+context feed the same investigation and action plan. The operator should not need
+to decide which scanner to run or connect separate reports manually.
+
+AI enhances explanations, investigation, and prioritization inside the visual
+interface. There is no chat screen, prompt box, or required conversation. The
+primary controls are ordinary actions such as Investigate, Review actions, Keep,
+and Recheck.
 
 Product promise: **show what is causing pressure or consuming unnecessary space,
 explain worthwhile actions, perform the approved actions, and show what changed.**
 
 This document reviews the existing journey and specifies the intended one.
-Proposed diagnostics, plans, and history screens are not implemented features.
+Proposed AI insights, unified findings, diagnostics, plans, and history screens
+are not implemented features. The shipped app still has separate Storage audit,
+Process health, and Move data destinations. This direction supersedes the earlier
+proposal to retain those destinations as the primary product organization.
 The review covers launch, measurement, interpretation, investigation, selection,
 execution, verification, return visits, read-only mode, and CLI automation. It
 is based on source inspection and platform documentation, not a diagnosis of the
@@ -134,22 +148,115 @@ or resource problem returned.
 
 ## Navigation and information hierarchy
 
-Retain one persistent top menu with a status bar. Storage is the first destination and the app
-opens its audit automatically. The current destinations are Storage audit,
-Process health, and Move data. Future performance trends, cleanup planning, and
-history can be added as destinations once those measurements and actions exist.
+Retain one persistent, single-line top menu with a status bar. The proposed
+destinations are **Findings**, **Explore**, and **History**. Settings and advanced
+commands remain secondary. A contextual **Review plan** control shows the number
+of selected actions and opens the same plan from any destination. Navigation
+labels have no numeric prefixes; highlights occupy one line.
 
-Settings and advanced commands can remain secondary. A Review plan control is
-available from the findings that populate it. This is a proposed destination map;
-it does not imply those screens already exist.
+**Findings is the working screen on launch.** Begin a bounded local assessment
+and populate actionable findings progressively, before the deep disk inventory
+finishes. It contains measured conditions and decisions, with no welcome cards
+or passive Overview screen. Show a useful all-clear state when evidence supports
+it, and distinguish that state from an incomplete assessment.
 
-The main pane pairs a size-sorted folder browser with a large nested storage map
-of the selected folder. Rectangle area shows size; branch colors distinguish
-folders. Cleanup eligibility is stated separately, with a link to the findings
-and their consequences. Size alone is never presented as evidence of waste. Exact implementation details belong in inspection
-and review. User-facing action names should describe the outcome: review cleanup,
-quit this app, inspect this folder, or move this folder. Preserve stable shortcuts
-and keep all essential actions visible and reachable by mouse or keyboard.
+Findings are organized around the responsible application, activity, or concrete
+problem. One finding can combine storage growth, associated processes, memory
+pressure, and supported actions. Filters can narrow benefit or action type, but
+the default list includes all relevant findings. Priority uses measured impact,
+confidence, and disruption; size and CPU usage alone do not establish waste.
+
+The status bar reports current assessment progress, measurement freshness, disk
+capacity, and resource pressure when available. Never collapse these into an
+unexplained health score or a fabricated overall scan percentage.
+
+The main pane shows findings on the left and the selected finding's explanation
+and evidence on the right. Its detail pane answers, in order: what was observed,
+why it may matter, what can be done, and what the tradeoff is. Storage findings
+include a nested map; process findings include process relationships and sampled
+trends; combined findings can show both. Findings stay usable while optional AI
+explanations are pending.
+
+**Explore** provides deeper inspection of applications, folders, and processes
+in the same workspace. The folder browser and selected-folder map remain
+available here. Rectangle area shows size; branch colors distinguish folders.
+Moving from a finding to its folder or process preserves the finding, selection,
+and plan. Relocation is a contextual action on eligible useful data.
+
+**History** shows completed plans, actual outcomes, and evidence of recurrence.
+History entry points lead back to the same application or finding. A history
+entry must not imply an undo operation when no recovery mechanism exists.
+
+Exact paths and PIDs are available in inspection and always visible in action
+review. Preserve stable shortcuts and keep essential actions reachable by mouse
+and keyboard. This is the target navigation, not a claim about shipped screens.
+
+## One finding across storage and processes
+
+Use a shared finding model with the following information:
+
+- Subject: application, project, activity, directory, or system condition.
+- Evidence: measurement IDs, timestamps, sampling windows, scope, and coverage.
+- Relationships: owning app, process family, generated data, or shared resource,
+  each with its provenance and uncertainty.
+- Interpretation: observed condition, possible explanation, and unresolved checks.
+- Actions: supported operations, benefit type, dependencies, disruption, and blockers.
+- Outcome: action completion, refreshed observations, and any remaining uncertainty.
+
+Retain explicit unknown and shared ownership. An AI-suggested relationship cannot
+become verified ownership or authorize deletion. Deduplicate overlapping targets
+and shared process relationships across findings before constructing a plan.
+
+For example, a browser-automation finding could combine residual process
+activity and associated temporary profiles. The app first checks whether an
+active session still owns the activity. If supported and approved, it can stop
+the selected process, recheck file use, clean eligible temporary data, and then
+measure the outcome. This is one continuing investigation with separate action
+consents, not separate storage and process tasks for the user to assemble.
+
+Other cases require only one kind of evidence: a full disk with disposable data,
+an intentional build that should continue, or a useful directory suitable for
+verified relocation. Do not force every finding to contain every measurement.
+
+## AI as part of the interface
+
+Use Apple's on-device Foundation Models as the proposed default provider on
+supported machines. Model availability is checked at runtime; unsupported
+hardware, disabled Apple Intelligence, or unavailable model assets must leave
+the ordinary audit and cleanup workflow functional. A Swift helper can support
+macOS 26; macOS 27 also provides Apple's `fm` command-line interface. Cloud
+inference is a separate, explicit option and is never a silent fallback.
+
+AI has three initial jobs:
+
+1. **Explain a finding.** Turn supplied measurements and known cleanup rules into
+   a concise description of purpose, benefit, disruption, and uncertainty.
+2. **Investigate further.** Select bounded read-only checks from an explicit tool
+   catalog and update the current finding with the resulting evidence. Show
+   progress, allow cancellation, and cap work; no manual terminal commands.
+3. **Explain a plan and its results.** Describe dependencies and tradeoffs before
+   execution, then summarize measured outcomes without inventing improvement.
+
+The Rust engine owns measurements, target identities, eligibility, confirmations,
+and execution. Model output refers to known evidence and action IDs and is
+validated before display or use. A model cannot introduce an executable shell
+command, expand a confirmed target set, or waive an in-use check. Treat filenames,
+process arguments, and inspected content as data, never as instructions.
+
+AI prioritization can suggest a better ordering within the engine's eligibility
+and disruption constraints. It must not relabel an unsupported operation as safe.
+Unknown purpose stays unknown when the supplied evidence cannot establish it.
+User choices such as Keep can be remembered as visible, editable preferences;
+they do not grant permission for later destructive actions.
+
+Run inference on demand for the selected finding or a bounded summary. Cache
+insights against evidence version and invalidate them when measurements or
+eligibility change. Do not generate an explanation for every file. Keep model
+work out of performance verification windows, or label those windows as affected.
+
+The product's distinction is the complete evidence-to-action journey. Model access
+alone does not establish an advantage. Evaluate both explanation accuracy and
+whether users reach a sound decision with less manual investigation.
 
 ## Review-plan contract
 
@@ -190,14 +297,18 @@ must retain its narrow policy and must not start process termination.
 
 ## Implementation priorities
 
-1. **Establish the evidence model.** Add bounded performance sampling, measurement
+1. **Unify findings and evidence.** Adapt existing storage and process collectors
+   to a shared finding model. Add bounded performance sampling, measurement
    windows, coverage/freshness, and a distinction between recommendation and eligibility.
-2. **Connect the journey.** Quick useful audit, progressive findings, selected-item
-   actions, explicit review, persistent results, and targeted refresh.
-3. **Improve action quality.** App-level context, exact blockers, selective supported
-   cleanup adapters, and contextual relocation. Preserve per-action safety checks.
-4. **Verify outcomes.** Before/after observations, recurring-problem history, and
-   conservative explanations of what changed and what remains unproven.
+2. **Ship one working journey.** Progressive assessment, the Findings/Explore
+   workspace, contextual actions and relocation, one review plan, persistent
+   results, and targeted refresh. Validate it with deterministic explanations.
+3. **Add local AI insights.** Evaluate selected-finding explanations and bounded
+   read-only investigation. Include unavailable-model and invalid-output handling;
+   the same workflow must remain usable without AI.
+4. **Close the outcome loop.** Before/after observations, editable Keep preferences,
+   recurring-problem history, and conservative AI summaries of what changed and
+   what remains unproven. Preserve per-action safety checks throughout.
 
 ## Acceptance scenarios
 
@@ -214,6 +325,16 @@ must retain its narrow policy and must not start process termination.
 - Cancellation, app relaunch, permission changes, and partial failures: preserve
   understandable state and offer an appropriate next step.
 - Read-only mode and unattended CLI: no newly introduced action bypasses.
+- Combined process/data finding: investigate ownership, review dependent actions,
+  revalidate between actions, and verify both storage and process outcomes in one place.
+- An active app restarts between stop and cleanup: skip newly blocked cleanup and
+  explain the updated finding without repeated automatic termination.
+- AI unavailable, cancelled, slow, or returning unsupported claims/IDs: retain
+  evidence, navigation, and valid deterministic actions without inventing an insight.
+- New scan evidence invalidates an explanation: visibly refresh or remove the old
+  insight; never execute a plan based only on a stale AI recommendation.
+- No chat interaction: complete assessment, investigation, review, action, and
+  verification entirely through visible controls.
 
 Measure time to first useful finding, whether the operator can explain the
 recommendation, whether the action can be completed inside the app, and whether
@@ -238,3 +359,20 @@ therefore require separate evidence in our product.
 
 These references ground the diagnostic distinctions. The proposed workflow,
 ranking rules, and verification requirements are this review's design conclusions.
+
+Apple documents on-device Foundation Models availability starting with macOS 26
+on Apple Intelligence-compatible devices with the feature enabled, including
+offline inference at no inference charge.
+[Foundation Models availability](https://www.apple.com/ca/newsroom/2025/09/apples-foundation-models-framework-unlocks-new-intelligent-app-experiences/).
+Apple introduces the preinstalled macOS 27 `fm` tool, structured output, and the
+Python SDK in [Build AI-powered scripts](https://developer.apple.com/videos/play/wwdc2026/334/).
+Provider integration above is proposed architecture and has not been implemented
+or benchmarked in this application.
+
+## Implementation checkpoint
+
+The unified workspace, bounded local AI helper, shared plans, and local outcome
+history are now implemented in source. See the dated checkpoint in
+[IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for completed capabilities and
+outstanding release evaluation. Earlier UX proposals in this review are design
+context; [README.md](../README.md) describes the current controls.

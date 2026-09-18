@@ -23,6 +23,7 @@ class Screen:
     def __init__(self, width=120, height=30):
         self.resize(width, height)
         self.pending = ""
+        self.cursor_reports = 0
         self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
 
     def resize(self, width, height):
@@ -47,6 +48,8 @@ class Screen:
                     if not params.startswith("?"):
                         numbers = [int(n or 0) for n in params.split(";")] if params else [0]
                         n = numbers[0]
+                        if action == "n" and n == 6:
+                            self.cursor_reports += 1
                         if action in "Hf":
                             self.y = max(0, n - 1)
                             self.x = max(0, (numbers[1] if len(numbers) > 1 else 1) - 1)
@@ -94,6 +97,18 @@ class Session:
         os.close(slave)
         self.screen = Screen()
 
+    def feed(self, data):
+        self.screen.feed(data)
+        while self.screen.cursor_reports:
+            os.write(self.master, b"\x1b[1;1R")
+            self.screen.cursor_reports -= 1
+
+    def pump(self, seconds):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if select.select([self.master], [], [], 0.05)[0]:
+                self.feed(os.read(self.master, 262144))
+
     def wait_for(self, text, timeout=20):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -103,8 +118,10 @@ class Session:
             # delivered as separate reads (ESC + key in one read parses as
             # Alt+key instead of two keys).
             if select.select([self.master], [], [], 0.05)[0]:
-                self.screen.feed(os.read(self.master, 262144))
+                data = os.read(self.master, 262144)
+                self.feed(data)
             if re.sub(r"\s+", "", text) in re.sub(r"\s+", "", self.screen.text()):
+                self.pump(0.12)  # Finish the frame before callers inspect its targets.
                 return
             if self.process.poll() is not None:
                 raise AssertionError(f"TUI exited before {text!r}: {self.process.returncode}")
@@ -128,7 +145,7 @@ class Session:
                 try:
                     data = os.read(self.master, 262144)
                     if data:
-                        self.screen.feed(data)
+                        self.feed(data)
                 except OSError:
                     break
         return self.process.wait(timeout=max(0.1, deadline - time.monotonic()))
@@ -148,36 +165,6 @@ class Session:
 
 def main():
     binary = Path(sys.argv[1] if len(sys.argv) > 1 else "target/release/mac-cleanup").resolve()
-    session = Session(binary, "--analyze")
-    try:
-        session.wait_for("SCANNING")
-        session.send(b"\x1b")
-        session.wait_for("AVAILABLE VOLUMES")
-        session.send(b"\x1b[19~")  # F8: focus the persistent top menu
-        session.wait_for("› Storage audit")
-        session.send(b"\r")
-        session.wait_for("AVAILABLE VOLUMES")
-        session.wait_for("Storage audit")
-        session.send(b"\x1b[Z")
-        session.wait_for("› Storage audit")
-        session.send(b"\x1b[B\r")
-        session.wait_for("LIVE PROCESSES")
-        session.send(b"?")
-        session.wait_for("KEYBOARD GUIDE")
-        session.send(b"\x1b")
-        session.wait_for("LIVE PROCESSES")
-        session.send(b"1")
-        session.wait_for("AVAILABLE VOLUMES")
-        session.resize(45, 12)
-        session.wait_for("Expand the terminal")
-        session.resize(80, 24)
-        session.wait_for("AVAILABLE VOLUMES")
-        session.send(b"q")
-        assert session.wait_exit() == 0
-    finally:
-        session.close()
-    print("PASS: live terminal navigation, help, resize, and exit")
-
     with tempfile.TemporaryDirectory(prefix="mac-cleanup-smoke-") as temporary:
         root = Path(temporary).resolve()
         trash = root / ".Trash"
@@ -186,44 +173,67 @@ def main():
         candidate.write_bytes(b"test fixture\n" * 4096)
         protected = root / "keep.txt"
         protected.write_text("outside the cleanup allowlist")
-        report = subprocess.run(
-            [str(binary), "--analyze", "--json", "--volume", str(root)],
-            capture_output=True, text=True, check=True, timeout=30,
-        )
-        data = json.loads(report.stdout)
-        assert data["schema_version"] == 5
+        report = subprocess.run([str(binary), "--analyze", "--json", "--volume", str(root)], capture_output=True, text=True, check=True, timeout=30)
+        assert json.loads(report.stdout)["schema_version"] == 5
         assert candidate.exists()
-        print("PASS: read-only JSON schema and disposable-volume inventory")
-        session = Session(binary, "--volume", str(root))
+        print("PASS: read-only JSON schema 5")
+        session = Session(binary, "--analyze", "--volume", str(root))
         try:
-            session.wait_for("Explore folders", timeout=30)
-            session.wait_for("FOLDER / FILE")
-            session.send(b"\r")
-            session.wait_for("disposable-fixture.bin")
-            session.send(b"\x7f")
-            session.send(b"v")
-            session.wait_for("Disk accounting")
-            session.send(b"f")
-            session.wait_for("FINDINGS")
-            session.send(b"c")
-            session.wait_for("CONFIRM CLEANUP")
-            session.wait_for(str(trash))
+            session.wait_for("Findings")
+            session.send(b"\t\x1b[C\r")
+            session.wait_for("Storage")
+            session.send(b"P")
+            session.wait_for("LIVE PROCESSES")
             session.send(b"\x1b")
-            session.wait_for("FINDINGS")
-            assert candidate.exists(), "cancel must preserve the selected data"
-            # Cancellation preserves the selection made by clean-all.
-            session.send(b"\r")
-            session.wait_for("CONFIRM CLEANUP")
-            session.send(b"y")
-            session.wait_for("A little more room.")
-            assert trash.is_dir(), "cleanup must retain the allowlisted folder"
-            assert not candidate.exists(), "confirmed fixture cleanup should complete"
-            assert protected.read_text() == "outside the cleanup allowlist"
-            session.send(b"\r")
-            assert session.wait_exit() == 0
+            session.wait_for("Findings")
+            session.resize(45,12)
+            session.wait_for("Expand the terminal")
+            session.send(b"CLEAN\r")
+            session.pump(0.8)  # Keep the window small until queued keys have been handled.
+            assert candidate.exists()
+            session.resize(120,30)
+            session.wait_for("Findings")
+            time.sleep(0.25)
+            session.send(b"q")
+            assert session.wait_exit()==0
         finally:
             session.close()
-        print("PASS: selection, exact-path confirmation, cancellation, guarded fixture cleanup")
+        print("PASS: unified menu, process inspection, read-only resize, and exit")
+        session = Session(binary, "--volume", str(root))
+        try:
+            session.wait_for("Assessment complete",timeout=45)
+            session.send(b"f")
+            session.wait_for("ALL FINDINGS")
+            # Inspect each plan without executing until the exact fixture is selected.
+            for _ in range(40):
+                session.send(b" ")
+                session.send(b"p")
+                session.wait_for("REVIEW EXACT ACTIONS")
+                if str(trash) in session.screen.text():
+                    break
+                session.send(b"\x1b[3~")  # Delete clears this unexecuted plan.
+                session.wait_for("ALL FINDINGS")
+                session.send(b"\x1b[B")
+            else:
+                raise AssertionError("fixture Trash was not selectable")
+            assert "1 actions" in session.screen.text()
+            session.send(b"\x1b")
+            session.wait_for("ALL FINDINGS")
+            assert candidate.exists(), "cancel must preserve data"
+            session.send(b"p")
+            session.wait_for("Type CLEAN")
+            session.send(b"CLEAN\r")
+            session.wait_for("RESULTS",timeout=45)
+            assert trash.is_dir()
+            assert not candidate.exists()
+            assert protected.read_text()=="outside the cleanup allowlist"
+            time.sleep(6)
+            assert session.process.poll() is None, "results must stay open"
+            session.send(b"q")
+            assert session.wait_exit()==0
+        finally:
+            session.close()
+        print("PASS: exact-path review, cancellation, fixture-only cleanup, persistent results")
 
 
 if __name__ == "__main__":

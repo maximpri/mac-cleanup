@@ -6,6 +6,16 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Unified Findings, Explore, History, and exact-action review plans across
+  storage cleanup, process signals, and relocation.
+- On-device Apple FoundationModels explanations and bounded investigations,
+  with real-work activity visuals and static accessibility modes.
+- Progressive assessment, sampled CPU/pressure evidence, private local outcome
+  history, persistent results, and before/after observations.
+- Swift helper protocol checks and unified-workflow terminal smoke coverage.
+
 ### Changed
 
 - Removed the empty Overview destination. The app now starts its read-only

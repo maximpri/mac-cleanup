@@ -1,7 +1,12 @@
 use super::*;
 
 impl App {
+    #[cfg(test)]
     pub(super) fn new(cli: &Cli, home: &Path) -> Result<Self, String> {
+        Self::new_with_care(cli, home, false)
+    }
+
+    pub(super) fn new_with_care(cli: &Cli, home: &Path, unified: bool) -> Result<Self, String> {
         let requested_root = cli.volume.as_deref().map(validate_scan_root).transpose()?;
         let mut locations = scan_locations(home);
         if let Some(path) = &requested_root
@@ -39,14 +44,17 @@ impl App {
         // Retention discovery can invoke lsof and measure large stale trees,
         // so it runs off-thread while the audit screen stays responsive.
         let temp_retention = TempRetentionScan::pending(cli.tmp_retention_days);
-        let retention_worker = Some(spawn_retention_worker(
-            scan_root.clone(),
-            home.to_path_buf(),
-            cli.tmp_retention_days,
-        ));
+        let retention_worker = (!unified).then(|| {
+            spawn_retention_worker(
+                scan_root.clone(),
+                home.to_path_buf(),
+                cli.tmp_retention_days,
+            )
+        });
         let specs = scan_specs(&scan_root, home);
         let now = Instant::now();
-        Ok(Self {
+        let mut app = Self {
+            care: None,
             mode: cli.mode(),
             analysis_only: cli.analyze,
             account_home: home.to_path_buf(),
@@ -58,7 +66,11 @@ impl App {
             whitelist: Whitelist::load(home),
             // Start with the useful work. The audit runs in the background
             // and opens the storage review when its inventory is ready.
-            phase: Phase::Scanning,
+            phase: if unified {
+                Phase::Review
+            } else {
+                Phase::Scanning
+            },
             include_reinstallable: cli.include_reinstallable,
             tmp_retention_days: cli.tmp_retention_days,
             temp_retention,
@@ -122,7 +134,11 @@ impl App {
             hit_regions: std::cell::RefCell::new(Vec::new()),
             map_paths: std::cell::RefCell::new(Vec::new()),
             quit: false,
-        })
+        };
+        if unified {
+            app.care = Some(care_view::Workspace::new(&app));
+        }
+        Ok(app)
     }
 
     pub(super) fn advance_work(&mut self) {

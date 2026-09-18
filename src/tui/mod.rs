@@ -20,8 +20,9 @@ use std::{
 use crossterm::{
     cursor::{Hide, Show},
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -58,6 +59,7 @@ use crate::{
 };
 
 mod app;
+mod care_view;
 mod dialogs;
 mod explorer;
 mod folder_map;
@@ -224,6 +226,7 @@ enum HitTarget {
 }
 
 struct App {
+    care: Option<care_view::Workspace>,
     mode: Mode,
     analysis_only: bool,
     account_home: PathBuf,
@@ -308,9 +311,21 @@ pub fn can_run() -> bool {
 pub fn run(cli: &Cli, home: &Path) -> Result<i32, String> {
     let mut stdout = io::stdout();
     enable_raw_mode().map_err(|error| format!("could not enable terminal raw mode: {error}"))?;
-    if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture, Hide) {
+    if let Err(error) = execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableFocusChange,
+        Hide
+    ) {
         let _ = disable_raw_mode();
-        let _ = execute!(stdout, DisableMouseCapture, Show, LeaveAlternateScreen);
+        let _ = execute!(
+            stdout,
+            DisableFocusChange,
+            DisableMouseCapture,
+            Show,
+            LeaveAlternateScreen
+        );
         return Err(format!(
             "could not enter the alternate terminal screen: {error}"
         ));
@@ -322,17 +337,24 @@ pub fn run(cli: &Cli, home: &Path) -> Result<i32, String> {
         Err(error) => {
             let _ = disable_raw_mode();
             let mut fallback = io::stdout();
-            let _ = execute!(fallback, DisableMouseCapture, Show, LeaveAlternateScreen);
+            let _ = execute!(
+                fallback,
+                DisableFocusChange,
+                DisableMouseCapture,
+                Show,
+                LeaveAlternateScreen
+            );
             return Err(format!("could not initialize the terminal: {error}"));
         }
     };
 
-    let app = match App::new(cli, home) {
+    let app = match App::new_with_care(cli, home, true) {
         Ok(app) => app,
         Err(error) => {
             let _ = disable_raw_mode();
             let _ = execute!(
                 terminal.backend_mut(),
+                DisableFocusChange,
                 DisableMouseCapture,
                 Show,
                 LeaveAlternateScreen
@@ -345,6 +367,7 @@ pub fn run(cli: &Cli, home: &Path) -> Result<i32, String> {
     let _ = disable_raw_mode();
     let _ = execute!(
         terminal.backend_mut(),
+        DisableFocusChange,
         DisableMouseCapture,
         Show,
         LeaveAlternateScreen
@@ -358,6 +381,10 @@ fn run_loop(
     mut app: App,
 ) -> Result<i32, String> {
     while !app.quit {
+        if let Some(mut workspace) = app.care.take() {
+            workspace.tick(&mut app);
+            app.care = Some(workspace);
+        }
         let size = terminal
             .size()
             .map_err(|error| format!("could not read terminal size: {error}"))?;
@@ -378,17 +405,27 @@ fn run_loop(
             if !app.quit {
                 app.advance_work();
             }
-        } else if event::poll(Duration::from_millis(250)).map_err(|error| error.to_string())? {
+        } else if event::poll(Duration::from_millis(if app.care.is_some() {
+            80
+        } else {
+            250
+        }))
+        .map_err(|error| error.to_string())?
+        {
             let terminal_event = event::read().map_err(|error| error.to_string())?;
             handle_terminal_event(&mut app, terminal_event);
         }
 
-        if !app.quit && app.summary_has_timed_out() {
+        if !app.quit && app.care.is_none() && app.summary_has_timed_out() {
             app.quit = true;
         }
     }
     Ok(i32::from(
         app.stats.failed > 0
+            || app
+                .care
+                .as_ref()
+                .is_some_and(|workspace| workspace.failed())
             || app
                 .relocation_report
                 .as_ref()
@@ -400,6 +437,16 @@ fn handle_terminal_event(app: &mut App, terminal_event: Event) {
     match terminal_event {
         Event::Key(key) => app.handle_key(key),
         Event::Mouse(mouse) => app.handle_mouse(mouse),
+        Event::FocusGained => {
+            if let Some(workspace) = &mut app.care {
+                workspace.set_focus(true);
+            }
+        }
+        Event::FocusLost => {
+            if let Some(workspace) = &mut app.care {
+                workspace.set_focus(false);
+            }
+        }
         Event::Resize(width, height) => {
             app.terminal_width = width;
             app.terminal_height = height;

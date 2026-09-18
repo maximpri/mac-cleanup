@@ -4,22 +4,20 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 
-Mac Cleanup finds disk space that can be reclaimed safely: files already in
-Trash or a volume recycle bin, temporary data, development artifacts, package
-caches, and other regenerable downloads. It also identifies large app-managed
-storage that may be worth reviewing without treating it as disposable. Its full-screen
-[Ratatui](https://ratatui.rs/) interface starts read-only and makes no changes
-unless cleanup is explicitly requested in the UI or with `--clean`, and the
-user confirms a selection. It also reviews processes that macOS explicitly
-reports as dead/zombie, stopped, or stuck in an uninterruptible wait.
+Mac Cleanup brings storage and running-process evidence into one visual care
+workspace. Find quick wins, inspect large folders and active workloads, review
+exact actions, and keep the measured results. On compatible Macs, Apple
+Intelligence adds local explanations and bounded investigations without chat,
+a cloud account, or an API key.
 
-Every storage scan also accounts for the selected filesystem and walks its
-real directories. The report shows capacity, used/free space, top-level
-directories, and the largest nested files/directories so a nearly full SSD is
-explained even when its space is not a safe cache to delete. These inventory
-paths are review-only; the cleanup allowlist remains separate.
+Assessment is read-only. Changes require an explicit reviewed plan; `--analyze`
+locks the session read-only. Never run the app with `sudo`. AI cannot introduce
+delete targets or execute actions. Existing path, ownership, process identity,
+whitelist, and in-use safeguards remain authoritative.
 
-The default mode is read-only. Do not run the app with `sudo`.
+The [implementation plan](docs/IMPLEMENTATION_PLAN.md) records the product scope
+and outstanding release validation. This implementation is under development;
+performance targets and the full model-evaluation matrix are not yet certified.
 
 > [!IMPORTANT]
 > The `mac-cleanup` package currently published on crates.io is an unrelated
@@ -29,7 +27,9 @@ The default mode is read-only. Do not run the app with `sudo`.
 
 ## Install and run
 
-Requirements: macOS, Rust 1.88 or newer, and a normal user account.
+Requirements: Rust 1.88 or newer and a normal macOS user account. Local AI requires
+Apple silicon, macOS 26+, an SDK containing FoundationModels, and Apple Intelligence
+enabled with its model downloaded. If unavailable, measured findings remain usable.
 
 Full Disk Access is optional. If macOS reports `SCAN ERROR` for a protected
 user cache you intentionally want to inspect, grant it to the terminal in
@@ -39,160 +39,103 @@ does not treat an unreadable directory as empty or eligible for cleanup.
 ```bash
 git clone https://github.com/maximpri/mac-cleanup.git
 cd mac-cleanup
-cargo build --release
+sh scripts/build-release.sh
 ./target/release/mac-cleanup
 ```
 
-To place a source-built binary in Cargo's binary directory instead, run
-`cargo install --path . --locked`. Prebuilt binaries, when available, are
-published only on this repository's Releases page.
+Keep `mac-cleanup` and `mac-cleanup-ai` together when installing the release
+bundle. A Rust-only build (`cargo build --release` or `cargo install --path .`)
+works without generated insights; the interface explains a missing helper.
+There is no remote provider fallback.
 
-The workspace has one persistent menu on the left and the selected section on
-the right. Click Storage audit, Process health, or Move data, or use
-keys `1`–`3`. Press `Tab` or `Shift+Tab` to switch between the top menu and content
-(`F8` is an alternative). A FOCUSED label identifies the pane receiving keys.
-Use Up/Down to choose a menu item and Enter or Right to open it. The app starts
-the storage audit automatically; opening a section transfers focus to its content. A single-line top menu stays visible at
-every supported size, with a status bar beneath it and no duplicate task cards.
-Menu keys never trigger content actions. A mouse click focuses its pane, and
-scrolling operates on the pane under the pointer. Read-only sessions disable
-Move data in the menu. Storage returns to an existing audit when available. `F9` opens additional
-commands, including File → Choose scan location for another volume.
+## Visual workflow
 
+The top menu is **Findings · Explore · History**, with **Review plan** on the
+right and one status line below. `Tab` switches between menu and content;
+arrow keys choose a menu item and `Enter` returns to content. Menu selection is
+one line, with no numbered labels.
 
-Storage opens with **Explore folders**, a size-sorted browser of everything the
-scan measured. Press `Enter` or `→` to open a directory, `←` or `Backspace` to
-return, and `i` for item information (also available in narrow terminals).
-`o` reveals the selected file or folder in Finder. Click a row to select it;
-click the selected row again to open it. The app retains all measured direct
-children, so drilling down needs no terminal commands or repeated scans.
-Each level shows allocated size, percentage of its measured children, and size
-bars on wide screens. Folder totals include their children; each list contains
-one level rather than overlapping ancestors and descendants.
-On wider terminals, the selected folder's **nested storage map** fills the right
-panel. Rectangle area represents allocated space; nested rectangles show its
-subfolders and files. Labels give names and sizes, with the largest children
-listed below. Click a rectangle to open that exact folder or inspect a file.
-`h` expands the selected item's map; `e` returns to the browser. Both share the
-same selection and navigation history. In narrow terminals, use `h` for the map
-and `i` for details.
+**Findings** combines cache measurements, pressure, flagged or busy processes,
+and large storage areas. It initially shows up to three Quick wins and five
+Key areas; `f` exposes all findings. Critical memory pressure remains visible.
+Quick wins use an explicit deterministic cache policy, never a model judgment.
+Rows stay in place as new evidence arrives. Storage sizes overlap when a
+parent and its descendants are shown; they are not added into a reclaimable total.
 
-Colors distinguish folder branches, not cleanup eligibility. The map shows up
-to three child levels and ten named items per level; smaller items are grouped,
-while amounts missing from measured children appear as **Other / unmeasured**.
-Items too small for a terminal cell remain accessible in the folder browser.
-The map footer links to cleanup findings with `f` when available. The status bar
-shows the current scan state and the top menu keeps section navigation visible;
-menu items and storage tabs use single-line highlights.
+The assessment first samples resource activity, then progressively measures
+known cleanup targets, temporary retention, incomplete downloads, and the full
+storage inventory. A large scan takes time; an unfinished or unreadable scan is
+not a complete measurement. `v` shows coverage and unexplained accounting.
 
-Use the four storage tabs, their letter shortcuts, or `[` / `]`:
+**Explore** browses folders largest first. `Enter` opens children; `Left` or
+`Backspace` returns. The right pane shows the selected folder's nested storage
+map: rectangle area represents allocated space, and colors distinguish branches,
+not cleanup safety. Tiny items remain available in the list. Click a rectangle
+to explore its target. `i` measures the selected folder again; `o` reveals it
+in Finder. No separate terminal commands are required.
 
-- **e Explore folders** — follow the space usage down to individual files.
-- **h Storage heatmap** — expand the selected folder's nested map. Use `↑` / `↓`
-  to select siblings, click a rectangle to open it, or `Enter` to open the
-  selected folder. `e` returns to the folder list.
-- **f Cleanup decisions** — inspect findings, removal impact, recovery, and the
-  recommended next step. From Explore or Heatmap, this selects an exact matching finding
-  or a finding inside the selected folder when available. `e` opens the selected
-  finding's contents when they were measured. Space selects a safe item;
-  Enter reviews the selection. `c` reviews all safe items; `d` reviews one item.
-- **v Scan coverage** — explains measured space, unexplained volume usage,
-  other APFS volumes / metadata, local snapshot dates, and unreadable paths.
-  `p` opens Full Disk Access settings; `r` scans again. Scroll for all details.
+**Local AI** first ranks measured key areas and eligible quick wins, then explains
+supplied evidence and tradeoffs. Triage can only reorder Rust-approved findings;
+it cannot create cleanup targets or change eligibility. `i` on a finding can
+request up to three permitted read-only checks: children, current process
+readings, open handles, or history comparison. Unsupported references are
+rejected, and explanations expire when supporting evidence changes. Inference
+has a timeout and pauses under critical memory pressure. A cyan/violet sweep
+runs only during actual inference or investigation; completion briefly accents
+the result. `M`, `REDUCE_MOTION`, and `NO_COLOR` provide static presentation.
+Animation stops when the terminal reports focus loss.
 
-The disk summary includes the percentage used, remaining space, and the safe
-cleanup estimate. Incomplete scans are labeled explicitly. APFS container
-usage can exceed the files measured on one volume; unexplained space is never
-presented as reclaimable. Exploration itself never selects or deletes data.
-Deletion still requires the existing exact-path confirmation; app-managed
-review data still requires typing `DELETE`. The initial screen starts the
-read-only audit automatically, and `Esc` opens the location picker if you want
-to change the scan scope.
+**Review plan** lists exact cleanup paths, process identities and signals, and
+relocation destinations with tradeoffs. `Space` adds/removes a finding's action;
+`p` reviews. Type `CLEAN` for ordinary cleanup, `APPLY` for signals or relocation,
+or `DELETE` for a separate single-item protected-data plan. No changes happen on
+selection. Signals run before data actions; if a signal fails, subsequent data
+actions are conservatively skipped. Every engine revalidates its targets.
+`Esc` returns from review, and `Delete` clears the plan. Mixed plans also require
+`s` to acknowledge process-signal consequences and `m` to acknowledge relocation
+and symlink consequences before `APPLY` is accepted.
 
-To start directly in cleanup mode, use:
-
-```bash
-./target/release/mac-cleanup --clean
-```
-
-The app scans each allowlisted location, shows its size and safety status, and
-lets you inspect every exact path before selecting anything. Cleanup uses a
-separate permanent-deletion confirmation dialog listing the exact targets and rechecks each selected item
-immediately before touching it. Press `o` on a finding to reveal that exact
-directory in Finder before deciding what to do.
-
-The Storage audit can open its location picker. Choose the home directory, the
-startup volume, or any mounted volume listed under `/Volumes`. Home scans look
-for user Trash and regenerable caches. Volume scans look for real volume-level
-waste such as `.Trashes`, `#recycle`, `@Recycle`, `$RECYCLE.BIN`, and
-`.TemporaryItems`. The picker labels each location as `LOCAL`, `USB`, or
-`NETWORK`, orders local storage first, and selects the local startup volume by
-default. Personal files are never inferred to be waste.
+**History** keeps assessment records and per-action outcomes on this Mac in
+`~/Library/Application Support/mac-cleanup/sessions`, with private directory/file
+permissions, a 30-day retention window, and a 50 MiB cap. It records before/after
+CPU, swap-rate, per-device activity, pressure, and free-space observations, plus
+regrowth and newly observed matching processes. These do not prove a
+causal performance improvement. Results stay open. `r` starts another assessment
+once the pending plan is empty. In writable mode, Delete in History opens a
+separate `CLEAR` confirmation; the deletion audit log is retained.
+When Apple Intelligence is available, a bounded summary of the completed
+observations appears beside the raw results; it cannot add actions or targets.
 
 ## TUI controls
 
-The interface uses high-contrast slate surfaces and a responsive command bar. Blue
-marks navigation, green indicates availability, amber marks caution, and
-coral identifies destructive decisions or failures. Labels convey the same
-meaning without color; `NO_COLOR` and `--no-color` remain supported. The interface
-requires at least 60 columns and 16 rows and blocks hidden actions in smaller
-windows. Long details, help, and confirmations scroll while decision controls
-remain visible.
+The interface supports terminals from 60 columns × 16 rows. Narrow windows
+stack evidence below the list. Hidden confirmations are blocked below the
+minimum size. Colors supplement text labels; `--no-color` is supported.
 
 | Key | Action |
 | --- | --- |
-| `1` / `2` / `3` | Open Storage / Process Health / Move Data. |
-| `PgUp` / `PgDn` | Page through lists or scroll long dialog details. |
-| `↑` / `↓` and `Enter` | Choose and open a task from the menu; move through lists elsewhere. |
-| Navigate menu | Open Storage, Process Health, or Move data from any non-modal screen. |
-| `?` | Open the in-app help overlay. |
-| `F1` | Open Help. |
-| `Tab` / `Shift+Tab` / `F8` | Switch focus between the top menu and content. |
-| `F9` / `F10` | Open the commands menu / quit. `Alt+F`, `Alt+N`, `Alt+A`, and `Alt+H` open File, Navigate, Actions, and Help. |
-| Mouse | Click the top menu or visible table rows; use the wheel to scroll lists and dialogs. |
-| `↑` / `↓` or `j` / `k` | Move through the current list. |
-| `e` / `h` / `f` / `v` | Explore folders / storage heatmap / cleanup decisions / scan coverage. `[` / `]` cycles these views. |
-| `←` / `Backspace` | Return to the parent in Explore or Heatmap. |
-| `Space` | In Cleanup decisions, select or deselect the highlighted eligible item; available from default mode. |
-| `a` | Select or deselect all eligible items. |
-| `c` | Select all safe `READY` items and open the cleanup confirmation. |
-| `d` | Delete the highlighted safe item, opt in to one highlighted `OPTIONAL` item, or begin guarded deletion for a highlighted `REVIEW` item. |
-| `m` | Open the largest-consumer relocation flow and move selected useful data to an external volume. |
-| `o` | Reveal the highlighted exact path in Finder. |
-| `i` | Explore or Heatmap: open scrollable item information. Cleanup decisions: toggle reinstallable items and rescan. |
-| `r` | Rescan storage, or refresh the process list from process review. |
-| `Enter` | Open the highlighted task, show details, or review selected cleanup items. |
-| `y` | Confirm the permanent deletion in the confirmation dialog. |
-| `t` / `k` | In process confirmation, send `SIGTERM` / explicitly send `SIGKILL`. |
-| `n` or `Esc` | Cancel the confirmation dialog. |
-| `q` | Quit, or stop after the current item while cleaning. |
-
-While scanning, the interface reports the current location, inspected-item
-count, allocated size found so far, and elapsed time. A full-volume inventory
-runs after the allowlisted locations finish; on macOS this includes the
-separate startup/data volume layout. The progress bar animates smoothly from
-zero through the active category but does not cross the next category
-boundary until that work finishes. Its counter reports completed categories, so
-a new scan begins at `0/total`. `Esc` cancels the scan and returns to the
-location picker; `q` quits.
-
-After cleanup, the final summary closes automatically after five seconds.
-Press `Enter`, `q`, or `Esc` to close it immediately.
-
-The default TUI starts in analysis mode. `d` opens confirmation for the single
-highlighted safe item. On an `OPTIONAL` finding, it explicitly opts in only that
-reinstallable item and warns that a large download may be needed later; `i`
-still opts in all reinstallable findings. On a `REVIEW` finding, `d` starts the
-guarded typed-confirmation flow. `c` selects all currently safe items. Passing
-`--analyze` explicitly locks the entire run to read-only analysis and hides
-these actions. In writable mode, `m` opens the largest-consumer list; choose a
-directory, enter an existing destination under `/Volumes`, review the verified
-plan, and confirm with `y`.
+| `Tab` / `Shift+Tab` | Switch menu/content focus. |
+| Arrow keys | Choose menu item or list row. |
+| `Enter` | Open selected folder or inspect a finding. |
+| `Space` | Add/remove selected finding's action. |
+| `p` | Review the exact action plan. |
+| `i` | Investigate finding with local AI; in Explore, measure selected folder. |
+| `e` / `d` | Explore selected finding's contents / expand evidence. |
+| `P` | Inspect current-account processes. |
+| `m` | Plan relocation to an external volume. |
+| `f` / `K` | All/fewer findings; keep selected finding out of this session's list. |
+| `v` | Show/hide scan coverage. |
+| `o` | Reveal selected path in Finder. |
+| `r` | Recheck storage and activity. |
+| `PgUp` / `PgDn` | Scroll evidence or review details. |
+| `M` / `A` | Toggle motion / open System Settings for Apple Intelligence. |
+| `?` | Show the keyboard guide in the evidence pane. |
+| `Esc` | Back/cancel; during execution, request stop after current action. |
+| `q` | Quit when no action is running. |
 
 ## Process review
 
-Choose Process Health from the top menu, or from Navigate → Process
-Health on another screen. The scan begins only after that explicit selection.
+Press `P` to inspect processes. Resource sampling begins with the unified assessment.
 The screen lists current-account processes so a visibly hung app can still be
 found and terminated even when macOS reports an ordinary run state. Explicit
 abnormal states are sorted to the top and highlighted:
@@ -207,8 +150,8 @@ before acting. The scanner does not infer a hang solely from high CPU use. A
 zombie is already dead, so sending it another signal cannot remove it; its
 parent must reap it, or the parent/session must be restarted.
 
-For a signalable entry, press `d` and choose `t` to request a graceful exit
-with `SIGTERM`, or `k` to explicitly force termination with `SIGKILL`. No
+For a signalable entry, press `Space` or `d` to add `SIGTERM` to the plan,
+or `x` to add an explicit `SIGKILL`. Review the plan and type `APPLY`. No
 escalation is automatic. Immediately before signalling, Mac Cleanup checks the
 PID, current-account ownership, parent PID, and start time again to guard
 against PID reuse. A previously flagged process that recovered is also
@@ -218,8 +161,8 @@ unattended.
 
 ## Scan another volume
 
-Use the location picker in the TUI, or pass the mounted volume path explicitly
-for line-oriented output and automation. NAS/server-managed recycle directories
+Pass `--volume` to select a mounted volume for either the TUI or
+line-oriented output and automation. NAS/server-managed recycle directories
 are separate from the Trash shown by Finder, so an empty Finder Trash does not
 mean a share's `#recycle` or `@Recycle` directory is empty:
 
@@ -270,7 +213,7 @@ The same retention threshold drives two more age-based cleanup sources:
 | Status | Meaning |
 | --- | --- |
 | `READY` | The allowlisted target exists and all current safeguards passed. Ordinary cache directories are emptied; aged directories release only stale entries; retention candidates are removed as exact paths. |
-| `OPTIONAL` | Regenerable, but needs explicit opt-in. Press `d` for only the highlighted item or `i` to opt in all reinstallables. |
+| `OPTIONAL` | Regenerable, but needs explicit opt-in. Add the highlighted item with `Space`; review its download tradeoff. |
 | `REVIEW` | Large app-managed or personal data. Excluded from ordinary and unattended cleanup; clean mode offers guarded single-item deletion. |
 | `PROTECTED` | Matches the user whitelist (`~/.config/mac-cleanup/whitelist`); every cleanup path refuses it. |
 | `IN USE` | A related application or package manager appears active. |
@@ -326,8 +269,8 @@ The following regenerable downloads are visible but unavailable by default:
 - Gradle, SwiftPM, and Hugging Face caches
 - CocoaPods downloads and Cypress application binaries
 
-Press `d` in the TUI to opt in and confirm only the highlighted item, press `i`
-to make all of them eligible, or start with `--include-reinstallable`. Using
+Press `Space` to add the highlighted item to the plan, or start with
+`--include-reinstallable`. Using
 their associated tools later may trigger a large download.
 
 Large app-managed areas are also shown as `REVIEW` findings when present:
@@ -342,7 +285,8 @@ These locations can contain valuable state. They are never included in normal
 selection, “select all,” or unattended cleanup and should preferably be reduced
 using the controls in Xcode, Cursor, OrbStack, or Telegram. Clean mode also
 offers advanced deletion for one highlighted `REVIEW` item at a time: highlight
-it and press `d`, inspect the exact path and impact, then type `DELETE`. This
+it and press `Space`, open the plan with `p`, inspect the exact path and impact,
+then type `DELETE`. Protected review data requires its own single-item plan. This
 permanently clears everything inside that app-managed directory and can remove
 settings, history, containers, simulator apps, or local account data. The
 related app must be closed, and the same path, symlink, type, and allowlist
@@ -533,7 +477,7 @@ concurrent app activity can make those values differ slightly.
 
 ![Redesigned storage workspace](docs/images/storage.png)
 
-The preview uses synthetic data. [Storage audit preview](docs/images/storage.png).
+The preview uses synthetic data. [Unified care workspace](docs/images/care.svg).
 
 ## Architecture
 

@@ -16,7 +16,7 @@ concurrency:
 jobs:
   quality:
     name: Format, lint, test, and package
-    runs-on: macos-latest
+    runs-on: macos-26
     timeout-minutes: 30
 
     steps:
@@ -44,8 +44,11 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo +stable doc --no-deps --document-private-items --locked
 
-      - name: Build release binary
-        run: cargo +stable build --release --locked
+      - name: Build Rust and Apple AI release bundle
+        run: RUSTUP_TOOLCHAIN=stable sh scripts/build-release.sh
+
+      - name: Check Apple helper protocol
+        run: python3 scripts/check_ai_helper.py
 
       - name: Validate source package
         run: cargo +stable package --locked

@@ -81,7 +81,7 @@ pub struct ProcessEntry {
     pub signalable: bool,
     pub signal_block_reason: Option<String>,
     pub outcome: Option<ProcessOutcome>,
-    start_time: String,
+    pub(crate) start_time: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

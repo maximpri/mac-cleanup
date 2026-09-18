@@ -1,55 +1,48 @@
-# TUI navigation decisions
+# Unified care navigation
 
-The application uses a persistent top navigation bar and one content pane.
-It starts the read-only storage audit automatically, then opens the Storage
-audit when the inventory is ready. There is no separate Overview destination:
-the first screen is the work that produces the evidence needed for a decision.
-The implementation stays in Ratatui; changing frameworks would not resolve the
-input-routing bugs and would add a large migration to a small interaction fix.
+The current Ratatui workspace has one navigation line: **Findings · Explore ·
+History**, with **Review plan (N)** at the right. One status line reports disk
+space, memory pressure, and assessment state. There is no Overview page or
+permanent left menu. Selection in the menu occupies one line.
 
-## Research
+`Tab` / `Shift+Tab` switches menu and content focus. Arrow keys select the menu
+item; Enter returns to content. Content actions are ignored while menu focus is
+active. Clickable controls and rows register the same rectangles used to render
+them. Read-only mode blocks all plan additions and execution. Terminals below
+60 × 16 block hidden confirmations while allowing cancellation and exit.
 
-- [Ratatui's List example](https://ratatui.rs/examples/widgets/list/) demonstrates
-  `List`, `ListState`, a selected item, highlight styling, and a focus marker.
-  We use that widget instead of painting each menu item independently. Mouse
-  hit testing derives from the same list rectangle and item heights.
-- [Textual's input guide](https://textual.textualize.io/guide/input/) describes a
-  single input-focused widget, focus styling, click-to-focus, and Tab/Shift+Tab
-  traversal. This is the basis for explicit menu/content focus and exclusive
-  dispatch of ordinary keys.
-- [Terminal.Gui's overview](https://gui-cs.github.io/Terminal.Gui/docs/overview.html)
-  also assigns Tab and Shift+Tab to the next and previous logical view. This
-  supports using those familiar keys rather than requiring F8 to reach the menu.
+Findings combines storage and process evidence. Quick wins use deterministic
+eligibility; local AI ranks eligible quick wins and key areas without changing
+policy, and explains the tradeoffs. New evidence preserves
+selected identity. `f` exposes all findings; `K` keeps an item out of the current
+session list. Enter or `e` inspects a finding; `d` expands its evidence. The right
+pane holds local AI context, selected-folder maps or sampled activity, and the
+evidence behind a decision. `v` exposes accounting and coverage.
 
-These references support the interaction patterns. The two-pane layout and the
-specific shortcut mapping below are application design choices, not a claim
-that one menu pattern is universally best.
+Explore lists immediate children by allocated size. Enter opens children;
+Left/Backspace returns. A nested rectangle map represents the selected folder.
+Colors identify branches, not deletion safety. A map click opens its exact
+measured path. `i` measures a selected folder, and `o` reveals it in Finder.
 
-## Behavior
+`P` opens current-account process inspection. Space queues SIGTERM; `x` queues
+an explicitly chosen SIGKILL. `m` opens relocation planning. Both feed the same
+review plan as cache actions. Protected review data requires a separate,
+single-item DELETE plan. Confirmation is fixed below the scrollable targets;
+Esc cancels and Delete clears the plan. Mixed plans require `s` to acknowledge
+signals and `m` to acknowledge relocation before `APPLY`. Execution cannot
+start from menu clicks, AI output, or row selection.
 
-| Input | Behavior |
-| --- | --- |
-| Tab / Shift+Tab | Move focus between the top menu and content, preserving content state. |
-| F8 | Alternative pane-focus shortcut. |
-| Up / Down, j / k | Move within the focused list; skip unavailable destinations. |
-| Home / End in menu | First / last available destination. |
-| Enter / Right in menu | Open the chosen section and focus its content. |
-| Esc in menu | Return focus to the current content without activating the choice. |
-| 1–3 | Open a section directly, when navigation is available. |
-| Click | Focus the clicked pane; a menu row also opens that section. |
-| Mouse wheel | Scroll the pane under the pointer. |
-| e / h / f / v or [ / ] in storage content | Choose Explore, Heatmap, Cleanup decisions, or Scan coverage. |
-| Click a storage-map rectangle | Open that exact folder or inspect that file; preserve cleanup selection. |
-| h / e in storage content | Expand the selected item’s map / return to the folder browser. |
-| i in storage content | Read full information and decision guidance for the selection. |
-| F9 / ? | Commands / keyboard help. |
+Local inference and read-only investigation have distinct labels. A moving
+cyan/violet accent represents real outstanding work. Completion briefly accents
+the result. `M`, `REDUCE_MOTION`, no-color mode, and terminal focus loss suppress
+motion. Model explanations identify their evidence scope and expire when that
+evidence changes. Measured facts remain usable without AI.
 
-The open section remains marked when the menu cursor moves elsewhere. Only the
-focused top-menu item receives its strong single-line highlight; the status bar
-identifies the scan state and keyboard focus. The menu remains visible at the
-minimum 60×16 viewport. Read-only sessions visibly disable Move data and skip it
-during menu navigation.
+History keeps results open and permits scrolling through exact outcomes.
+`r` starts a fresh assessment after the plan is empty. It does not claim that
+concurrent changes in CPU, pressure, or disk space prove a performance gain.
 
-Ordinary menu input is fully consumed: c, d, Space, a, m, and storage-view
-shortcuts cannot operate on the content while the menu owns focus. Confirmation
-dialogs and work in progress retain their existing navigation restrictions.
+Implementation: `src/tui/care_view.rs`. Domain safety remains in `cache.rs`,
+`processes.rs`, and `relocation.rs`. The retained specialist renderers support
+process inspection, folder maps, and relocation entry. CLI output remains
+independent and retains JSON schema 5.

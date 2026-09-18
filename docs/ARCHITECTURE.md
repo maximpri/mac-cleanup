@@ -2,7 +2,27 @@
 
 The current product direction and end-to-end findings are in the
 [performance and cleanup journey review](PRODUCT_REVIEW.md). That review
-supersedes older UI proposals below; proposed capabilities are not yet implemented.
+provides historical design context. The current implementation checkpoint is in
+[IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
+
+## Unified workspace implementation
+
+- `src/care.rs` collects capacity, sampled CPU/RSS/pressure, cache findings, and
+  storage inventory; classifies deterministic quick wins; and stores private
+  bounded session records.
+- `src/ai.rs` sends bounded structured metadata to a sibling helper, validates
+  response references/checks and policy-safe triage rankings, caches validated
+  insights by evidence revision, and enforces inference cancellation and timeout.
+- `native/AIHelper.swift` calls Apple's on-device FoundationModels API. It has
+  no filesystem action tool or remote fallback. The app revalidates evidence
+  after generation; valid JSON alone does not establish truthful prose.
+- `src/tui/care_view.rs` owns Findings/Explore/History, model activity visuals,
+  shared review plans, sequential execution, and before/after observations.
+- Existing cache, process, whitelist, and relocation engines own all mutation
+  safeguards. No model-generated path or signal is executed.
+- `scripts/build-release.sh` builds both binaries. `check_ai_helper.py` checks
+  framing without model assets, or exercises synthetic inference with `--live`.
+  `smoke_tui.py` checks terminal interactions and disposable-fixture cleanup.
 
 ## Purpose
 
@@ -65,10 +85,10 @@ remains under the user's control.
   always-visible decision controls. They own keyboard and mouse interaction.
 
 A persistent top menu is shown at every supported width, with shorter labels
-in narrow terminals. Tab switches focus between the top menu and content.
-Number keys 1–3 and mouse navigation share the same destinations. At less
-than 60 columns or 16 rows, the UI displays a resize message and blocks hidden
-actions while still allowing cancellation and exit handling.
+in narrow terminals. Tab switches focus between the top menu and content;
+navigation has no numbered menu labels. At less than 60 columns or 16 rows, the
+UI displays a resize message and blocks hidden actions while still allowing
+cancellation and exit handling.
 
 ## Boundaries
 

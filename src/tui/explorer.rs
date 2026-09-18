@@ -658,7 +658,7 @@ fn render_inspector_text(frame: &mut Frame<'_>, area: Rect, app: &App, lines: Ve
     frame.render_widget(paragraph.scroll((scroll, 0)), area);
 }
 
-fn coverage_lines(app: &App) -> Vec<Line<'static>> {
+pub(super) fn coverage_lines(app: &App) -> Vec<Line<'static>> {
     let Some(inventory) = &app.inventory else {
         return vec![];
     };

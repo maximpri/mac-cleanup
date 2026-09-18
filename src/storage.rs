@@ -571,7 +571,7 @@ fn device_for(path: &Path) -> Option<u64> {
         .map(|metadata| metadata.dev())
 }
 
-fn read_volume_stats(path: &Path) -> io::Result<VolumeStats> {
+pub(crate) fn read_volume_stats(path: &Path) -> io::Result<VolumeStats> {
     let device = device_for(path).unwrap_or_default();
     let output = Command::new(DF_COMMAND).args(["-kP"]).arg(path).output()?;
     if !output.status.success() {

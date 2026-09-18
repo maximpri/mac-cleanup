@@ -5,7 +5,9 @@
 //! allowlisted and revalidated before their contents are removed. See the
 //! repository README for the complete safety model.
 
+pub mod ai;
 pub mod cache;
+pub mod care;
 pub mod cli;
 pub mod downloads;
 pub mod history;

@@ -257,6 +257,13 @@ impl App {
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if let Some(mut workspace) = self.care.take() {
+            let handled = workspace.mouse(self, mouse);
+            self.care = Some(workspace);
+            if handled {
+                return;
+            }
+        }
         if self.is_scrollable_dialog() {
             match mouse.kind {
                 MouseEventKind::ScrollUp => {
@@ -422,6 +429,13 @@ impl App {
     }
 
     pub(super) fn handle_key(&mut self, key: KeyEvent) {
+        if let Some(mut workspace) = self.care.take() {
+            let handled = workspace.key(self, key);
+            self.care = Some(workspace);
+            if handled {
+                return;
+            }
+        }
         if key.kind != KeyEventKind::Press {
             return;
         }
