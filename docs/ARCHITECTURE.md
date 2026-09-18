@@ -8,8 +8,9 @@ provides historical design context. The current implementation checkpoint is in
 ## Unified workspace implementation
 
 - `src/care.rs` collects capacity, sampled CPU/RSS/pressure, cache findings, and
-  storage inventory; classifies deterministic quick wins; and stores private
-  bounded session records.
+  storage inventory; classifies deterministic quick wins; records read-only
+  high-memory system daemons such as `fseventsd`; and stores private bounded
+  session records.
 - `src/ai.rs` sends bounded structured metadata to a sibling helper, validates
   response references/checks and policy-safe triage rankings, caches validated
   insights by evidence revision, and enforces inference cancellation and timeout.

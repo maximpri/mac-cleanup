@@ -136,8 +136,9 @@ minimum size. Colors supplement text labels; `--no-color` is supported.
 ## Process review
 
 Press `P` to inspect processes. Resource sampling begins with the unified assessment.
-The screen lists current-account processes so a visibly hung app can still be
-found and terminated even when macOS reports an ordinary run state. Explicit
+The screen lists current-account processes and high-memory system daemons as
+separate read-only observations. A visibly hung app can still be found and
+terminated even when macOS reports an ordinary run state. Explicit
 abnormal states are sorted to the top and highlighted:
 
 - `STUCK WAIT` is blocked in an uninterruptible kernel wait (`U` or `D`);
@@ -157,7 +158,9 @@ PID, current-account ownership, parent PID, and start time again to guard
 against PID reuse. A previously flagged process that recovered is also
 protected. Mac Cleanup never signals itself or an ancestor process.
 `--analyze` disables process actions, and `--clean --yes` never kills processes
-unattended.
+unattended. For `fseventsd`, `i` can request a bounded `sudo -n fs_usage -w -f
+filesys fseventsd` sample when an existing authorization is available; the app
+never opens a password prompt or signals the daemon.
 
 ## Scan another volume
 

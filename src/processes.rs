@@ -1,4 +1,5 @@
-//! Conservative review and signalling of current-account processes.
+//! Conservative review and signalling of current-account processes, with
+//! read-only observations for unusually large system-owned daemons.
 //!
 //! Explicit abnormal states are highlighted, while ordinary processes remain
 //! visible for manual review of UI hangs that `ps` cannot prove. Signals are
@@ -18,6 +19,7 @@ const PS_COMMAND: &str = "/bin/ps";
 const ID_COMMAND: &str = "/usr/bin/id";
 const KILL_COMMAND: &str = "/bin/kill";
 const SIGNAL_WAIT: Duration = Duration::from_millis(750);
+const SYSTEM_MEMORY_OBSERVATION_KB: u64 = 512 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -77,6 +79,8 @@ pub struct ProcessEntry {
     pub elapsed: String,
     pub cpu_percent: String,
     pub command: String,
+    pub rss_kb: Option<u64>,
+    pub system_owned: bool,
     pub health: ProcessHealth,
     pub signalable: bool,
     pub signal_block_reason: Option<String>,
@@ -114,11 +118,13 @@ struct ProcessRow {
     state: String,
     elapsed: String,
     cpu_percent: String,
+    rss_kb: Option<u64>,
     command: String,
     start_time: String,
 }
 
-/// Return current-account processes with explicit abnormal states sorted first.
+/// Return current-account processes with explicit abnormal states sorted first,
+/// plus unusually large system daemons as read-only observations.
 pub fn review_processes() -> Result<Vec<ProcessEntry>, String> {
     let uid = current_uid()?;
     let rows = read_process_rows()?;
@@ -128,13 +134,16 @@ pub fn review_processes() -> Result<Vec<ProcessEntry>, String> {
 
     let mut entries = Vec::new();
     for row in rows {
-        if row.uid != uid {
+        let system_owned = row.uid != uid;
+        if system_owned && !is_system_observation_candidate(&row) {
             continue;
         }
 
         let health = health_from_state(&row.state).unwrap_or(ProcessHealth::Running);
         let start_time = row.start_time.clone();
-        let signal_block_reason = if health == ProcessHealth::Zombie {
+        let signal_block_reason = if system_owned {
+            Some("system-owned macOS process is read-only; Mac Cleanup never signals it".into())
+        } else if health == ProcessHealth::Zombie {
             Some("zombies are already dead and must be reaped by their parent".into())
         } else if row.pid <= 1 || row.pid == current_pid || protected.contains(&row.pid) {
             Some("Mac Cleanup never signals itself or one of its ancestor processes".into())
@@ -150,7 +159,9 @@ pub fn review_processes() -> Result<Vec<ProcessEntry>, String> {
             state: row.state,
             elapsed: row.elapsed,
             cpu_percent: row.cpu_percent,
+            rss_kb: row.rss_kb,
             command: row.command,
+            system_owned,
             health,
             signalable: signal_block_reason.is_none(),
             signal_block_reason,
@@ -269,7 +280,10 @@ fn current_uid() -> Result<u32, String> {
 }
 
 fn read_process_rows() -> Result<Vec<ProcessRow>, String> {
-    read_process_rows_with_args(&["-axo", "pid=,ppid=,uid=,state=,etime=,%cpu=,lstart=,comm="])
+    read_process_rows_with_args(&[
+        "-axo",
+        "pid=,ppid=,uid=,state=,etime=,%cpu=,rss=,lstart=,comm=",
+    ])
 }
 
 fn read_process_rows_for(pid: u32) -> Result<Vec<ProcessRow>, String> {
@@ -277,7 +291,7 @@ fn read_process_rows_for(pid: u32) -> Result<Vec<ProcessRow>, String> {
         "-p",
         &pid.to_string(),
         "-o",
-        "pid=,ppid=,uid=,state=,etime=,%cpu=,lstart=,comm=",
+        "pid=,ppid=,uid=,state=,etime=,%cpu=,rss=,lstart=,comm=",
     ])
 }
 
@@ -297,7 +311,7 @@ fn read_process_rows_with_args(args: &[&str]) -> Result<Vec<ProcessRow>, String>
 
 fn parse_process_row(line: &str) -> Option<ProcessRow> {
     let fields: Vec<&str> = line.split_whitespace().collect();
-    if fields.len() < 12 {
+    if fields.len() < 13 {
         return None;
     }
     Some(ProcessRow {
@@ -307,9 +321,21 @@ fn parse_process_row(line: &str) -> Option<ProcessRow> {
         state: fields[3].into(),
         elapsed: fields[4].into(),
         cpu_percent: fields[5].into(),
-        start_time: fields[6..11].join(" "),
-        command: fields[11..].join(" "),
+        rss_kb: fields[6].parse().ok(),
+        start_time: fields[7..12].join(" "),
+        command: fields[12..].join(" "),
     })
+}
+
+fn is_system_observation_candidate(row: &ProcessRow) -> bool {
+    row.rss_kb
+        .is_some_and(|rss| rss >= SYSTEM_MEMORY_OBSERVATION_KB)
+        || row
+            .command
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case("fseventsd"))
+        || health_from_state(&row.state).is_some()
 }
 
 fn process_exists(pid: u32) -> bool {
@@ -361,14 +387,29 @@ mod tests {
     #[test]
     fn parses_ps_rows_with_commands_containing_spaces() {
         let row = parse_process_row(
-            "  123   10  501 T+   01:02:03  7.5 Sun Aug 23 16:05:46 2026 /Applications/Test App.app/Test App",
+            "  123   10  501 T+   01:02:03  7.5 2048 Sun Aug 23 16:05:46 2026 /Applications/Test App.app/Test App",
         )
         .unwrap();
         assert_eq!(row.pid, 123);
         assert_eq!(row.parent_pid, 10);
         assert_eq!(row.command, "/Applications/Test App.app/Test App");
         assert_eq!(row.start_time, "Sun Aug 23 16:05:46 2026");
+        assert_eq!(row.rss_kb, Some(2048));
         assert_eq!(health_from_state(&row.state), Some(ProcessHealth::Stopped));
+    }
+
+    #[test]
+    fn system_observation_candidates_include_fseventsd_without_promoting_other_daemons() {
+        let fseventsd = parse_process_row(
+            "  42   1  0 S    01:02  0.0 64 Sun Aug 23 16:05:46 2026 /usr/sbin/fseventsd",
+        )
+        .unwrap();
+        assert!(is_system_observation_candidate(&fseventsd));
+        let daemon = parse_process_row(
+            "  43   1  0 S    01:02  0.0 64 Sun Aug 23 16:05:46 2026 /usr/libexec/exampled",
+        )
+        .unwrap();
+        assert!(!is_system_observation_candidate(&daemon));
     }
 
     #[test]

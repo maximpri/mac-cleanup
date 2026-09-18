@@ -565,6 +565,32 @@ impl Workspace {
                         self.ai_error = None;
                         if work.request.investigation {
                             self.pending_checks = insight.next_checks.iter().cloned().collect();
+                            let selected_is_fseventsd = self
+                                .investigation_target
+                                .as_ref()
+                                .and_then(|target| match target {
+                                    Target::Process(pid, identity) => app
+                                        .processes
+                                        .iter()
+                                        .find(|process| {
+                                            process.pid == *pid && process.start_time == *identity
+                                        })
+                                        .map(|process| {
+                                            Path::new(&process.command)
+                                                .file_name()
+                                                .and_then(|name| name.to_str())
+                                                .is_some_and(|name| {
+                                                    name.eq_ignore_ascii_case("fseventsd")
+                                                })
+                                        }),
+                                    _ => None,
+                                })
+                                .unwrap_or(false);
+                            if selected_is_fseventsd
+                                && !self.pending_checks.iter().any(|check| check == "fs_usage")
+                            {
+                                self.pending_checks.push_back("fs_usage".into());
+                            }
                             if self.pending_checks.is_empty() {
                                 self.pending_checks.push_back("inspect_children".into());
                             }
@@ -677,7 +703,7 @@ impl Workspace {
                     && !self.clearing_history
                     && self.work.is_none()
                 {
-                    self.start_ai(true, false);
+                    self.start_ai(app, true, false);
                     self.investigation_deadline = deadline;
                 } else {
                     self.investigation_deadline = None;
@@ -791,7 +817,7 @@ impl Workspace {
             self.note = Some(format!("History could not be saved: {error}"));
         }
     }
-    fn start_ai(&mut self, selected_only: bool, investigation: bool) {
+    fn start_ai(&mut self, app: &App, selected_only: bool, investigation: bool) {
         if self.metrics.pressure == Some(4) {
             self.auto_requested = true;
             self.ai_error = Some("Local AI paused while memory pressure is critical.".into());
@@ -822,20 +848,40 @@ impl Workspace {
             investigation,
             subjects: subjects.iter().map(|f| subject_for_finding(f)).collect(),
         };
+        let target = subjects.first().map(|f| f.target.clone());
+        let subject = investigation.then(|| subjects[0].id.clone());
+        let selected_is_fseventsd = target.as_ref().and_then(|target| match target {
+            Target::Process(pid, identity) => app
+                .processes
+                .iter()
+                .find(|process| process.pid == *pid && process.start_time == *identity)
+                .map(|process| {
+                    Path::new(&process.command)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.eq_ignore_ascii_case("fseventsd"))
+                }),
+            _ => None,
+        }) == Some(true);
         let cache_key = ai::cache_key(&request);
         if let Some(cached) = self.insight_cache.get(&cache_key).cloned() {
             self.insight_scope = cached.evidence_ids.clone();
             self.insight_inputs = request.subjects.clone();
             if investigation {
                 self.pending_checks = cached.next_checks.iter().cloned().collect();
+                if selected_is_fseventsd
+                    && !self.pending_checks.iter().any(|check| check == "fs_usage")
+                {
+                    self.pending_checks.push_back("fs_usage".into());
+                }
             }
+            self.investigation_target = target;
+            self.investigation_subject = subject;
             self.insight = Some(cached);
             self.ai_error = None;
             self.auto_requested = true;
             return;
         }
-        let target = subjects.first().map(|f| f.target.clone());
-        let subject = investigation.then(|| subjects[0].id.clone());
         self.investigation_target = target;
         self.investigation_subject = subject;
         let (sender, receiver) = mpsc::channel();
@@ -941,6 +987,14 @@ impl Workspace {
         let flag = stop.clone();
         let home = app.account_home.clone();
         let selected = target.clone();
+        let selected_command = match &target {
+            Target::Process(pid, identity) => app
+                .processes
+                .iter()
+                .find(|process| process.pid == *pid && process.start_time == *identity)
+                .map(|process| process.command.clone()),
+            _ => None,
+        };
         let history = self.history.clone();
         thread::spawn(move || {
             let path = match &selected {
@@ -1004,6 +1058,27 @@ impl Workspace {
                         _ => InvestigationResult::Note(
                             "The current assessment already refreshes process readings every two seconds; no process family is verified for this folder.".into(),
                         ),
+                    }
+                }
+                "fs_usage" => {
+                    let is_fseventsd = selected_command.as_deref().is_some_and(|command| {
+                        Path::new(command)
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.eq_ignore_ascii_case("fseventsd"))
+                    });
+                    if is_fseventsd {
+                        InvestigationResult::Note(
+                            care::observe_fseventsd(&flag).unwrap_or_else(|error| {
+                                format!(
+                                    "Filesystem activity probe unavailable: {error}. It uses sudo -n and never opens a password prompt."
+                                )
+                            }),
+                        )
+                    } else {
+                        InvestigationResult::Note(
+                            "Filesystem activity tracing is limited to the selected fseventsd daemon.".into(),
+                        )
                     }
                 }
                 _ => InvestigationResult::Note("Unsupported investigation check.".into()),
@@ -1496,7 +1571,7 @@ impl Workspace {
             KeyCode::Char('r')=>{if self.plan.is_empty(){self.recheck(app);}else{self.note=Some("Review or clear the pending plan before rechecking.".into());}},
             KeyCode::Char('?')=>self.note=Some("Tab: menu/content · arrows: choose · Enter: inspect · Space: add/remove action · i: AI investigation · e: explore · P: processes · m: move · p: review plan · f: all findings · K: keep · r: recheck · M: motion · q: quit".into()),
             KeyCode::Char('P')=>{app.phase=Phase::Processes;self.legacy=true;},
-            KeyCode::Char('i')=>self.start_ai(true,true),
+            KeyCode::Char('i')=>self.start_ai(app,true,true),
             KeyCode::Char('f')=>{self.show_all= !self.show_all;self.cursor=0;},
             KeyCode::Char('K')=>{if let Some(f)=self.selected(){if matches!(f.target,Target::System){self.note=Some("System pressure stays visible until readings change.".into());}else{self.kept.insert(f.id.clone());}}self.cursor=self.cursor.min(self.visible().len().saturating_sub(1));},
             KeyCode::Char('e')=>self.inspect(app),

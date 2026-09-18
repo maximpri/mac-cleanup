@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs,
-    io::{self, Write},
+    io::{self, Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -148,6 +148,118 @@ pub fn query(program: &str, args: &[&str], timeout: Duration) -> io::Result<Stri
             }
         }
     }
+}
+
+/// Capture a short, read-only filesystem-activity sample for fseventsd.
+/// `sudo -n` is deliberate: an interactive password prompt must never appear
+/// inside the TUI. A missing cached authorization is reported as unavailable.
+pub fn observe_fseventsd(cancel_requested: &AtomicBool) -> Result<String, String> {
+    let mut child = Command::new("/usr/bin/sudo")
+        .args([
+            "-n",
+            "/usr/bin/fs_usage",
+            "-w",
+            "-f",
+            "filesys",
+            "fseventsd",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("filesystem activity probe unavailable: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "filesystem activity probe returned no output".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "filesystem activity probe returned no diagnostics".to_string())?;
+    let output_reader = thread::spawn(move || {
+        let mut output = String::new();
+        stdout
+            .take(64_001)
+            .read_to_string(&mut output)
+            .map(|_| output)
+    });
+    let error_reader = thread::spawn(move || {
+        let mut output = String::new();
+        stderr
+            .take(8_193)
+            .read_to_string(&mut output)
+            .map(|_| output)
+    });
+    let started = Instant::now();
+    let timed_out = loop {
+        if cancel_requested.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = output_reader.join();
+            let _ = error_reader.join();
+            return Err("filesystem activity probe cancelled".into());
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => break false,
+            Ok(None) if started.elapsed() < Duration::from_secs(8) => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break true;
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = output_reader.join();
+                let _ = error_reader.join();
+                return Err(format!("filesystem activity probe failed: {error}"));
+            }
+        }
+    };
+    let output = output_reader
+        .join()
+        .map_err(|_| "filesystem activity reader stopped".to_string())
+        .and_then(|result| result.map_err(|error| error.to_string()))?;
+    let error = error_reader
+        .join()
+        .map_err(|_| "filesystem activity diagnostics stopped".to_string())
+        .and_then(|result| result.map_err(|error| error.to_string()))?;
+    let lines = output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(12)
+        .map(ai::display_text)
+        .collect::<Vec<_>>();
+    if !lines.is_empty() {
+        let swap_events = lines
+            .iter()
+            .filter(|line| line.to_ascii_lowercase().contains("swapfile"))
+            .count();
+        let pattern = if swap_events > 0 {
+            format!(
+                "Pattern: {swap_events}/{} sampled lines mention VM swapfiles. This indicates fseventsd is observing swap-backed filesystem activity; it does not prove fseventsd caused memory pressure.",
+                lines.len()
+            )
+        } else {
+            "Pattern: no VM swapfile path appeared in the sampled lines.".into()
+        };
+        let timing = if timed_out {
+            "The 8-second sample reached its safety limit."
+        } else {
+            "The bounded sample completed."
+        };
+        return Ok(format!(
+            "{pattern}\n{timing}\nSampled filesystem events from fseventsd:\n{}",
+            lines.join("\n")
+        ));
+    }
+    let diagnostic = ai::display_text(error.trim());
+    Err(if diagnostic.is_empty() {
+        "No filesystem events were captured. Existing sudo authorization may be required.".into()
+    } else {
+        format!("No filesystem events captured: {diagnostic}")
+    })
 }
 fn cpu_seconds(value: &str) -> Option<f64> {
     let mut total = 0.;
@@ -498,6 +610,11 @@ pub fn findings(
         .filter(|p| {
             p.health != processes::ProcessHealth::Running
                 || metrics.cpu.get(&p.pid).is_some_and(|cpu| *cpu >= 25.)
+                || metrics
+                    .rss_kb
+                    .get(&p.pid)
+                    .or(p.rss_kb.as_ref())
+                    .is_some_and(|rss| *rss >= 512 * 1024)
         })
         .take(20)
     {
@@ -512,6 +629,50 @@ pub fn findings(
             .get(&process.pid)
             .map(|cpu| format!("{cpu:.1}% CPU over {:.1}s", metrics.interval_secs))
             .unwrap_or_else(|| "CPU interval unavailable".into());
+        let rss = metrics
+            .rss_kb
+            .get(&process.pid)
+            .copied()
+            .or(process.rss_kb)
+            .map(cache::format_kb)
+            .unwrap_or_else(|| "RAM unavailable".into());
+        let system_note = if process.system_owned {
+            "System-owned · read-only observation"
+        } else {
+            "Current-account process"
+        };
+        let consequence = if process.system_owned
+            && Path::new(&process.command)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("fseventsd"))
+        {
+            "fseventsd is macOS's filesystem-event journal service. High RAM can reflect event backlog or heavy filesystem activity; it is not reclaimable storage. Inspect filesystem activity before taking action; never terminate this system daemon from Mac Cleanup."
+        } else if process.system_owned {
+            "This system-owned process is read-only here. High RAM is an observation, not reclaimable memory; inspect its activity and memory pressure before deciding what to do."
+        } else {
+            process.health.explanation()
+        };
+        let activity_note = if process.system_owned
+            && Path::new(&process.command)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("fseventsd"))
+        {
+            format!(
+                " · swap in {} / out {}",
+                metrics
+                    .swap_in_kb_s
+                    .map(|rate| format!("{rate:.1} KiB/s"))
+                    .unwrap_or_else(|| "unavailable".into()),
+                metrics
+                    .swap_out_kb_s
+                    .map(|rate| format!("{rate:.1} KiB/s"))
+                    .unwrap_or_else(|| "unavailable".into())
+            )
+        } else {
+            String::new()
+        };
         results.push(Finding {
             id: format!("process:{}:{}", process.pid, process.start_time),
             title: ai::display_text(
@@ -520,8 +681,15 @@ pub fn findings(
                     .and_then(|p| p.to_str())
                     .unwrap_or(&process.command),
             ),
-            observation: format!("{} · {cpu} · PID {}", process.health.label(), process.pid),
-            consequence: process.health.explanation().into(),
+            observation: format!(
+                "{} · {} · {} · PID {} · {}",
+                process.health.label(),
+                rss,
+                cpu,
+                process.pid,
+                system_note
+            ) + &activity_note,
+            consequence: consequence.into(),
             size_kb: 0,
             quick_win: false,
             target: Target::Process(process.pid, process.start_time.clone()),
@@ -750,6 +918,42 @@ mod tests {
         assert_eq!(disks.get("disk0"), Some(&8.5));
         assert_eq!(disks.get("disk4"), Some(&3.));
         assert!(disk_counters("disk0 disk4\nheaders\n4 12 8.5").is_none());
+    }
+    #[test]
+    fn large_system_fseventsd_finding_explains_swap_activity_and_stays_read_only() {
+        let process = ProcessEntry {
+            pid: 74514539,
+            parent_pid: 1,
+            uid: 0,
+            state: "S".into(),
+            elapsed: "01:02".into(),
+            cpu_percent: "0.0".into(),
+            command: "/usr/sbin/fseventsd".into(),
+            rss_kb: Some(900 * 1024),
+            system_owned: true,
+            health: processes::ProcessHealth::Running,
+            signalable: false,
+            signal_block_reason: Some("system-owned".into()),
+            outcome: None,
+            start_time: "Sun Aug 23 16:05:46 2026".into(),
+        };
+        let mut metrics = Metrics {
+            swap_in_kb_s: Some(1200.),
+            swap_out_kb_s: Some(80.),
+            ..Default::default()
+        };
+        metrics.rss_kb.insert(process.pid, 900 * 1024);
+        let finding = findings(&[], &[process], &metrics, None)
+            .into_iter()
+            .find(|finding| finding.title == "fseventsd")
+            .expect("fseventsd finding");
+        assert!(finding.observation.contains("swap in 1200.0 KiB/s"));
+        assert!(
+            finding
+                .consequence
+                .contains("filesystem-event journal service")
+        );
+        assert!(!finding.quick_win);
     }
     #[test]
     fn interrupted_sessions_are_not_resumed_and_clear_preserves_other_files() {

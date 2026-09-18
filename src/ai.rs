@@ -101,6 +101,7 @@ pub fn validate(request: &Request, insight: &Insight) -> Result<(), String> {
         "refresh_processes",
         "check_open_handles",
         "compare_history",
+        "fs_usage",
     ];
     if insight.next_checks.len() > 3
         || (!request.investigation && !insight.next_checks.is_empty())
@@ -436,6 +437,12 @@ mod tests {
         insight.evidence_ids = vec!["a".into()];
         insight.next_checks = vec!["shell".into()];
         assert!(validate(&request, &insight).is_err());
+        let investigation_request = Request {
+            investigation: true,
+            ..request
+        };
+        insight.next_checks = vec!["fs_usage".into()];
+        assert!(validate(&investigation_request, &insight).is_ok());
     }
     #[test]
     fn triage_cannot_change_policy_or_refer_to_unknown_subjects() {

@@ -24,6 +24,10 @@ Implemented in source:
   relocation now have separate acknowledgments in mixed plans.
 - Validated insight caching is keyed by the evidence revision and prompt contract;
   targeted process refresh reports the current PID identity rather than a generic note.
+- High-memory system-owned daemons are visible as read-only observations. A selected
+  `fseventsd` finding can request a bounded `sudo -n fs_usage` sample; swap-backed
+  filesystem activity is explained as evidence to investigate, never as proof that
+  the daemon caused memory pressure.
 - Completed action sessions can receive a bounded local AI outcome summary in
   History; raw action records and before/after measurements remain authoritative.
 - Per-action history, before/after resource windows, regrowth/restart observations,
@@ -38,7 +42,7 @@ budgets. The current CPU/pressure observations must not be
 presented as causal performance gains. Folder investigation is a bounded read-only
 measurement; the model never receives a general shell or filesystem mutation tool.
 
-Validation on the development Mac passed 123 Rust tests, strict Clippy, the
+Validation on the development Mac passed 127 Rust tests, strict Clippy, the
 read-only JSON schema check, and a live terminal test that cancels and executes
 cleanup only inside a disposable fixture while preserving neighboring files.
 The real helper returned validated synthetic explanations in approximately
@@ -212,10 +216,11 @@ numeric facts from Rust rather than accepting model-generated quantities.
 
 For Investigate further, allow at most three read-only checks scoped to the
 selected subject: inspect its measured children, measure an already discovered
-subtree, refresh its process family, check open handles, or compare saved complete
-measurements. Limit the entire investigation to 60 seconds; cancel at safe read
-boundaries and retain marked partial evidence. No file-content ingestion or
-free-form shell tools in this release.
+subtree, refresh its process family, check open handles, compare saved complete
+measurements, or sample the selected system-owned `fseventsd` with the fixed
+`fs_usage` collector. Limit the entire investigation to 60 seconds; cancel at
+safe read boundaries and retain marked partial evidence. No file-content
+ingestion or free-form shell tools in this release.
 
 Respect the model's context limit, including instructions, schema, and response.
 Reserve 768 output tokens, compact evidence deterministically, and use token

@@ -9,7 +9,7 @@ struct GeneratedInsight {
     var evidenceIDs: [String]
     @Guide(description: "Up to three exact action_ids from the supplied subjects.")
     var actionIDs: [String]
-    @Guide(description: "Empty unless investigation is true; then up to three of inspect_children, refresh_processes, check_open_handles, compare_history.")
+    @Guide(description: "Empty unless investigation is true; then up to three of inspect_children, refresh_processes, check_open_handles, compare_history, fs_usage.")
     var nextChecks: [String]
 }
 @Generable
@@ -82,6 +82,7 @@ struct AIHelper {
                 Identify the relevant area and a supplied low-disruption action if available. Cite exact subject IDs.
                 Only return supplied action IDs. Large files and high CPU do not prove waste. Parent exit does not prove abandonment.
                 Preserve unknown ownership and incomplete measurements. Never claim unmeasured performance improvement.
+                For a system-owned fseventsd finding, request fs_usage when filesystem activity would clarify the observation.
                 Do not output commands, paths, numbers, or safety claims; the app shows verified quantities separately.
                 Plain concise language, no greetings. When investigation is false, nextChecks must be empty.
                 """)
