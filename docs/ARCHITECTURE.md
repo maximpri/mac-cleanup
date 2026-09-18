@@ -14,8 +14,9 @@ provides historical design context. The current implementation checkpoint is in
 - `src/ai.rs` sends bounded structured metadata to a sibling helper, validates
   response references/checks and policy-safe triage rankings, caches validated
   insights by evidence revision, detects the Apple Foundation Models runtime,
-  falls back to measured triage ordering when needed, and enforces inference
-  cancellation and timeout.
+  falls back to visibly labeled measured triage ordering when needed, and
+  enforces inference cancellation and timeout. Triage uses short model-facing
+  IDs mapped back to findings; generated reasons are not shown as evidence.
 - `src/investigation.rs` owns bounded investigation cases, typed evidence,
   competing hypotheses, adaptive check decisions, and inconclusive outcomes.
 - `native/AIHelper.swift` calls Apple's on-device FoundationModels API. It has

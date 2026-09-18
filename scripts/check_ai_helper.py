@@ -44,10 +44,14 @@ if "--live" in sys.argv:
     assert not insight["next_checks"]
     print(f"PASS: live synthetic explanation and references ({time.monotonic() - began:.2f}s)")
     began = time.monotonic()
-    response = request({"protocol": 1, "operation": "triage", "prompt": json.dumps(evidence)})
+    triage_evidence = json.loads(json.dumps(evidence))
+    triage_evidence["subjects"][0]["id"] = "item1"
+    triage_evidence["subjects"][1]["id"] = "item2"
+    response = request({"protocol": 1, "operation": "triage", "prompt": json.dumps(triage_evidence)})
     triage = response["triage"]
-    assert set(triage["quick_win_ids"]) <= {"cache-1"}
-    assert set(triage["key_area_ids"]) <= {"folder-1"}
+    assert set(triage["quick_win_ids"]) <= {"item1"}
+    assert set(triage["key_area_ids"]) <= {"item2"}
+    assert triage["reasons"] == []
     print(f"PASS: live synthetic triage references ({time.monotonic() - began:.2f}s)")
     began = time.monotonic()
     result_evidence = {"revision": 2, "investigation": False, "subjects": [{

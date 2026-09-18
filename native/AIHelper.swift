@@ -18,8 +18,6 @@ struct GeneratedTriage {
     var keyAreaIDs: [String]
     @Guide(description: "Up to three exact eligible quick-win subject IDs. Use only subjects marked quick_win=true. Never put these IDs in keyAreaIDs.")
     var quickWinIDs: [String]
-    @Guide(description: "Short reasons for the chosen ordering, at most one sentence per chosen ID.")
-    var reasons: [String]
 }
 struct Request: Decodable { let `protocol`: Int; let operation: String; let prompt: String? }
 @main
@@ -57,7 +55,7 @@ struct AIHelper {
                 let result = try await session.respond(to: prompt, generating: GeneratedTriage.self,
                     options: GenerationOptions(sampling: .greedy, maximumResponseTokens: 768)).content
                 emit(["protocol": 1, "available": true, "triage": ["key_area_ids": result.keyAreaIDs,
-                    "quick_win_ids": result.quickWinIDs, "reasons": result.reasons]])
+                    "quick_win_ids": result.quickWinIDs, "reasons": []]])
             } catch { emit(["protocol": 1, "available": true, "error": "Local triage failed: \(error)"]) }
             return
         }

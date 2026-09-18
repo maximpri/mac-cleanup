@@ -13,7 +13,7 @@ use std::{
 };
 
 /// Bump when the helper instructions or response interpretation changes.
-pub const PROMPT_VERSION: &str = "care-triage-v2";
+pub const PROMPT_VERSION: &str = "care-triage-v3";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameworkStatus {
@@ -32,7 +32,7 @@ impl FrameworkStatus {
                 format!("Apple Foundation Models · unavailable · {detail}")
             }
             Self::Missing { detail } => {
-                format!("Apple Foundation Models · helper missing · {detail}")
+                format!("helper missing · Apple Foundation Models not checked · {detail}")
             }
         }
     }
@@ -282,7 +282,8 @@ pub fn validate_triage(request: &Request, triage: &Triage) -> Result<(), String>
         .iter()
         .chain(triage.quick_win_ids.iter())
         .any(|id| !chosen.insert(id.as_str()));
-    if triage.key_area_ids.len() > 5
+    if (triage.key_area_ids.is_empty() && triage.quick_win_ids.is_empty())
+        || triage.key_area_ids.len() > 5
         || triage.quick_win_ids.len() > 3
         || triage.reasons.len() > triage.key_area_ids.len() + triage.quick_win_ids.len()
         || duplicate
@@ -335,15 +336,10 @@ pub fn deterministic_triage(request: &Request) -> Triage {
         .take(5)
         .map(|subject| subject.id.clone())
         .collect::<Vec<_>>();
-    let reasons = quick_win_ids
-        .iter()
-        .chain(key_area_ids.iter())
-        .map(|_| "Measured policy order; local AI did not return a usable ranking.".into())
-        .collect();
     Triage {
         key_area_ids,
         quick_win_ids,
-        reasons,
+        reasons: vec![],
     }
 }
 pub fn explain(request: &Request, cancelled: &Arc<AtomicBool>) -> Result<Insight, String> {

@@ -127,6 +127,7 @@ struct TriageWork {
     worker: Option<thread::JoinHandle<()>>,
     cancel: Arc<AtomicBool>,
     request: ai::Request,
+    id_map: HashMap<String, String>,
 }
 impl Drop for TriageWork {
     fn drop(&mut self) {
@@ -143,6 +144,22 @@ impl Drop for InsightWork {
             let _ = worker.join();
         }
     }
+}
+
+fn resolve_triage_ids(
+    mut triage: ai::Triage,
+    id_map: &HashMap<String, String>,
+) -> Option<ai::Triage> {
+    for id in triage
+        .key_area_ids
+        .iter_mut()
+        .chain(triage.quick_win_ids.iter_mut())
+    {
+        *id = id_map.get(id)?.clone();
+    }
+    // Model prose is not evidence and may not correspond to the returned order.
+    triage.reasons.clear();
+    Some(triage)
 }
 enum InvestigationResult {
     Inventory(Box<StorageInventory>),
@@ -183,7 +200,8 @@ pub(super) struct Workspace {
     started: Instant,
     triage_work: Option<TriageWork>,
     triage: Option<ai::Triage>,
-    triage_reasons: HashMap<String, String>,
+    triage_revision: Option<u64>,
+    triage_is_ai: bool,
     insight_work: Option<InsightWork>,
     insight: Option<ai::Insight>,
     insight_cache: HashMap<String, ai::Insight>,
@@ -273,7 +291,8 @@ impl Workspace {
             started: Instant::now(),
             triage_work: None,
             triage: None,
-            triage_reasons: HashMap::new(),
+            triage_revision: None,
+            triage_is_ai: false,
             insight_work: None,
             insight: None,
             insight_cache: HashMap::new(),
@@ -336,24 +355,14 @@ impl Workspace {
     fn selected(&self) -> Option<&Finding> {
         self.visible().get(self.cursor).copied()
     }
-    fn apply_triage(&mut self, triage: ai::Triage) {
+    fn apply_triage(&mut self, triage: ai::Triage, ai_ranked: bool) {
+        let selected = self.selected().map(|finding| finding.id.clone());
         let mut rank = HashMap::new();
-        let mut reasons = HashMap::new();
         for (index, id) in triage.quick_win_ids.iter().enumerate() {
             rank.insert(id.clone(), (0_u8, index));
         }
         for (index, id) in triage.key_area_ids.iter().enumerate() {
             rank.insert(id.clone(), (1_u8, index));
-        }
-        for (index, id) in triage
-            .quick_win_ids
-            .iter()
-            .chain(triage.key_area_ids.iter())
-            .enumerate()
-        {
-            if let Some(reason) = triage.reasons.get(index) {
-                reasons.insert(id.clone(), ai::display_text(reason));
-            }
         }
         let old_order: HashMap<_, _> = self
             .findings
@@ -366,9 +375,12 @@ impl Workspace {
                 .copied()
                 .unwrap_or((2, old_order.get(&finding.id).copied().unwrap_or(usize::MAX)))
         });
-        self.triage_reasons = reasons;
         self.triage = Some(triage);
-        self.cursor = self.cursor.min(self.visible().len().saturating_sub(1));
+        self.triage_revision = Some(self.revision);
+        self.triage_is_ai = ai_ranked;
+        self.cursor = selected
+            .and_then(|id| self.visible().iter().position(|finding| finding.id == id))
+            .unwrap_or_else(|| self.cursor.min(self.visible().len().saturating_sub(1)));
     }
     fn rebuild(&mut self, app: &App) {
         let selected = self.selected().map(|f| f.id.clone());
@@ -409,15 +421,19 @@ impl Workspace {
         {
             self.insight = None;
         }
-        if self.triage.as_ref().is_some_and(|triage| {
-            triage
-                .key_area_ids
-                .iter()
-                .chain(triage.quick_win_ids.iter())
-                .any(|id| !self.findings.iter().any(|finding| &finding.id == id))
-        }) {
+        if self.triage.is_some()
+            && (self.triage_revision != Some(self.revision)
+                || self.triage.as_ref().is_some_and(|triage| {
+                    triage
+                        .key_area_ids
+                        .iter()
+                        .chain(triage.quick_win_ids.iter())
+                        .any(|id| !self.findings.iter().any(|finding| &finding.id == id))
+                }))
+        {
             self.triage = None;
-            self.triage_reasons.clear();
+            self.triage_revision = None;
+            self.triage_is_ai = false;
         }
     }
     pub(super) fn tick(&mut self, app: &mut App) {
@@ -583,14 +599,40 @@ impl Workspace {
             let work = self.triage_work.take().expect("AI triage work");
             match result {
                 Ok(triage) if work.request.revision == self.revision => {
-                    self.apply_triage(triage);
-                    self.flash = Some(Instant::now());
-                    self.ai_error = None;
+                    if let Some(triage) = resolve_triage_ids(triage, &work.id_map) {
+                        self.apply_triage(triage, true);
+                        self.flash = Some(Instant::now());
+                        self.ai_error = None;
+                    } else {
+                        self.apply_triage(
+                            resolve_triage_ids(
+                                ai::deterministic_triage(&work.request),
+                                &work.id_map,
+                            )
+                            .expect("policy triage uses known IDs"),
+                            false,
+                        );
+                        self.ai_error = Some(
+                            "AI ranking used unknown findings. Showing measured priority order."
+                                .into(),
+                        );
+                    }
                 }
                 Ok(_) => {
                     self.ai_error = Some(
                         "Evidence changed while triage was running. The measured order is still used.".into(),
                     );
+                }
+                Err(error) if work.request.revision == self.revision => {
+                    self.apply_triage(
+                        resolve_triage_ids(ai::deterministic_triage(&work.request), &work.id_map)
+                            .expect("policy triage uses known IDs"),
+                        false,
+                    );
+                    self.ai_error = Some(format!(
+                        "AI ranking skipped: {} Showing measured priority order.",
+                        ai::display_text(&error)
+                    ));
                 }
                 Err(error) => self.ai_error = Some(error),
             }
@@ -1039,16 +1081,29 @@ impl Workspace {
             self.ai_error = Some("Local AI paused while memory pressure is critical.".into());
             return;
         }
-        let subjects: Vec<_> = self
+        let findings: Vec<_> = self
             .findings
             .iter()
             .filter(|finding| !self.kept.contains(&finding.id))
             .take(8)
-            .map(subject_for_finding)
             .collect();
-        if subjects.is_empty() {
+        if findings.is_empty() {
             return;
         }
+        // Short opaque IDs are easier for the local model to reproduce exactly.
+        // The app resolves them back to measured finding IDs after validation.
+        let mut id_map = HashMap::new();
+        let subjects = findings
+            .into_iter()
+            .enumerate()
+            .map(|(index, finding)| {
+                let mut subject = subject_for_finding(finding);
+                let short_id = format!("item{}", index + 1);
+                id_map.insert(short_id.clone(), subject.id);
+                subject.id = short_id;
+                subject
+            })
+            .collect();
         let request = ai::Request {
             revision: self.revision,
             checks: Default::default(),
@@ -1060,15 +1115,14 @@ impl Workspace {
         let flag = cancel.clone();
         let input = request.clone();
         let worker = thread::spawn(move || {
-            let result =
-                ai::triage(&input, &flag).unwrap_or_else(|_| ai::deterministic_triage(&input));
-            let _ = sender.send(Ok(result));
+            let _ = sender.send(ai::triage(&input, &flag));
         });
         self.triage_work = Some(TriageWork {
             receiver,
             worker: Some(worker),
             cancel,
             request,
+            id_map,
         });
         self.ai_error = None;
         self.auto_requested = true;
@@ -1452,7 +1506,8 @@ impl Workspace {
         self.result_insight = None;
         self.result_summary_session = None;
         self.triage = None;
-        self.triage_reasons.clear();
+        self.triage_revision = None;
+        self.triage_is_ai = false;
         self.plan.clear();
         self.session = Session::default();
         self.started = Instant::now();
@@ -2097,6 +2152,8 @@ fn render_findings(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) 
         app,
         if w.triage_work.is_some() {
             " AI PRIORITIZING MEASURED AREAS · f all "
+        } else if w.triage_is_ai && !w.show_all {
+            " AI-RANKED DECISIONS · f all "
         } else if w.show_all {
             " ALL FINDINGS · f fewer "
         } else if !w.visible().iter().any(|f| f.quick_win) {
@@ -2141,29 +2198,25 @@ fn render_findings(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) 
         } else {
             String::new()
         };
-        let reason = w
-            .triage_reasons
-            .get(&f.id)
-            .cloned()
-            .unwrap_or_else(|| match &f.target {
-                Target::Cache(path) => app
-                    .entries
-                    .iter()
-                    .find(|e| &e.spec.path == path)
-                    .map(|e| match e.status {
-                        CacheStatus::Ready if f.quick_win => "Rebuildable cache",
-                        CacheStatus::Ready => "Review what will be removed",
-                        CacheStatus::Optional => "May need a download again",
-                        CacheStatus::InUse => "Check the active application",
-                        CacheStatus::Review => "App-managed data · inspect first",
-                        CacheStatus::Whitelisted => "Protected from cleanup",
-                        _ => "Incomplete · inspect coverage",
-                    })
-                    .unwrap_or("Inspect the measured evidence")
-                    .to_string(),
-                Target::Folder(_) => "Large folder · inspect or move".into(),
-                _ => f.observation.clone(),
-            });
+        let reason = match &f.target {
+            Target::Cache(path) => app
+                .entries
+                .iter()
+                .find(|e| &e.spec.path == path)
+                .map(|e| match e.status {
+                    CacheStatus::Ready if f.quick_win => "Rebuildable cache",
+                    CacheStatus::Ready => "Review what will be removed",
+                    CacheStatus::Optional => "May need a download again",
+                    CacheStatus::InUse => "Check the active application",
+                    CacheStatus::Review => "App-managed data · inspect first",
+                    CacheStatus::Whitelisted => "Protected from cleanup",
+                    _ => "Incomplete · inspect coverage",
+                })
+                .unwrap_or("Inspect the measured evidence")
+                .to_string(),
+            Target::Folder(_) => "Large folder · inspect or move".into(),
+            _ => f.observation.clone(),
+        };
         let title = format!(
             "{} {}  {}",
             if queued {
@@ -2401,7 +2454,7 @@ fn render_evidence(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) 
             )
         })
         .unwrap_or_default();
-    let framework_line = format!("Framework detected: {}", w.ai_framework.description());
+    let framework_line = format!("Local AI: {}", w.ai_framework.description());
     let ai_text = if active {
         format!(
             "{framework_line}\nReading measured evidence. Your findings and controls remain available.{investigation_summary}"
@@ -2424,7 +2477,7 @@ fn render_evidence(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) 
         )
     } else if let Some(error) = &w.ai_error {
         format!(
-            "{framework_line}\nAI unavailable · {error}\nMeasured evidence remains available. i retries; A opens System Settings."
+            "{framework_line}\n{error}\nMeasured evidence remains available. i retries selected insight."
         )
     } else {
         format!(
@@ -3089,6 +3142,86 @@ mod tests {
         w.tick(&mut app);
         assert!(w.insight.is_none());
         assert!(w.ai_error.is_some());
+    }
+    #[test]
+    fn triage_fallback_keeps_measured_ids_selection_and_source_clear() {
+        let (_home, mut app, mut w) = fixture();
+        let first = w.findings[0].clone();
+        let mut second = first.clone();
+        second.id = "finding:second".into();
+        second.title = "Second measured finding".into();
+        w.findings.push(second);
+        w.cursor = 1;
+        let selected = w.selected().unwrap().id.clone();
+        let mut first_subject = subject_for_finding(&first);
+        first_subject.id = "item1".into();
+        let request = ai::Request {
+            revision: w.revision,
+            checks: Default::default(),
+            subjects: vec![first_subject],
+            investigation: false,
+        };
+        let (sender, receiver) = mpsc::channel();
+        w.triage_work = Some(TriageWork {
+            receiver,
+            worker: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            request,
+            id_map: HashMap::from([("item1".into(), first.id.clone())]),
+        });
+        sender
+            .send(Err("AI returned unsupported triage references.".into()))
+            .unwrap();
+        w.tick(&mut app);
+        assert_eq!(w.selected().unwrap().id, selected);
+        assert!(!w.triage_is_ai);
+        assert_eq!(w.triage.unwrap().quick_win_ids, vec![first.id]);
+        assert!(
+            w.ai_error
+                .unwrap()
+                .contains("Showing measured priority order")
+        );
+    }
+    #[test]
+    fn triage_aliases_reject_unknown_ids_and_drop_unverified_reasons() {
+        let map = HashMap::from([("item1".into(), "finding:real".into())]);
+        let valid = ai::Triage {
+            key_area_ids: vec!["item1".into()],
+            quick_win_ids: vec![],
+            reasons: vec!["Unverified claim".into()],
+        };
+        let resolved = resolve_triage_ids(valid, &map).unwrap();
+        assert_eq!(resolved.key_area_ids, vec!["finding:real"]);
+        assert!(resolved.reasons.is_empty());
+        assert!(
+            resolve_triage_ids(
+                ai::Triage {
+                    key_area_ids: vec!["unknown".into()],
+                    quick_win_ids: vec![],
+                    reasons: vec![]
+                },
+                &map
+            )
+            .is_none()
+        );
+    }
+    #[test]
+    fn triage_rank_expires_when_measurements_change() {
+        let (_home, app, mut w) = fixture();
+        let id = w.findings[0].id.clone();
+        w.apply_triage(
+            ai::Triage {
+                key_area_ids: vec![],
+                quick_win_ids: vec![id],
+                reasons: vec![],
+            },
+            true,
+        );
+        assert!(w.triage_is_ai);
+        w.revision += 1;
+        w.rebuild(&app);
+        assert!(w.triage.is_none());
+        assert!(!w.triage_is_ai);
     }
     #[test]
     fn unified_screens_render_at_supported_sizes_and_export_previews() {

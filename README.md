@@ -84,9 +84,11 @@ has a timeout and pauses under critical memory pressure. A cyan/violet sweep
 runs only during actual inference or investigation; completion briefly accents
 the result. `M`, `REDUCE_MOTION`, and `NO_COLOR` provide static presentation.
 Animation stops when the terminal reports focus loss.
-The top status line and AI pane show the detected Apple Foundation Models
-framework state: detecting, available, unavailable, or helper missing. If a
-triage response is malformed, the app falls back to measured policy ordering.
+The top status line and AI pane show Apple Foundation Models availability:
+detecting, available, unavailable, or helper missing. AI ranks findings using
+short IDs that the app maps back to measured findings. Visible explanations
+come from verified app facts. If a triage response is malformed, the app says
+why and shows measured policy ordering instead of labeling it as AI-ranked.
 
 **Review plan** lists exact cleanup paths, process identities and signals, and
 relocation destinations with tradeoffs. `Space` adds/removes a finding's action;
