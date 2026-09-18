@@ -1629,14 +1629,14 @@ fn button(
     control: Control,
     active: bool,
 ) {
-    frame.render_widget(
-        Paragraph::new(label).style(if active {
-            selected_row_style(app)
-        } else {
-            Style::default().fg(app.color(MUTED))
-        }),
-        area,
-    );
+    let style = if active && w.focus == 0 {
+        selected_row_style(app)
+    } else if active {
+        Style::default().fg(app.color(BLUE)).bold()
+    } else {
+        Style::default().fg(app.color(MUTED))
+    };
+    frame.render_widget(Paragraph::new(label).style(style), area);
     w.hits.borrow_mut().push((area, control));
 }
 pub(super) fn render(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
@@ -2687,6 +2687,25 @@ mod tests {
         app.analysis_only = true;
         press(&mut w, &mut app, KeyCode::Char(' '));
         assert!(w.plan.is_empty());
+    }
+    #[test]
+    fn tab_focus_has_a_visible_single_line_menu_highlight() {
+        let (_home, mut app, mut w) = fixture();
+        app.terminal_width = 120;
+        app.terminal_height = 30;
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| render(frame, frame.area(), &app, &w))
+            .unwrap();
+        let content_style = terminal.backend().buffer()[(16, 0)].style();
+        press(&mut w, &mut app, KeyCode::Tab);
+        terminal
+            .draw(|frame| render(frame, frame.area(), &app, &w))
+            .unwrap();
+        let menu_style = terminal.backend().buffer()[(16, 0)].style();
+        assert_ne!(content_style.bg, menu_style.bg);
+        press(&mut w, &mut app, KeyCode::Tab);
+        assert_eq!(w.focus, 1);
     }
     #[test]
     fn clearing_history_requires_a_separate_phrase_and_writable_session() {
