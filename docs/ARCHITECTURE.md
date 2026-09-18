@@ -14,9 +14,12 @@ provides historical design context. The current implementation checkpoint is in
 - `src/ai.rs` sends bounded structured metadata to a sibling helper, validates
   response references/checks and policy-safe triage rankings, caches validated
   insights by evidence revision, and enforces inference cancellation and timeout.
+- `src/investigation.rs` owns bounded investigation cases, typed evidence,
+  competing hypotheses, adaptive check decisions, and inconclusive outcomes.
 - `native/AIHelper.swift` calls Apple's on-device FoundationModels API. It has
   no filesystem action tool or remote fallback. The app revalidates evidence
-  after generation; valid JSON alone does not establish truthful prose.
+  after generation; valid JSON alone does not establish truthful prose. Online
+  source research uses a fixed no-key catalog and is opt-in.
 - `src/tui/care_view.rs` owns Findings/Explore/History, model activity visuals,
   shared review plans, sequential execution, and before/after observations.
 - Existing cache, process, whitelist, and relocation engines own all mutation

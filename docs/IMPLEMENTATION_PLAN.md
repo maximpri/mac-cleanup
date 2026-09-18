@@ -28,6 +28,9 @@ Implemented in source:
   `fseventsd` finding can request a bounded `sudo -n fs_usage` sample; swap-backed
   filesystem activity is explained as evidence to investigate, never as proof that
   the daemon caused memory pressure.
+- Agentic investigation cases now retain competing hypotheses and typed evidence,
+  automatically sequence fseventsd activity, volume context, and source research,
+  and finish with a leading explanation or an explicit inconclusive state.
 - Completed action sessions can receive a bounded local AI outcome summary in
   History; raw action records and before/after measurements remain authoritative.
 - Per-action history, before/after resource windows, regrowth/restart observations,

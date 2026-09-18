@@ -261,6 +261,98 @@ pub fn observe_fseventsd(cancel_requested: &AtomicBool) -> Result<String, String
         format!("No filesystem events captured: {diagnostic}")
     })
 }
+
+/// Capture mounted-volume context without reading file contents or changing mounts.
+pub fn observe_volume_context(cancel_requested: &AtomicBool) -> Result<String, String> {
+    if cancel_requested.load(Ordering::Relaxed) {
+        return Err("volume context check cancelled".into());
+    }
+    let mounts = query("/sbin/mount", &[], Duration::from_secs(3))
+        .map_err(|error| format!("mounted-volume inventory unavailable: {error}"))?;
+    if cancel_requested.load(Ordering::Relaxed) {
+        return Err("volume context check cancelled".into());
+    }
+    let disk = query("/bin/df", &["-k", "-P"], Duration::from_secs(3))
+        .unwrap_or_else(|_| "disk capacity details unavailable".into());
+    let mount_lines = mounts
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(24)
+        .map(ai::display_text)
+        .collect::<Vec<_>>();
+    let disk_lines = disk
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(12)
+        .map(ai::display_text)
+        .collect::<Vec<_>>();
+    Ok(format!(
+        "Mounted-volume context (read-only):\n{}\nCapacity context:\n{}",
+        if mount_lines.is_empty() {
+            "unavailable".into()
+        } else {
+            mount_lines.join("\n")
+        },
+        if disk_lines.is_empty() {
+            "unavailable".into()
+        } else {
+            disk_lines.join("\n")
+        }
+    ))
+}
+
+/// Research a fixed, no-key source catalog. Network fetching is opt-in through
+/// MAC_CLEANUP_RESEARCH=1 so an automatic case never unexpectedly sends data.
+pub fn research_sources(cancel_requested: &AtomicBool) -> Result<String, String> {
+    const SOURCES: [(&str, &str); 2] = [
+        (
+            "Apple File System Events Programming Guide",
+            "https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/FSEvents_ProgGuide/Introduction/Introduction.html",
+        ),
+        (
+            "Apple fs_usage manual",
+            "https://developer.apple.com/library/archive/documentation/Darwin/Reference/ManPages/man1/fs_usage.1.html",
+        ),
+    ];
+    let online = std::env::var("MAC_CLEANUP_RESEARCH").ok().as_deref() == Some("1");
+    let mut lines = vec![if online {
+        "Online research enabled for the fixed Apple source catalog.".into()
+    } else {
+        "Online research is disabled. Showing the fixed source catalog; enable MAC_CLEANUP_RESEARCH=1 to fetch it.".into()
+    }];
+    for (title, url) in SOURCES {
+        if cancel_requested.load(Ordering::Relaxed) {
+            return Err("source research cancelled".into());
+        }
+        if online {
+            let fetched = query(
+                "/usr/bin/curl",
+                &[
+                    "--fail",
+                    "--location",
+                    "--silent",
+                    "--show-error",
+                    "--max-time",
+                    "5",
+                    url,
+                ],
+                Duration::from_secs(6),
+            )
+            .map(|body| format!("{} · fetched {} bytes", title, body.len()))
+            .unwrap_or_else(|error| {
+                format!(
+                    "{} · fetch unavailable: {}",
+                    title,
+                    ai::display_text(&error.to_string())
+                )
+            });
+            lines.push(format!("{} · {}", fetched, url));
+        } else {
+            lines.push(format!("{} · {}", title, url));
+        }
+    }
+    Ok(lines.join("\n"))
+}
 fn cpu_seconds(value: &str) -> Option<f64> {
     let mut total = 0.;
     for part in value.split(':') {

@@ -102,6 +102,8 @@ pub fn validate(request: &Request, insight: &Insight) -> Result<(), String> {
         "check_open_handles",
         "compare_history",
         "fs_usage",
+        "volume_context",
+        "research_sources",
     ];
     if insight.next_checks.len() > 3
         || (!request.investigation && !insight.next_checks.is_empty())
@@ -442,6 +444,8 @@ mod tests {
             ..request
         };
         insight.next_checks = vec!["fs_usage".into()];
+        assert!(validate(&investigation_request, &insight).is_ok());
+        insight.next_checks = vec!["volume_context".into(), "research_sources".into()];
         assert!(validate(&investigation_request, &insight).is_ok());
     }
     #[test]

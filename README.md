@@ -160,7 +160,10 @@ protected. Mac Cleanup never signals itself or an ancestor process.
 `--analyze` disables process actions, and `--clean --yes` never kills processes
 unattended. For `fseventsd`, `i` can request a bounded `sudo -n fs_usage -w -f
 filesys fseventsd` sample when an existing authorization is available; the app
-never opens a password prompt or signals the daemon.
+never signals the daemon. The investigation can continue with mounted-volume
+context and a fixed Apple source catalog. Set `MAC_CLEANUP_RESEARCH=1` to allow
+those fixed URLs to be fetched; paths, usernames, and raw logs are never sent
+as research queries.
 
 ## Scan another volume
 

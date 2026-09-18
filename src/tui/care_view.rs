@@ -4,6 +4,7 @@ use crate::cache;
 use crate::{
     ai,
     care::{self, Finding, Metrics, RecordedAction, Session, Target},
+    investigation,
 };
 use std::collections::{HashMap, VecDeque};
 
@@ -151,6 +152,7 @@ struct Investigation {
     receiver: Receiver<InvestigationResult>,
     stop: Arc<AtomicBool>,
     deadline: Instant,
+    check: String,
     checks: VecDeque<String>,
     target: Target,
 }
@@ -192,7 +194,9 @@ pub(super) struct Workspace {
     insight_inputs: Vec<ai::Subject>,
     ai_error: Option<String>,
     auto_requested: bool,
+    auto_investigation_started: bool,
     investigation: Option<Investigation>,
+    investigation_case: Option<investigation::InvestigationCase>,
     pending_checks: VecDeque<String>,
     investigation_deadline: Option<Instant>,
     investigation_target: Option<Target>,
@@ -273,7 +277,9 @@ impl Workspace {
             insight_inputs: vec![],
             ai_error: None,
             auto_requested: false,
+            auto_investigation_started: false,
             investigation: None,
+            investigation_case: None,
             pending_checks: VecDeque::new(),
             investigation_deadline: None,
             investigation_target: None,
@@ -516,6 +522,38 @@ impl Workspace {
         if changed {
             self.rebuild(app);
         }
+        if !self.auto_investigation_started
+            && self.started.elapsed() >= Duration::from_secs(20)
+            && (self.metrics.pressure.is_some_and(|level| level >= 2)
+                || self.findings.iter().any(|finding| {
+                    matches!(finding.target, Target::Process(..))
+                        && finding.title.eq_ignore_ascii_case("fseventsd")
+                }))
+            && self.investigation.is_none()
+            && self.insight_work.is_none()
+            && let Some(target_id) = self
+                .findings
+                .iter()
+                .find(|finding| {
+                    matches!(finding.target, Target::Process(..))
+                        && finding.title.eq_ignore_ascii_case("fseventsd")
+                })
+                .map(|finding| finding.id.clone())
+        {
+            self.show_all = true;
+            if let Some(index) = self
+                .visible()
+                .iter()
+                .position(|finding| finding.id == target_id)
+            {
+                self.cursor = index;
+            }
+            self.auto_investigation_started = true;
+            self.note = Some(
+                "Automatic investigation started for sustained fseventsd memory pressure.".into(),
+            );
+            self.start_ai(app, true, true, true);
+        }
         if let Some(result) =
             self.triage_work
                 .as_ref()
@@ -641,6 +679,52 @@ impl Workspace {
             .and_then(|work| work.receiver.try_recv().ok())
         {
             let work = self.investigation.take().expect("investigation");
+            if let Some(case) = &mut self.investigation_case {
+                case.record_check(work.check.clone());
+                let (kind, summary, supports) = match &result {
+                    InvestigationResult::Inventory(inventory) => (
+                        investigation::EvidenceKind::VolumeContext,
+                        format!(
+                            "Measured folder evidence: {} observed, complete={}, {} unreadable entries.",
+                            format_kb(inventory.scanned_kb),
+                            inventory.complete,
+                            inventory.scan_errors
+                        ),
+                        vec!["volume_specific"],
+                    ),
+                    InvestigationResult::Note(note) => {
+                        let kind = match work.check.as_str() {
+                            "fs_usage" => investigation::EvidenceKind::FilesystemActivity,
+                            "volume_context" => investigation::EvidenceKind::VolumeContext,
+                            "research_sources" => investigation::EvidenceKind::Research,
+                            _ => investigation::EvidenceKind::ProcessSample,
+                        };
+                        let supports = match kind {
+                            investigation::EvidenceKind::FilesystemActivity => {
+                                vec!["filesystem_activity"]
+                            }
+                            investigation::EvidenceKind::VolumeContext => {
+                                vec!["volume_specific"]
+                            }
+                            _ => Vec::new(),
+                        };
+                        (kind, ai::display_text(note), supports)
+                    }
+                };
+                let mut evidence = investigation::evidence(
+                    format!("{}:{}", case.id, work.check),
+                    kind,
+                    &case.target,
+                    summary,
+                    &supports,
+                    &[],
+                    true,
+                );
+                if kind == investigation::EvidenceKind::Research {
+                    evidence.source = Some("fixed Apple source catalog".into());
+                }
+                case.add_evidence(evidence);
+            }
             let check_observation = match &result {
                 InvestigationResult::Inventory(inventory) => format!(
                     "Read-only folder check at {}: {} observed; complete={}; {} unreadable entries. Largest children: {}",
@@ -693,6 +777,28 @@ impl Workspace {
                 InvestigationResult::Note(note) => self.note = Some(note),
             }
             self.pending_checks = work.checks.clone();
+            if let Some(case) = &mut self.investigation_case {
+                let decision = case.next_local_decision();
+                case.apply_decision(&decision);
+                match decision {
+                    investigation::AgentDecision::Check { check, .. } => {
+                        if !self.pending_checks.iter().any(|pending| pending == &check) {
+                            self.pending_checks.push_front(check);
+                        }
+                    }
+                    investigation::AgentDecision::Research { .. } => {
+                        if !self
+                            .pending_checks
+                            .iter()
+                            .any(|pending| pending == "research_sources")
+                        {
+                            self.pending_checks.push_front("research_sources".into());
+                        }
+                    }
+                    investigation::AgentDecision::AwaitApproval { .. }
+                    | investigation::AgentDecision::Finish { .. } => {}
+                }
+            }
             if self.pending_checks.is_empty() {
                 let deadline = self.investigation_deadline;
                 if self
@@ -703,7 +809,7 @@ impl Workspace {
                     && !self.clearing_history
                     && self.work.is_none()
                 {
-                    self.start_ai(app, true, false);
+                    self.start_ai(app, true, false, false);
                     self.investigation_deadline = deadline;
                 } else {
                     self.investigation_deadline = None;
@@ -817,7 +923,7 @@ impl Workspace {
             self.note = Some(format!("History could not be saved: {error}"));
         }
     }
-    fn start_ai(&mut self, app: &App, selected_only: bool, investigation: bool) {
+    fn start_ai(&mut self, app: &App, selected_only: bool, investigation: bool, automatic: bool) {
         if self.metrics.pressure == Some(4) {
             self.auto_requested = true;
             self.ai_error = Some("Local AI paused while memory pressure is critical.".into());
@@ -863,6 +969,15 @@ impl Workspace {
                 }),
             _ => None,
         }) == Some(true);
+        if investigation {
+            self.investigation_case = selected_is_fseventsd.then(|| {
+                investigation::InvestigationCase::new_fseventsd(
+                    "fseventsd",
+                    self.revision,
+                    automatic,
+                )
+            });
+        }
         let cache_key = ai::cache_key(&request);
         if let Some(cached) = self.insight_cache.get(&cache_key).cloned() {
             self.insight_scope = cached.evidence_ids.clone();
@@ -996,6 +1111,7 @@ impl Workspace {
             _ => None,
         };
         let history = self.history.clone();
+        let check_name = check.clone();
         thread::spawn(move || {
             let path = match &selected {
                 Target::Cache(path) | Target::Folder(path) => Some(path.clone()),
@@ -1081,6 +1197,15 @@ impl Workspace {
                         )
                     }
                 }
+                "volume_context" => InvestigationResult::Note(
+                    care::observe_volume_context(&flag).unwrap_or_else(|error| {
+                        format!("Mounted-volume context unavailable: {error}")
+                    }),
+                ),
+                "research_sources" => InvestigationResult::Note(
+                    care::research_sources(&flag)
+                        .unwrap_or_else(|error| format!("Source research unavailable: {error}")),
+                ),
                 _ => InvestigationResult::Note("Unsupported investigation check.".into()),
             };
             if !flag.load(Ordering::Relaxed) {
@@ -1093,6 +1218,7 @@ impl Workspace {
             deadline: *self
                 .investigation_deadline
                 .get_or_insert_with(|| Instant::now() + Duration::from_secs(60)),
+            check: check_name,
             checks: self.pending_checks.clone(),
             target,
         });
@@ -1571,7 +1697,7 @@ impl Workspace {
             KeyCode::Char('r')=>{if self.plan.is_empty(){self.recheck(app);}else{self.note=Some("Review or clear the pending plan before rechecking.".into());}},
             KeyCode::Char('?')=>self.note=Some("Tab: menu/content · arrows: choose · Enter: inspect · Space: add/remove action · i: AI investigation · e: explore · P: processes · m: move · p: review plan · f: all findings · K: keep · r: recheck · M: motion · q: quit".into()),
             KeyCode::Char('P')=>{app.phase=Phase::Processes;self.legacy=true;},
-            KeyCode::Char('i')=>self.start_ai(app,true,true),
+            KeyCode::Char('i')=>self.start_ai(app,true,true,false),
             KeyCode::Char('f')=>{self.show_all= !self.show_all;self.cursor=0;},
             KeyCode::Char('K')=>{if let Some(f)=self.selected(){if matches!(f.target,Target::System){self.note=Some("System pressure stays visible until readings change.".into());}else{self.kept.insert(f.id.clone());}}self.cursor=self.cursor.min(self.visible().len().saturating_sub(1));},
             KeyCode::Char('e')=>self.inspect(app),
@@ -2225,11 +2351,43 @@ fn render_evidence(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) 
     } else {
         " INSIGHT ".into()
     };
+    let investigation_summary = w
+        .investigation_case
+        .as_ref()
+        .map(|case| {
+            let leading = case
+                .hypotheses
+                .iter()
+                .filter(|hypothesis| {
+                    matches!(
+                        hypothesis.status,
+                        investigation::HypothesisStatus::Leading
+                            | investigation::HypothesisStatus::Supported
+                    )
+                })
+                .map(|hypothesis| hypothesis.label.as_str())
+                .collect::<Vec<_>>();
+            format!(
+                "\n\nINVESTIGATION · {:?}\nChecks {} / {} · Evidence {}\nLeading: {}",
+                case.phase,
+                case.decision_count,
+                case.decision_budget,
+                case.evidence.len(),
+                if leading.is_empty() {
+                    "none yet".into()
+                } else {
+                    leading.join("; ")
+                }
+            )
+        })
+        .unwrap_or_default();
     let ai_text = if active {
-        "Reading measured evidence. Your findings and controls remain available.".to_string()
+        format!(
+            "Reading measured evidence. Your findings and controls remain available.{investigation_summary}"
+        )
     } else if let Some(insight) = &w.insight {
         format!(
-            "{}\nFor: {}",
+            "{}\nFor: {}{}",
             insight.summary,
             insight
                 .evidence_ids
@@ -2240,7 +2398,8 @@ fn render_evidence(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) 
                     .find(|f| &f.id == id)
                     .map(|f| f.title.as_str()))
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            investigation_summary
         )
     } else if let Some(error) = &w.ai_error {
         format!(

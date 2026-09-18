@@ -11,6 +11,7 @@ pub mod care;
 pub mod cli;
 pub mod downloads;
 pub mod history;
+pub mod investigation;
 pub mod plain;
 pub mod processes;
 pub mod relocation;
