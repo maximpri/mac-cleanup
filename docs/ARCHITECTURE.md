@@ -17,16 +17,26 @@ provides historical design context. The current implementation checkpoint is in
   falls back to visibly labeled measured triage ordering when needed, and
   enforces inference cancellation and timeout. Triage uses short model-facing
   IDs mapped back to findings; generated reasons are not shown as evidence.
-- `src/investigation.rs` owns bounded investigation cases, typed evidence,
-  competing hypotheses, adaptive check decisions, and inconclusive outcomes.
+- `src/investigation.rs` owns bounded investigation cases for capacity coverage,
+  storage growth, memory pressure, CPU activity, filesystem activity, and
+  developer-data ownership. It validates typed evidence status, competing
+  hypotheses, model-selected check IDs, budgets, and supported/inconclusive
+  outcomes. A failed or denied collector cannot strengthen a hypothesis.
 - `native/AIHelper.swift` calls Apple's on-device FoundationModels API. It has
-  no filesystem action tool or remote fallback. The app revalidates evidence
-  after generation; valid JSON alone does not establish truthful prose. Online
-  source research uses a fixed no-key catalog and is opt-in.
+  no filesystem action tool or remote fallback. Protocol v2 correlates request
+  IDs and reports helper/model capabilities. Dynamic generation schemas constrain
+  every evidence, action, hypothesis, and diagnostic reference to the IDs Rust
+  supplies; token preflight is used where the installed framework supports it.
+  The app revalidates evidence after generation because valid JSON alone does
+  not establish truthful prose. Online source research uses a fixed no-key Apple
+  catalog, short extracted passages, and a saved explicit opt-in.
 - `src/tui/care_view.rs` owns Findings/Explore/History, model activity visuals,
   shared review plans, sequential execution, and before/after observations.
 - Existing cache, process, whitelist, and relocation engines own all mutation
   safeguards. No model-generated path or signal is executed.
+- Administrator-assisted diagnostics are fixed read-only collectors. The TUI
+  obtains explicit approval before invoking macOS authorization, records denial
+  as unusable evidence, and never gives the model a shell or command arguments.
 - `scripts/build-release.sh` builds both binaries. `check_ai_helper.py` checks
   framing without model assets, or exercises synthetic inference with `--live`.
   `smoke_tui.py` checks terminal interactions and disposable-fixture cleanup.
@@ -41,7 +51,9 @@ of deleted bytes is not itself a measure of success.
 
 The application remains a local Rust terminal utility. That fits its existing
 macOS filesystem integration, keyboard-driven use, and plain-text/JSON automation
-interfaces. There is no server, browser runtime, telemetry, or background agent.
+interfaces. There is no server, browser runtime, telemetry, or persistent
+background service. “Agentic” means the on-device model selects from bounded
+diagnostic capabilities while Rust owns execution, evidence, limits, and policy.
 
 ## Product goals
 

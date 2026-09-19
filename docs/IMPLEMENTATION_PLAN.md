@@ -1,22 +1,27 @@
 # Fast triage and unified AI-assisted Mac care
 
-Status: implementation in progress; the unified workspace and local AI helper are now in source. Release certification is pending. This plan supersedes earlier
+Status: the agentic Apple Foundation Models core is implemented in source;
+release certification and the human-reviewed model evaluation corpus remain
+pending. This plan supersedes earlier
 milestone ordering and timing assumptions in the product discussion. It keeps
 the accepted scope: a Rust/Ratatui utility for developers and AI-tool users,
 Apple Intelligence in the first release, macOS 26+ on compatible Apple silicon,
 and a visual workflow without chat.
 
-## Implementation checkpoint — 2026-09-17
+## Implementation checkpoint — 2026-09-18
 
 Implemented in source:
 
 - Progressive storage/process assessment and a Findings / Explore / History workspace.
 - Deterministic quick-win eligibility, stable finding selection, selected-folder maps,
   CPU deltas, native swap/device rates, pressure readings, and explicit coverage inspection.
-- A compiled Swift FoundationModels helper with bounded structured responses,
-  evidence/action reference validation, AI-ranked triage within Rust policy,
-  stale-evidence rejection, and no cloud fallback.
-- Contextual read-only investigation with permitted checks and cancellation.
+- A compiled Swift FoundationModels helper with protocol-v2 request correlation,
+  capability reporting, context/token preflight, dynamic schemas constrained to
+  Rust-provided IDs, AI-ranked triage within Rust policy, stale-evidence rejection,
+  and no cloud fallback.
+- Adaptive cases for capacity, storage, memory, CPU, filesystem activity, and
+  developer data. Apple FM chooses one permitted read-only check at a time; Rust
+  owns collectors, typed outcomes, budgets, deadlines, and conclusion validation.
 - Actual-work cyan/violet activity visuals, completion accent, reduced motion,
   no-color support, and terminal focus tracking.
 - Shared exact-target plans for cleanup, signals, and relocation; protected-data
@@ -25,12 +30,16 @@ Implemented in source:
 - Validated insight caching is keyed by the evidence revision and prompt contract;
   targeted process refresh reports the current PID identity rather than a generic note.
 - High-memory system-owned daemons are visible as read-only observations. A selected
-  `fseventsd` finding can request a bounded `sudo -n fs_usage` sample; swap-backed
-  filesystem activity is explained as evidence to investigate, never as proof that
-  the daemon caused memory pressure.
-- Agentic investigation cases now retain competing hypotheses and typed evidence,
-  automatically sequence fseventsd activity, volume context, and source research,
-  and finish with a leading explanation or an explicit inconclusive state.
+  `fseventsd` case may propose a fixed eight-second `fs_usage` sample. The TUI waits
+  for explicit approval before macOS requests administrator authorization. Paging,
+  ordinary filesystem operations, and external-volume paths are counted separately;
+  paging never proves an event storm or causation.
+- Investigation evidence distinguishes complete, partial, permission-required,
+  unsupported, timed-out, cancelled, and failed results. Only complete/partial
+  evidence can update a hypothesis. Cases and conclusions persist in History.
+- Saved online-research consent enables fixed Apple documentation URLs only.
+  Bounded extracted passages become typed evidence; raw paths, traces, process
+  arguments, and model-generated queries are excluded.
 - The workspace displays the detected Apple Foundation Models framework state and
   keeps measured triage usable when a model response cannot be validated.
 - Completed action sessions can receive a bounded local AI outcome summary in
@@ -40,19 +49,20 @@ Implemented in source:
 - Regression tests for focus, read-only behavior, hidden confirmations, overlapping
   plans, stale inference, responsive rendering, and reduced motion.
 
-The first implementation deliberately does not certify the remaining release
+The implementation deliberately does not certify the remaining release
 acceptance gates below. Outstanding work includes richer app/session ownership
 adapters, causal workload correlation, and cumulative attributable AI resource
 budgets. The current CPU/pressure observations must not be
 presented as causal performance gains. Folder investigation is a bounded read-only
 measurement; the model never receives a general shell or filesystem mutation tool.
 
-Validation on the development Mac passed 127 Rust tests, strict Clippy, the
-read-only JSON schema check, and a live terminal test that cancels and executes
-cleanup only inside a disposable fixture while preserving neighboring files.
-The real helper returned validated synthetic explanations in approximately
-three to four seconds. The release script successfully builds both binaries. These are local observations,
-not a performance guarantee or a substitute for the planned evaluation corpus.
+Validation on the development Mac passed 142 Rust tests, strict Clippy, private
+Rust documentation warnings, Swift typechecking, protocol-v2 framing, release
+packaging, and disposable-fixture TUI smoke coverage. Live Apple Foundation
+Models checks passed for explanation, triage, result summary, and constrained
+agent decisions; individual synthetic requests completed in approximately
+0.7–2.2 seconds in the recorded run. These are local observations, not a
+performance guarantee or a substitute for the planned evaluation corpus.
 
 ## 1. Outcome and first-release boundaries
 
@@ -219,13 +229,22 @@ three eligible quick-win IDs, and short reasons. Guided generation enforces the
 response shape; Rust validates IDs, revisions, and allowed relationships. Display
 numeric facts from Rust rather than accepting model-generated quantities.
 
-For Investigate further, allow at most three read-only checks scoped to the
+For automatic investigation, allow at most three read-only checks scoped to the
 selected subject: inspect its measured children, measure an already discovered
 subtree, refresh its process family, check open handles, compare saved complete
 measurements, or sample the selected system-owned `fseventsd` with the fixed
-`fs_usage` collector. Limit the entire investigation to 60 seconds; cancel at
-safe read boundaries and retain marked partial evidence. No file-content
-ingestion or free-form shell tools in this release.
+`fs_usage` collector. An operator-started case may use up to eight decisions and
+three minutes. Limit automatic cases to 60 seconds; cancel at safe read boundaries
+and retain marked partial evidence. The model receives each check status and
+cannot use failed or denied evidence to complete a case. No file-content ingestion
+or free-form shell tools exist in this release.
+
+Online research is a separate saved consent. It fetches only a compiled Apple
+source catalog and extracts bounded text locally; it does not send a generated
+query. Administrator-assisted diagnostics are also separate: the model can choose
+only the fixed diagnostic ID, the TUI asks for approval, and macOS owns the
+authorization prompt. A refusal is evidence about availability, never evidence
+for a technical cause.
 
 Respect the model's context limit, including instructions, schema, and response.
 Reserve 768 output tokens, compact evidence deterministically, and use token

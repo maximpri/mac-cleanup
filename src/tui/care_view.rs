@@ -129,7 +129,22 @@ struct TriageWork {
     request: ai::Request,
     id_map: HashMap<String, String>,
 }
+struct DecisionWork {
+    receiver: Receiver<Result<investigation::AgentDecision, String>>,
+    worker: Option<thread::JoinHandle<()>>,
+    cancel: Arc<AtomicBool>,
+    available: Vec<investigation::AvailableCheck>,
+    case_id: String,
+}
 impl Drop for TriageWork {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+impl Drop for DecisionWork {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
         if let Some(worker) = self.worker.take() {
@@ -163,7 +178,7 @@ fn resolve_triage_ids(
 }
 enum InvestigationResult {
     Inventory(Box<StorageInventory>),
-    Note(String),
+    Observation(investigation::CheckObservation),
 }
 struct Investigation {
     receiver: Receiver<InvestigationResult>,
@@ -199,6 +214,7 @@ pub(super) struct Workspace {
     revision: u64,
     started: Instant,
     triage_work: Option<TriageWork>,
+    decision_work: Option<DecisionWork>,
     triage: Option<ai::Triage>,
     triage_revision: Option<u64>,
     triage_is_ai: bool,
@@ -217,6 +233,9 @@ pub(super) struct Workspace {
     auto_investigation_started: bool,
     investigation: Option<Investigation>,
     investigation_case: Option<investigation::InvestigationCase>,
+    pending_diagnostic_approval: Option<String>,
+    agent_decision_reason: Option<String>,
+    online_research: bool,
     pending_checks: VecDeque<String>,
     investigation_deadline: Option<Instant>,
     investigation_target: Option<Target>,
@@ -256,6 +275,7 @@ impl Workspace {
     pub(super) fn new(app: &App) -> Self {
         let mut result = Self::empty();
         result.history = care::sessions(&app.account_home);
+        result.online_research = care::online_research_enabled(&app.account_home);
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             let _ = sender.send(ai::framework_status());
@@ -290,6 +310,7 @@ impl Workspace {
             revision: 0,
             started: Instant::now(),
             triage_work: None,
+            decision_work: None,
             triage: None,
             triage_revision: None,
             triage_is_ai: false,
@@ -308,6 +329,9 @@ impl Workspace {
             auto_investigation_started: false,
             investigation: None,
             investigation_case: None,
+            pending_diagnostic_approval: None,
+            agent_decision_reason: None,
+            online_research: false,
             pending_checks: VecDeque::new(),
             investigation_deadline: None,
             investigation_target: None,
@@ -464,10 +488,13 @@ impl Workspace {
                 care::Event::Processes(result, metrics) => {
                     self.metrics = metrics;
                     if self.metrics.pressure == Some(4)
-                        && (self.insight_work.is_some() || self.triage_work.is_some())
+                        && (self.insight_work.is_some()
+                            || self.triage_work.is_some()
+                            || self.decision_work.is_some())
                     {
                         self.insight_work = None;
                         self.triage_work = None;
+                        self.decision_work = None;
                         self.ai_error =
                             Some("Local AI paused while memory pressure is critical.".into());
                     }
@@ -638,6 +665,46 @@ impl Workspace {
             }
         }
         if let Some(result) =
+            self.decision_work
+                .as_ref()
+                .and_then(|work| match work.receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Disconnected) => {
+                        Some(Err("AI decision worker stopped".into()))
+                    }
+                    Err(TryRecvError::Empty) => None,
+                })
+        {
+            let work = self.decision_work.take().expect("AI decision work");
+            let current_case = self
+                .investigation_case
+                .as_ref()
+                .is_some_and(|case| case.id == work.case_id);
+            if current_case {
+                let decision = result.unwrap_or_else(|error| {
+                    self.ai_error = Some(format!(
+                        "Local AI could not choose the next check: {} Using the measured fallback.",
+                        ai::display_text(&error)
+                    ));
+                    work.available.first().map_or_else(
+                        || investigation::AgentDecision::Finish {
+                            conclusion: "No further permitted check is available. The cause remains unresolved.".into(),
+                            phase: investigation::CasePhase::Inconclusive,
+                            evidence_ids: vec![],
+                        },
+                        |check| investigation::AgentDecision::Check {
+                            check: check.id.clone(),
+                            reason: "Measured fallback order after local AI was unavailable.".into(),
+                            evidence_ids: vec![],
+                            hypothesis_ids: vec![],
+                        },
+                    )
+                });
+                self.accept_agent_decision(decision, &work.available);
+                self.persist(app);
+            }
+        }
+        if let Some(result) =
             self.insight_work
                 .as_ref()
                 .and_then(|work| match work.receiver.try_recv() {
@@ -661,34 +728,12 @@ impl Workspace {
                         self.flash = Some(Instant::now());
                         self.ai_error = None;
                         if work.request.investigation {
-                            self.pending_checks = insight.next_checks.iter().cloned().collect();
-                            let selected_is_fseventsd = self
-                                .investigation_target
-                                .as_ref()
-                                .and_then(|target| match target {
-                                    Target::Process(pid, identity) => app
-                                        .processes
-                                        .iter()
-                                        .find(|process| {
-                                            process.pid == *pid && process.start_time == *identity
-                                        })
-                                        .map(|process| {
-                                            Path::new(&process.command)
-                                                .file_name()
-                                                .and_then(|name| name.to_str())
-                                                .is_some_and(|name| {
-                                                    name.eq_ignore_ascii_case("fseventsd")
-                                                })
-                                        }),
-                                    _ => None,
-                                })
-                                .unwrap_or(false);
-                            if selected_is_fseventsd
-                                && !self.pending_checks.iter().any(|check| check == "fs_usage")
-                            {
-                                self.pending_checks.push_back("fs_usage".into());
+                            if self.investigation_case.is_some() {
+                                self.pending_checks.clear();
+                            } else {
+                                self.pending_checks = insight.next_checks.iter().cloned().collect();
                             }
-                            if self.pending_checks.is_empty() {
+                            if self.pending_checks.is_empty() && self.investigation_case.is_none() {
                                 self.pending_checks.push_back("inspect_children".into());
                             }
                         }
@@ -738,50 +783,48 @@ impl Workspace {
             .and_then(|work| work.receiver.try_recv().ok())
         {
             let work = self.investigation.take().expect("investigation");
-            if let Some(case) = &mut self.investigation_case {
-                case.record_check(work.check.clone());
-                let (kind, summary, supports) = match &result {
-                    InvestigationResult::Inventory(inventory) => (
+            let mut observation = match &result {
+                InvestigationResult::Inventory(inventory) => {
+                    let mut observation = investigation::CheckObservation::complete(
                         investigation::EvidenceKind::VolumeContext,
                         format!(
-                            "Measured folder evidence: {} observed, complete={}, {} unreadable entries.",
+                            "Measured folder evidence: {} observed · {} not reconciled with volume accounting · {} unreadable entries.",
                             format_kb(inventory.scanned_kb),
-                            inventory.complete,
+                            format_kb(inventory.unaccounted_kb),
                             inventory.scan_errors
                         ),
-                        vec!["volume_specific"],
-                    ),
-                    InvestigationResult::Note(note) => {
-                        let kind = match work.check.as_str() {
-                            "fs_usage" => investigation::EvidenceKind::FilesystemActivity,
-                            "volume_context" => investigation::EvidenceKind::VolumeContext,
-                            "research_sources" => investigation::EvidenceKind::Research,
-                            _ => investigation::EvidenceKind::ProcessSample,
-                        };
-                        let supports = match kind {
-                            investigation::EvidenceKind::FilesystemActivity => {
-                                vec!["filesystem_activity"]
-                            }
-                            investigation::EvidenceKind::VolumeContext => {
-                                vec!["volume_specific"]
-                            }
-                            _ => Vec::new(),
-                        };
-                        (kind, ai::display_text(note), supports)
+                    );
+                    if inventory.unaccounted_kb >= 1_048_576 {
+                        observation.supports.push("missing_coverage".into());
                     }
-                };
+                    if !inventory.complete {
+                        observation.status = investigation::EvidenceStatus::Partial;
+                    }
+                    observation
+                }
+                InvestigationResult::Observation(observation) => observation.clone(),
+            };
+            if let Some(case) = &mut self.investigation_case {
+                case.classify_observation(&work.check, &mut observation);
+                case.record_check(work.check.clone());
                 let mut evidence = investigation::evidence(
                     format!("{}:{}", case.id, work.check),
-                    kind,
+                    observation.kind,
                     &case.target,
-                    summary,
-                    &supports,
-                    &[],
-                    true,
+                    ai::display_text(&observation.summary),
+                    &observation
+                        .supports
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                    &observation
+                        .contradicts
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                    observation.status,
                 );
-                if kind == investigation::EvidenceKind::Research {
-                    evidence.source = Some("fixed Apple source catalog".into());
-                }
+                evidence.source = observation.source.clone();
                 case.add_evidence(evidence);
             }
             let check_observation = match &result {
@@ -809,8 +852,13 @@ impl Workspace {
                             .join(", "))
                         .unwrap_or_default()
                 ),
-                InvestigationResult::Note(note) => {
-                    format!("Read-only check at {}: {note}", care::timestamp())
+                InvestigationResult::Observation(observation) => {
+                    format!(
+                        "Read-only check at {} · {}: {}",
+                        care::timestamp(),
+                        observation.status.label(),
+                        observation.summary
+                    )
                 }
             };
             if let Some(id) = &self.investigation_subject {
@@ -833,48 +881,17 @@ impl Workspace {
                     self.revision += 1;
                     self.flash = Some(Instant::now());
                 }
-                InvestigationResult::Note(note) => self.note = Some(note),
+                InvestigationResult::Observation(observation) => {
+                    self.note = Some(format!(
+                        "{} · {}",
+                        observation.status.label(),
+                        observation.summary
+                    ))
+                }
             }
             self.pending_checks = work.checks.clone();
-            if let Some(case) = &mut self.investigation_case {
-                let decision = case.next_local_decision();
-                case.apply_decision(&decision);
-                match decision {
-                    investigation::AgentDecision::Check { check, .. } => {
-                        if !self.pending_checks.iter().any(|pending| pending == &check) {
-                            self.pending_checks.push_front(check);
-                        }
-                    }
-                    investigation::AgentDecision::Research { .. } => {
-                        if !self
-                            .pending_checks
-                            .iter()
-                            .any(|pending| pending == "research_sources")
-                        {
-                            self.pending_checks.push_front("research_sources".into());
-                        }
-                    }
-                    investigation::AgentDecision::AwaitApproval { .. }
-                    | investigation::AgentDecision::Finish { .. } => {}
-                }
-            }
-            if self.pending_checks.is_empty() {
-                let deadline = self.investigation_deadline;
-                if self
-                    .investigation_subject
-                    .as_ref()
-                    .is_some_and(|id| self.selected().is_some_and(|f| &f.id == id))
-                    && !self.reviewing
-                    && !self.clearing_history
-                    && self.work.is_none()
-                {
-                    self.start_ai(app, true, false, false);
-                    self.investigation_deadline = deadline;
-                } else {
-                    self.investigation_deadline = None;
-                }
-            }
             self.investigation_target = Some(work.target.clone());
+            self.persist(app);
         }
         if self
             .investigation
@@ -883,9 +900,17 @@ impl Workspace {
         {
             self.investigation = None;
             self.pending_checks.clear();
+            if let Some(case) = &mut self.investigation_case {
+                case.phase = investigation::CasePhase::Inconclusive;
+                case.conclusion = Some(
+                    "The bounded investigation window ended before another check completed. Existing evidence remains available, but no root cause is established."
+                        .into(),
+                );
+            }
             self.note = Some(
                 "Investigation time limit reached. Existing evidence remains available.".into(),
             );
+            self.persist(app);
         }
         if self
             .insight_work
@@ -900,8 +925,21 @@ impl Workspace {
                 "Investigation time limit reached. Measured check results remain available.".into(),
             );
         }
+        if self.investigation_case.is_some()
+            && self.investigation.is_none()
+            && self.insight_work.is_none()
+            && self.decision_work.is_none()
+            && self.pending_checks.is_empty()
+            && self.pending_diagnostic_approval.is_none()
+            && self
+                .investigation_deadline
+                .is_some_and(|deadline| Instant::now() <= deadline)
+        {
+            self.start_agent_decision();
+        }
         if self.investigation.is_none()
             && self.insight_work.is_none()
+            && self.decision_work.is_none()
             && let Some(check) = self.pending_checks.pop_front()
         {
             self.start_check(app, check);
@@ -977,21 +1015,119 @@ impl Workspace {
         }
     }
     fn persist(&mut self, app: &App) {
+        self.session.investigations = self.investigation_case.clone().into_iter().collect();
         self.session.updated = care::timestamp();
         if let Err(error) = care::save_session(&app.account_home, &self.session) {
             self.note = Some(format!("History could not be saved: {error}"));
         }
     }
+    fn start_agent_decision(&mut self) {
+        if self.decision_work.is_some()
+            || self.investigation.is_some()
+            || self.pending_diagnostic_approval.is_some()
+        {
+            return;
+        }
+        let Some(case) = self.investigation_case.clone() else {
+            return;
+        };
+        if matches!(
+            case.phase,
+            investigation::CasePhase::Complete | investigation::CasePhase::Inconclusive
+        ) {
+            return;
+        }
+        if case.automatic && self.metrics.pressure.is_some_and(|pressure| pressure >= 2) {
+            self.ai_error = Some(
+                "Automatic local AI paused while memory pressure is elevated. Measured evidence remains available."
+                    .into(),
+            );
+            return;
+        }
+        let available = case.available_checks(self.online_research);
+        let case_id = case.id.clone();
+        let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let choices = available.clone();
+        let worker = thread::spawn(move || {
+            let _ = sender.send(ai::decide(&case, &choices, &flag));
+        });
+        self.decision_work = Some(DecisionWork {
+            receiver,
+            worker: Some(worker),
+            cancel,
+            available,
+            case_id,
+        });
+        self.agent_decision_reason =
+            Some("Choosing the next check that best separates the remaining explanations.".into());
+    }
+
+    fn accept_agent_decision(
+        &mut self,
+        decision: investigation::AgentDecision,
+        available: &[investigation::AvailableCheck],
+    ) {
+        if let Some(case) = &mut self.investigation_case {
+            case.apply_decision(&decision);
+        }
+        match decision {
+            investigation::AgentDecision::Check { check, reason, .. } => {
+                self.agent_decision_reason = Some(reason);
+                if available
+                    .iter()
+                    .any(|candidate| candidate.id == check && candidate.requires_approval)
+                {
+                    if let Some(case) = &mut self.investigation_case {
+                        case.phase = investigation::CasePhase::AwaitingApproval;
+                    }
+                    self.pending_diagnostic_approval = Some(check);
+                    self.note = Some(
+                        "Administrator-assisted read-only tracing is recommended. Press a to approve the fixed 8-second probe, or Esc to skip it."
+                            .into(),
+                    );
+                } else {
+                    self.pending_checks.push_back(check);
+                }
+            }
+            investigation::AgentDecision::Finish {
+                conclusion, phase, ..
+            } => {
+                self.agent_decision_reason = Some(conclusion.clone());
+                self.note = Some(conclusion);
+                if let Some(case) = &mut self.investigation_case {
+                    case.phase = phase;
+                }
+                self.investigation_deadline = None;
+            }
+            investigation::AgentDecision::Research { .. }
+            | investigation::AgentDecision::AwaitApproval { .. } => {
+                self.ai_error = Some("The local model returned an obsolete decision type.".into());
+            }
+        }
+    }
+
     fn start_ai(&mut self, app: &App, selected_only: bool, investigation: bool, automatic: bool) {
-        if self.metrics.pressure == Some(4) {
+        if self.metrics.pressure == Some(4) || (automatic && self.metrics.pressure == Some(2)) {
             self.auto_requested = true;
-            self.ai_error = Some("Local AI paused while memory pressure is critical.".into());
+            self.ai_error =
+                Some("Automatic local AI paused while memory pressure is elevated.".into());
             return;
         }
         self.insight_work = None;
+        self.decision_work = None;
         self.investigation = None;
+        self.pending_diagnostic_approval = None;
         self.pending_checks.clear();
-        self.investigation_deadline = Some(Instant::now() + Duration::from_secs(60));
+        self.investigation_deadline = investigation.then(|| {
+            Instant::now()
+                + if automatic {
+                    investigation::AUTOMATIC_CASE_WINDOW
+                } else {
+                    investigation::EXPLICIT_CASE_WINDOW
+                }
+        });
         let subjects: Vec<_> = if selected_only {
             self.selected().into_iter().collect()
         } else {
@@ -1014,6 +1150,30 @@ impl Workspace {
             subjects: subjects.iter().map(|f| subject_for_finding(f)).collect(),
         };
         let target = subjects.first().map(|f| f.target.clone());
+        let check_target = if investigation
+            && matches!(target.as_ref(), Some(Target::System))
+            && subjects[0].id == "system:disk"
+        {
+            Some(Target::Folder(app.scan_root.clone()))
+        } else if investigation
+            && matches!(target.as_ref(), Some(Target::System))
+            && subjects[0].id == "system:memory"
+        {
+            app.processes
+                .iter()
+                .filter_map(|process| {
+                    self.metrics
+                        .rss_kb
+                        .get(&process.pid)
+                        .or(process.rss_kb.as_ref())
+                        .map(|rss| (rss, process))
+                })
+                .max_by_key(|(rss, _)| *rss)
+                .map(|(_, process)| Target::Process(process.pid, process.start_time.clone()))
+                .or(target.clone())
+        } else {
+            target.clone()
+        };
         let subject = investigation.then(|| subjects[0].id.clone());
         let selected_is_fseventsd = target.as_ref().and_then(|target| match target {
             Target::Process(pid, identity) => app
@@ -1029,12 +1189,94 @@ impl Workspace {
             _ => None,
         }) == Some(true);
         if investigation {
-            self.investigation_case = selected_is_fseventsd.then(|| {
-                investigation::InvestigationCase::new_fseventsd(
-                    "fseventsd",
-                    self.revision,
-                    automatic,
-                )
+            self.investigation_case = subjects.first().map(|finding| {
+                let mut case = if selected_is_fseventsd {
+                    investigation::InvestigationCase::new_fseventsd(
+                        "fseventsd",
+                        self.revision,
+                        automatic,
+                    )
+                } else {
+                    match &finding.target {
+                        Target::Cache(path) | Target::Folder(path) => {
+                            let label = format!(
+                                "{} {}",
+                                finding.title,
+                                path.display().to_string().to_ascii_lowercase()
+                            )
+                            .to_ascii_lowercase();
+                            if [
+                                "xcode",
+                                "developer",
+                                "opencode",
+                                "codex",
+                                "playwright",
+                                "node",
+                                "npm",
+                                "python",
+                                "homebrew",
+                                "gradle",
+                                "swiftpm",
+                            ]
+                            .iter()
+                            .any(|marker| label.contains(marker))
+                            {
+                                investigation::InvestigationCase::new_developer(
+                                    ai::display_text(&path.display().to_string()),
+                                    self.revision,
+                                    automatic,
+                                )
+                            } else {
+                                investigation::InvestigationCase::new_storage(
+                                    ai::display_text(&path.display().to_string()),
+                                    self.revision,
+                                    automatic,
+                                )
+                            }
+                        }
+                        Target::Process(..) => investigation::InvestigationCase::new_process(
+                            finding.title.clone(),
+                            self.revision,
+                            automatic,
+                            finding.observation.contains("RAM"),
+                        ),
+                        Target::System => {
+                            if finding.id == "system:disk" {
+                                investigation::InvestigationCase::new_capacity(
+                                    self.revision,
+                                    automatic,
+                                )
+                            } else {
+                                investigation::InvestigationCase::new_process(
+                                    finding.title.clone(),
+                                    self.revision,
+                                    automatic,
+                                    true,
+                                )
+                            }
+                        }
+                    }
+                };
+                if finding.quick_win
+                    && case
+                        .hypotheses
+                        .iter()
+                        .any(|hypothesis| hypothesis.id == "rebuildable_data")
+                {
+                    case.add_evidence(investigation::evidence(
+                        format!("{}:cleanup-policy", case.id),
+                        investigation::EvidenceKind::Policy,
+                        case.target.clone(),
+                        format!(
+                            "Rust cleanup policy classifies this measured target as a current low-disruption quick win: {}",
+                            ai::display_text(&finding.consequence)
+                        ),
+                        &["rebuildable_data"],
+                        &[],
+                        investigation::EvidenceStatus::Complete,
+                    ));
+                }
+                case
             });
         }
         let cache_key = ai::cache_key(&request);
@@ -1042,21 +1284,20 @@ impl Workspace {
             self.insight_scope = cached.evidence_ids.clone();
             self.insight_inputs = request.subjects.clone();
             if investigation {
-                self.pending_checks = cached.next_checks.iter().cloned().collect();
-                if selected_is_fseventsd
-                    && !self.pending_checks.iter().any(|check| check == "fs_usage")
-                {
-                    self.pending_checks.push_back("fs_usage".into());
+                if self.investigation_case.is_some() {
+                    self.pending_checks.clear();
+                } else {
+                    self.pending_checks = cached.next_checks.iter().cloned().collect();
                 }
             }
-            self.investigation_target = target;
+            self.investigation_target = check_target;
             self.investigation_subject = subject;
             self.insight = Some(cached);
             self.ai_error = None;
             self.auto_requested = true;
             return;
         }
-        self.investigation_target = target;
+        self.investigation_target = check_target;
         self.investigation_subject = subject;
         let (sender, receiver) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1170,6 +1411,9 @@ impl Workspace {
         let Some(target) = self.investigation_target.clone() else {
             return;
         };
+        if let Some(case) = &mut self.investigation_case {
+            case.phase = investigation::CasePhase::Checking;
+        }
         let (sender, receiver) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
@@ -1184,6 +1428,7 @@ impl Workspace {
             _ => None,
         };
         let history = self.history.clone();
+        let online_research = self.online_research;
         let check_name = check.clone();
         thread::spawn(move || {
             let path = match &selected {
@@ -1197,58 +1442,124 @@ impl Workspace {
                             StorageInventory::scan_with_cancel(&path, &home, &flag),
                         ))
                     } else {
-                        InvestigationResult::Note("Process evidence refreshes every two seconds. Inspect the family and sample window.".into())
+                        InvestigationResult::Observation(investigation::CheckObservation::complete(
+                            investigation::EvidenceKind::ProcessSample,
+                            "Process evidence refreshes every two seconds. Inspect the family and sample window.",
+                        ))
                     }
                 }
-                "check_open_handles" => InvestigationResult::Note(if let Some(path) = path {
-                    match cache::path_is_open(&path){Ok(true)=>"An open handle was found. Keep this data while it is in use.".into(),Ok(false)=>"No open handles were found by this check. Cleanup policy still applies.".into(),Err(e)=>format!("Open-handle check unavailable: {e}")}
-                } else {
-                    "Select a folder for an open-handle check.".into()
-                }),
-                "compare_history" => InvestigationResult::Note(if let Some(path) = path {
+                "check_open_handles" => {
+                    InvestigationResult::Observation(if let Some(path) = path {
+                        match cache::path_is_open(&path) {
+                            Ok(true) => {
+                                let mut observation = investigation::CheckObservation::complete(
+                                    investigation::EvidenceKind::ProcessSample,
+                                    "An open handle was found. Keep this data while it is in use.",
+                                );
+                                observation.supports.push("active_writer".into());
+                                observation
+                            }
+                            Ok(false) => {
+                                let mut observation = investigation::CheckObservation::complete(
+                                    investigation::EvidenceKind::ProcessSample,
+                                    "No open handles were found by this point-in-time check. Cleanup policy still applies.",
+                                );
+                                observation.contradicts.push("active_writer".into());
+                                observation
+                            }
+                            Err(e) => investigation::CheckObservation::unavailable(
+                                investigation::EvidenceKind::ProcessSample,
+                                investigation::EvidenceStatus::Failed,
+                                format!("Open-handle check unavailable: {e}"),
+                            ),
+                        }
+                    } else {
+                        investigation::CheckObservation::unavailable(
+                            investigation::EvidenceKind::ProcessSample,
+                            investigation::EvidenceStatus::Unsupported,
+                            "Select a folder for an open-handle check.",
+                        )
+                    })
+                }
+                "compare_history" => InvestigationResult::Observation(if let Some(path) = path {
                     let values: Vec<_> = history
                         .iter()
                         .filter_map(|s| s.measurements.get(&path.display().to_string()))
                         .take(2)
                         .collect();
                     if values.len() == 2 {
-                        format!(
-                            "Prior complete measurements: {} and {}. This does not identify the writer.",
-                            format_kb(*values[0]),
-                            format_kb(*values[1])
-                        )
+                        let mut observation = investigation::CheckObservation::complete(
+                            investigation::EvidenceKind::ProcessSample,
+                            format!(
+                                "Prior complete measurements: {} and {}. This does not identify the writer.",
+                                format_kb(*values[0]),
+                                format_kb(*values[1])
+                            ),
+                        );
+                        if *values[0] > (*values[1]).saturating_add(*values[1] / 10) {
+                            observation.supports.push("active_writer".into());
+                        }
+                        observation
                     } else {
-                        "No comparable complete history yet.".into()
+                        investigation::CheckObservation::unavailable(
+                            investigation::EvidenceKind::ProcessSample,
+                            investigation::EvidenceStatus::Unsupported,
+                            "No comparable complete history yet.",
+                        )
                     }
                 } else {
-                    "Process history records outcomes; it does not prove ownership of generated files.".into()
+                    investigation::CheckObservation::unavailable(
+                        investigation::EvidenceKind::ProcessSample,
+                        investigation::EvidenceStatus::Unsupported,
+                        "Process history records outcomes; it does not prove ownership of generated files.",
+                    )
                 }),
-                "refresh_processes" => {
-                    match &selected {
-                        Target::Process(pid, identity) => match review_processes() {
-                            Ok(processes) => {
-                                let exact = processes
-                                    .iter()
-                                    .find(|process| process.pid == *pid && process.start_time == *identity);
-                                InvestigationResult::Note(match exact {
-                                    Some(process) => format!(
-                                        "Current process identity is still present: PID {} · {} · parent {}. CPU and memory readings continue in the assessment window.",
-                                        process.pid,
-                                        ai::display_text(&process.command),
-                                        process.parent_pid
-                                    ),
-                                    None => "The selected process identity is no longer present in the current-account sample. A replacement process is not assumed to be the same workload.".into(),
-                                })
-                            }
-                            Err(error) => InvestigationResult::Note(format!(
-                                "Process refresh unavailable: {error}"
-                            )),
-                        },
-                        _ => InvestigationResult::Note(
-                            "The current assessment already refreshes process readings every two seconds; no process family is verified for this folder.".into(),
+                "refresh_processes" => match &selected {
+                    Target::Process(pid, identity) => match review_processes() {
+                        Ok(processes) => {
+                            let exact = processes.iter().find(|process| {
+                                process.pid == *pid && process.start_time == *identity
+                            });
+                            InvestigationResult::Observation(match exact {
+                                Some(process) => {
+                                    let mut observation = investigation::CheckObservation::complete(
+                                        investigation::EvidenceKind::ProcessSample,
+                                        format!(
+                                            "Current process identity is still present: PID {} · {} · parent {}. CPU and memory readings continue in the assessment window.",
+                                            process.pid,
+                                            ai::display_text(&process.command),
+                                            process.parent_pid
+                                        ),
+                                    );
+                                    observation.supports.push("process_persists".into());
+                                    observation
+                                }
+                                None => {
+                                    let mut observation = investigation::CheckObservation::complete(
+                                        investigation::EvidenceKind::ProcessSample,
+                                        "The selected process identity is no longer present in the current-account sample. A replacement process is not assumed to be the same workload.",
+                                    );
+                                    observation.contradicts.push("process_persists".into());
+                                    observation
+                                }
+                            })
+                        }
+                        Err(error) => InvestigationResult::Observation(
+                            investigation::CheckObservation::unavailable(
+                                investigation::EvidenceKind::ProcessSample,
+                                investigation::EvidenceStatus::Failed,
+                                format!("Process refresh unavailable: {error}"),
+                            ),
                         ),
-                    }
-                }
+                    },
+                    _ => InvestigationResult::Observation(
+                        investigation::CheckObservation::unavailable(
+                            investigation::EvidenceKind::ProcessSample,
+                            investigation::EvidenceStatus::Unsupported,
+                            "The current assessment already refreshes process readings every two seconds; no process family is verified for this folder.",
+                        ),
+                    ),
+                },
                 "fs_usage" => {
                     let is_fseventsd = selected_command.as_deref().is_some_and(|command| {
                         Path::new(command)
@@ -1257,29 +1568,44 @@ impl Workspace {
                             .is_some_and(|name| name.eq_ignore_ascii_case("fseventsd"))
                     });
                     if is_fseventsd {
-                        InvestigationResult::Note(
-                            care::observe_fseventsd(&flag).unwrap_or_else(|error| {
-                                format!(
-                                    "Filesystem activity probe unavailable: {error}. It uses sudo -n and never opens a password prompt."
-                                )
-                            }),
-                        )
+                        InvestigationResult::Observation(care::observe_fseventsd(&flag))
                     } else {
-                        InvestigationResult::Note(
-                            "Filesystem activity tracing is limited to the selected fseventsd daemon.".into(),
+                        InvestigationResult::Observation(
+                            investigation::CheckObservation::unavailable(
+                                investigation::EvidenceKind::FilesystemActivity,
+                                investigation::EvidenceStatus::Unsupported,
+                                "Filesystem activity tracing is limited to the selected fseventsd daemon.",
+                            ),
                         )
                     }
                 }
-                "volume_context" => InvestigationResult::Note(
-                    care::observe_volume_context(&flag).unwrap_or_else(|error| {
-                        format!("Mounted-volume context unavailable: {error}")
-                    }),
+                "volume_context" => {
+                    InvestigationResult::Observation(care::observe_volume_context(&flag))
+                }
+                "research_sources" => InvestigationResult::Observation(
+                    match care::research_sources(&flag, online_research) {
+                        Ok(summary) => {
+                            let mut result = investigation::CheckObservation::complete(
+                                investigation::EvidenceKind::Research,
+                                summary,
+                            );
+                            result.source = Some("Apple documentation catalog".into());
+                            result
+                        }
+                        Err(error) => investigation::CheckObservation::unavailable(
+                            investigation::EvidenceKind::Research,
+                            investigation::EvidenceStatus::Failed,
+                            format!("Source research unavailable: {error}"),
+                        ),
+                    },
                 ),
-                "research_sources" => InvestigationResult::Note(
-                    care::research_sources(&flag)
-                        .unwrap_or_else(|error| format!("Source research unavailable: {error}")),
-                ),
-                _ => InvestigationResult::Note("Unsupported investigation check.".into()),
+                _ => {
+                    InvestigationResult::Observation(investigation::CheckObservation::unavailable(
+                        investigation::EvidenceKind::ProcessSample,
+                        investigation::EvidenceStatus::Unsupported,
+                        "Unsupported investigation check.",
+                    ))
+                }
             };
             if !flag.load(Ordering::Relaxed) {
                 let _ = sender.send(result);
@@ -1419,8 +1745,10 @@ impl Workspace {
         self.assessment = None;
         self.insight_work = None;
         self.triage_work = None;
+        self.decision_work = None;
         self.result_work = None;
         self.investigation = None;
+        self.pending_diagnostic_approval = None;
         self.pending_checks.clear();
         let actions = self.plan.clone();
         let home = app.account_home.clone();
@@ -1494,8 +1822,10 @@ impl Workspace {
         self.assessment = None;
         self.insight_work = None;
         self.triage_work = None;
+        self.decision_work = None;
         self.result_work = None;
         self.investigation = None;
+        self.pending_diagnostic_approval = None;
         self.pending_checks.clear();
         self.findings.clear();
         app.entries.clear();
@@ -1708,6 +2038,40 @@ impl Workspace {
         if self.screen == Screen::History && key.code == KeyCode::Char('i') {
             return true;
         }
+        if let Some(check) = self.pending_diagnostic_approval.clone() {
+            match key.code {
+                KeyCode::Char('a') => {
+                    self.pending_diagnostic_approval = None;
+                    self.pending_checks.push_front(check);
+                    self.note = Some(
+                        "Approved the fixed 8-second read-only trace. macOS authorization may be required."
+                            .into(),
+                    );
+                }
+                KeyCode::Esc => {
+                    self.pending_diagnostic_approval = None;
+                    if let Some(case) = &mut self.investigation_case {
+                        case.record_check(check.clone());
+                        case.add_evidence(investigation::evidence(
+                            format!("{}:{check}:declined", case.id),
+                            investigation::EvidenceKind::FilesystemActivity,
+                            &case.target,
+                            "The operator declined administrator-assisted tracing.",
+                            &[],
+                            &[],
+                            investigation::EvidenceStatus::Cancelled,
+                        ));
+                    }
+                    self.note = Some(
+                        "Administrator-assisted tracing skipped. The case will continue with other evidence."
+                            .into(),
+                    );
+                    self.persist(app);
+                }
+                _ => {}
+            }
+            return true;
+        }
         if self.detail && key.code == KeyCode::Esc {
             self.detail = false;
             self.detail_scroll = 0;
@@ -1766,10 +2130,25 @@ impl Workspace {
             KeyCode::Enter if self.focus==0=>self.focus=1,
             KeyCode::Char('p')=>{self.reviewing=true;self.review_scroll=0;self.acknowledgement.clear();self.signals_ack=false;self.moves_ack=false;},
             KeyCode::Char('M')=>self.motion= !self.motion,
+            KeyCode::Char('R')=>{
+                let enabled=!self.online_research;
+                match care::set_online_research(&app.account_home,enabled){
+                    Ok(())=>{
+                        self.online_research=enabled;
+                        if enabled && let Some(case)=&mut self.investigation_case && case.available_checks(true).iter().any(|check| check.id == "research_sources") {
+                            case.phase=investigation::CasePhase::Checking;
+                            case.conclusion=None;
+                            self.investigation_deadline=Some(Instant::now()+investigation::EXPLICIT_CASE_WINDOW);
+                        }
+                        self.note=Some(if enabled{"Online research enabled. The app may fetch only its fixed Apple documentation URLs; local paths, traces, process arguments, and generated queries are excluded."}else{"Online research disabled. Bundled reference notes remain available."}.into())
+                    },
+                    Err(error)=>self.note=Some(format!("Research preference could not be saved: {error}")),
+                }
+            },
             KeyCode::Char('A')=>{thread::spawn(||{let _=Command::new("/usr/bin/open").args(["-b","com.apple.systempreferences"]).status();});},
             KeyCode::Char('d')=>{self.detail= !self.detail;self.detail_scroll=0;},
             KeyCode::Char('r')=>{if self.plan.is_empty(){self.recheck(app);}else{self.note=Some("Review or clear the pending plan before rechecking.".into());}},
-            KeyCode::Char('?')=>self.note=Some("Tab: menu/content · arrows: choose · Enter: inspect · Space: add/remove action · i: AI investigation · e: explore · P: processes · m: move · p: review plan · f: all findings · K: keep · r: recheck · M: motion · q: quit".into()),
+            KeyCode::Char('?')=>self.note=Some("Tab: menu/content · arrows: choose · Enter: inspect · Space: add/remove action · i: AI investigation · a: approve a pending diagnostic · R: online research · e: explore · P: processes · m: move · p: review plan · f: all findings · K: keep · r: recheck · M: motion · q: quit".into()),
             KeyCode::Char('P')=>{app.phase=Phase::Processes;self.legacy=true;},
             KeyCode::Char('i')=>self.start_ai(app,true,true,false),
             KeyCode::Char('f')=>{self.show_all= !self.show_all;self.cursor=0;},
@@ -2381,8 +2760,29 @@ fn render_evidence(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) 
                             .map(|_| "\n\nLOCAL AI OUTCOME\nInterpreting the recorded observations…".into())
                     })
                     .unwrap_or_default();
+                let investigations = if s.investigations.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "\n\nINVESTIGATIONS\n{}",
+                        s.investigations
+                            .iter()
+                            .map(|case| format!(
+                                "{} · {:?} · checks {} · evidence {}\n{}",
+                                case.target,
+                                case.phase,
+                                case.decision_count,
+                                case.evidence.len(),
+                                case.conclusion
+                                    .as_deref()
+                                    .unwrap_or("No evidence-bounded conclusion recorded.")
+                            ))
+                            .collect::<Vec<_>>()
+                            .join("\n\n")
+                    )
+                };
                 format!(
-                    "{}\n\nMeasured removal: {}\nFree space: {} → {}\n\nBEFORE\n{}\n\nAFTER\n{}\n\nThese are observations, not proof of a performance improvement.\n\n{}{}",
+                    "{}\n\nMeasured removal: {}\nFree space: {} → {}\n\nBEFORE\n{}\n\nAFTER\n{}\n\nThese are observations, not proof of a performance improvement.\n\n{}{}{}",
                     s.state,
                     format_kb(s.actions.iter().map(|a| a.removed_kb).sum()),
                     s.free_before_kb.map(format_kb).unwrap_or_else(|| "unavailable".into()),
@@ -2390,6 +2790,7 @@ fn render_evidence(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) 
                     s.before.as_ref().map(Metrics::describe).unwrap_or_else(|| "not measured".into()),
                     s.after.as_ref().map(Metrics::describe).unwrap_or_else(|| "not measured".into()),
                     s.actions.iter().map(|a| format!("{}\n{}", a.target, a.result)).collect::<Vec<_>>().join("\n\n"),
+                    investigations,
                     outcome
                 )
             })
@@ -2405,18 +2806,20 @@ fn render_evidence(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) 
         return;
     }
     let parts = Layout::vertical([
-        Constraint::Length(7.min(area.height / 3)),
+        Constraint::Length(11.min(area.height / 3)),
         Constraint::Percentage(38),
         Constraint::Min(4),
         Constraint::Length(1),
     ])
     .split(area);
-    let active = w.insight_work.is_some() || w.investigation.is_some();
+    let active = w.insight_work.is_some() || w.decision_work.is_some() || w.investigation.is_some();
     let title = if let Some(work) = &w.insight_work {
         format!(
             " LOCAL AI · comparing evidence · {}s ",
             work.started.elapsed().as_secs()
         )
+    } else if w.decision_work.is_some() {
+        " LOCAL AI · choosing the next diagnostic step ".into()
     } else if w.investigation.is_some() {
         " INVESTIGATION · measuring selected evidence ".into()
     } else if w.insight.is_some() {
@@ -2440,25 +2843,84 @@ fn render_evidence(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) 
                 })
                 .map(|hypothesis| hypothesis.label.as_str())
                 .collect::<Vec<_>>();
+            let usable = case
+                .evidence
+                .iter()
+                .filter(|evidence| evidence.status.can_support_hypothesis())
+                .count();
+            let latest = case
+                .evidence
+                .last()
+                .map(|evidence| {
+                    format!(
+                        "\nLatest · {} · {}",
+                        evidence.status.label(),
+                        truncate_middle(&evidence.summary, 120)
+                    )
+                })
+                .unwrap_or_default();
+            let next = w
+                .pending_diagnostic_approval
+                .as_ref()
+                .map(|_| "Approval needed · a approve · Esc skip".into())
+                .or_else(|| w.agent_decision_reason.clone())
+                .unwrap_or_else(|| "Assessing the next useful distinction".into());
+            let step = match case.phase {
+                investigation::CasePhase::Observing => 0,
+                investigation::CasePhase::Checking
+                | investigation::CasePhase::Researching
+                | investigation::CasePhase::AwaitingApproval => 2,
+                investigation::CasePhase::Verifying => 3,
+                investigation::CasePhase::Complete
+                | investigation::CasePhase::Inconclusive => 4,
+            };
+            let path = ["OBSERVE", "CHOOSE", "CHECK", "VERIFY", "DECIDE"]
+                .iter()
+                .enumerate()
+                .map(|(index, label)| {
+                    format!(
+                        "{} {label}",
+                        if index < step {
+                            "●"
+                        } else if index == step {
+                            "◆"
+                        } else {
+                            "○"
+                        }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ━ ");
             format!(
-                "\n\nINVESTIGATION · {:?}\nChecks {} / {} · Evidence {}\nLeading: {}",
+                "\nAGENT PATH · {path}\nINVESTIGATION · {:?} · Checks {} / {} · Usable evidence {} / {}\nLeading · {}{latest}\nNext · {} · Research {}",
                 case.phase,
                 case.decision_count,
                 case.decision_budget,
+                usable,
                 case.evidence.len(),
                 if leading.is_empty() {
                     "none yet".into()
                 } else {
                     leading.join("; ")
-                }
+                },
+                truncate_middle(&next, 100),
+                if w.online_research {
+                    "on"
+                } else {
+                    "off [R]"
+                },
             )
         })
         .unwrap_or_default();
     let framework_line = format!("Local AI: {}", w.ai_framework.description());
     let ai_text = if active {
-        format!(
-            "{framework_line}\nReading measured evidence. Your findings and controls remain available.{investigation_summary}"
-        )
+        if investigation_summary.is_empty() {
+            format!(
+                "{framework_line}\nReading measured evidence. Your findings and controls remain available."
+            )
+        } else {
+            format!("{framework_line}{investigation_summary}")
+        }
     } else if let Some(insight) = &w.insight {
         format!(
             "{framework_line}\n{}\nFor: {}{}",
@@ -3294,6 +3756,16 @@ mod tests {
         });
         w.rebuild(&app);
         w.insight=Some(ai::Insight{summary:"The package cache can be rebuilt. Clearing it trades disk space for a future download.".into(),evidence_ids:vec![w.findings[0].id.clone()],action_ids:vec![],next_checks:vec![]});
+        let mut preview_case = investigation::InvestigationCase::new_developer(
+            "/Users/example/Library/Caches/pip",
+            w.revision,
+            false,
+        );
+        preview_case.phase = investigation::CasePhase::Checking;
+        preview_case.record_check("inspect_children");
+        w.investigation_case = Some(preview_case);
+        w.agent_decision_reason =
+            Some("Checking whether current work still uses this cache.".into());
         w.volume = Some(crate::storage::VolumeStats {
             accounting_path: PathBuf::from("/"),
             filesystem: "synthetic".into(),
@@ -3366,5 +3838,39 @@ mod tests {
             .draw(|frame| render(frame, frame.area(), &app, &w))
             .unwrap();
         assert_eq!(&before, terminal.backend().buffer());
+    }
+
+    #[test]
+    fn administrator_diagnostic_waits_for_approval_and_decline_is_not_evidence() {
+        let (_home, mut app, mut w) = fixture();
+        let case = investigation::InvestigationCase::new_fseventsd("fseventsd", 1, false);
+        let available = case.available_checks(false);
+        w.investigation_case = Some(case);
+        w.accept_agent_decision(
+            investigation::AgentDecision::Check {
+                check: "fs_usage".into(),
+                reason: "Distinguish paging from ordinary filesystem activity.".into(),
+                evidence_ids: vec![],
+                hypothesis_ids: vec!["filesystem_activity".into()],
+            },
+            &available,
+        );
+        assert_eq!(w.pending_diagnostic_approval.as_deref(), Some("fs_usage"));
+        assert_eq!(
+            w.investigation_case.as_ref().unwrap().phase,
+            investigation::CasePhase::AwaitingApproval
+        );
+
+        press(&mut w, &mut app, KeyCode::Esc);
+        let case = w.investigation_case.as_ref().unwrap();
+        assert!(w.pending_diagnostic_approval.is_none());
+        assert_eq!(
+            case.evidence[0].status,
+            investigation::EvidenceStatus::Cancelled
+        );
+        assert!(case.hypotheses.iter().all(|hypothesis| {
+            hypothesis.supporting_evidence.is_empty()
+                && hypothesis.status == investigation::HypothesisStatus::Open
+        }));
     }
 }

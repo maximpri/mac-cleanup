@@ -76,19 +76,30 @@ in Finder. No separate terminal commands are required.
 
 **Local AI** first ranks measured key areas and eligible quick wins, then explains
 supplied evidence and tradeoffs. Triage can only reorder Rust-approved findings;
-it cannot create cleanup targets or change eligibility. `i` on a finding can
-request up to three permitted read-only checks: children, current process
-readings, open handles, or history comparison. Unsupported references are
+it cannot create cleanup targets or change eligibility. `i` opens a bounded case
+with competing hypotheses. Apple Foundation Models chooses one check at a time
+from the exact Rust-provided set, reads the typed result, and either selects the
+next useful distinction or finishes as supported/inconclusive. Folder children,
+current process identity, open handles, complete history, volume context, and a
+fixed `fseventsd` trace are the available collectors. Failed, denied, timed-out,
+and unsupported checks cannot support a conclusion. Unsupported references are
 rejected, and explanations expire when supporting evidence changes. Inference
-has a timeout and pauses under critical memory pressure. A cyan/violet sweep
-runs only during actual inference or investigation; completion briefly accents
-the result. `M`, `REDUCE_MOTION`, and `NO_COLOR` provide static presentation.
-Animation stops when the terminal reports focus loss.
-The top status line and AI pane show Apple Foundation Models availability:
-detecting, available, unavailable, or helper missing. AI ranks findings using
-short IDs that the app maps back to measured findings. Visible explanations
-come from verified app facts. If a triage response is malformed, the app says
-why and shows measured policy ordering instead of labeling it as AI-ranked.
+has a timeout and pauses under elevated memory pressure. The AI pane draws a
+live **Observe → Choose → Check → Verify → Decide** path plus a cyan/violet work
+sweep; completion briefly accents the result. `M`, `REDUCE_MOTION`, and
+`NO_COLOR` provide static presentation. Animation stops when the terminal loses
+focus.
+The top status line and AI pane show Apple Foundation Models availability,
+helper version, model context size, dynamic-schema support, and whether token
+preflight is available. AI ranks findings using short IDs that the app maps back
+to measured findings. Visible explanations cite verified app facts. If a model
+response is malformed, the app says why and uses measured policy ordering.
+
+`R` controls saved one-time consent for online research. When enabled, the app
+fetches only its fixed Apple documentation catalog and supplies short excerpts
+as typed research evidence. It never builds a model-generated URL or sends local
+paths, file contents, process arguments, or raw traces. Local Apple FM inference
+remains on-device whether research is on or off.
 
 **Review plan** lists exact cleanup paths, process identities and signals, and
 relocation destinations with tradeoffs. `Space` adds/removes a finding's action;
@@ -134,6 +145,8 @@ minimum size. Colors supplement text labels; `--no-color` is supported.
 | `r` | Recheck storage and activity. |
 | `PgUp` / `PgDn` | Scroll evidence or review details. |
 | `M` / `A` | Toggle motion / open System Settings for Apple Intelligence. |
+| `a` | Approve a pending fixed administrator-assisted diagnostic. |
+| `R` | Enable/disable saved fixed-catalog online research consent. |
 | `?` | Show the keyboard guide in the evidence pane. |
 | `Esc` | Back/cancel; during execution, request stop after current action. |
 | `q` | Quit when no action is running. |
@@ -163,12 +176,11 @@ PID, current-account ownership, parent PID, and start time again to guard
 against PID reuse. A previously flagged process that recovered is also
 protected. Mac Cleanup never signals itself or an ancestor process.
 `--analyze` disables process actions, and `--clean --yes` never kills processes
-unattended. For `fseventsd`, `i` can request a bounded `sudo -n fs_usage -w -f
-filesys fseventsd` sample when an existing authorization is available; the app
-never signals the daemon. The investigation can continue with mounted-volume
-context and a fixed Apple source catalog. Set `MAC_CLEANUP_RESEARCH=1` to allow
-those fixed URLs to be fetched; paths, usernames, and raw logs are never sent
-as research queries.
+unattended. For `fseventsd`, `i` can propose a fixed eight-second
+`fs_usage -w -f filesys -t 8 fseventsd` sample. The app waits for `a`; macOS then
+owns the administrator authorization prompt. Declining or failing authorization
+is recorded as unusable evidence, and the case continues with mounted-volume
+context or bundled Apple reference notes. The app never signals the daemon.
 
 ## Scan another volume
 

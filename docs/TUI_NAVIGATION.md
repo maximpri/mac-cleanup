@@ -32,11 +32,16 @@ Esc cancels and Delete clears the plan. Mixed plans require `s` to acknowledge
 signals and `m` to acknowledge relocation before `APPLY`. Execution cannot
 start from menu clicks, AI output, or row selection.
 
-Local inference and read-only investigation have distinct labels. A moving
-cyan/violet accent represents real outstanding work. Completion briefly accents
-the result. `M`, `REDUCE_MOTION`, no-color mode, and terminal focus loss suppress
-motion. Model explanations identify their evidence scope and expire when that
-evidence changes. Measured facts remain usable without AI.
+Local inference and read-only investigation have distinct labels. The AI pane
+shows an **Observe → Choose → Check → Verify → Decide** path, check/evidence
+budgets, the current leading hypothesis, and whether research is enabled. A
+moving cyan/violet accent represents real outstanding work. Completion briefly
+accents the result. `M`, `REDUCE_MOTION`, no-color mode, and terminal focus loss
+suppress motion. Model explanations identify their evidence scope and expire
+when that evidence changes. `R` saves or revokes consent for the fixed Apple
+documentation catalog. A pending administrator-assisted read-only diagnostic
+accepts `a` or `Esc`; no authorization prompt appears before that choice.
+Measured facts remain usable without AI.
 
 History keeps results open and permits scrolling through exact outcomes.
 `r` starts a fresh assessment after the plan is empty. It does not claim that

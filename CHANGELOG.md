@@ -15,8 +15,23 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Progressive assessment, sampled CPU/pressure evidence, private local outcome
   history, persistent results, and before/after observations.
 - Swift helper protocol checks and unified-workflow terminal smoke coverage.
+- Apple Foundation Models protocol v2 with correlated requests, capability and
+  context reporting, token preflight, and dynamically constrained evidence,
+  action, hypothesis, and diagnostic IDs.
+- Adaptive bounded investigation cases with competing hypotheses and typed
+  evidence outcomes across storage, process, filesystem, capacity, and developer
+  data; cases and conclusions are retained in private local History.
+- Explicit approval for the fixed administrator-assisted `fseventsd` trace and
+  saved consent for fixed-catalog Apple documentation research.
 
 ### Changed
+
+- Replaced fixed post-insight diagnostic sequencing with one-step Apple FM
+  decisions. Rust still owns every collector, timeout, evidence relationship,
+  action policy, and final reference validation. Failed or denied checks cannot
+  support a cause.
+- Added a visible Observe → Choose → Check → Verify → Decide path and live case
+  status to the AI pane.
 
 - Removed the empty Overview destination. The app now starts its read-only
   storage audit automatically and opens the Storage audit when it is ready;

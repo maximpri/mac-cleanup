@@ -1,4 +1,5 @@
 //! Bounded local inference. Structured suggestions never execute actions.
+use crate::investigation::{AgentDecision, AvailableCheck, CasePhase, InvestigationCase};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -13,7 +14,8 @@ use std::{
 };
 
 /// Bump when the helper instructions or response interpretation changes.
-pub const PROMPT_VERSION: &str = "care-triage-v3";
+pub const PROMPT_VERSION: &str = "care-agent-v4";
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameworkStatus {
@@ -89,10 +91,22 @@ pub fn cache_key(request: &Request) -> String {
 #[derive(Deserialize)]
 struct Response {
     protocol: u32,
+    request_id: Option<String>,
     available: bool,
     error: Option<String>,
     insight: Option<Insight>,
     triage: Option<Triage>,
+    decision: Option<AgentDecision>,
+    capabilities: Option<Capabilities>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct Capabilities {
+    helper_version: String,
+    provider: String,
+    context_size: Option<usize>,
+    token_counting: bool,
+    dynamic_schemas: bool,
 }
 
 /// Detect the framework used by the bundled local model helper without starting
@@ -132,7 +146,7 @@ pub fn framework_status() -> FrameworkStatus {
             detail: "helper input unavailable".into(),
         };
     };
-    if writeln!(stdin, "{{\"protocol\":1,\"operation\":\"availability\"}}").is_err() {
+    if writeln!(stdin, "{{\"protocol\":{PROTOCOL_VERSION},\"request_id\":\"availability\",\"operation\":\"capabilities\"}}").is_err() {
         let _ = child.kill();
         let _ = child.wait();
         return FrameworkStatus::Unavailable {
@@ -156,7 +170,7 @@ pub fn framework_status() -> FrameworkStatus {
     });
     let started = Instant::now();
     loop {
-        if started.elapsed() > Duration::from_secs(3) {
+        if started.elapsed() > Duration::from_secs(5) {
             let _ = child.kill();
             let _ = child.wait();
             let _ = reader.join();
@@ -187,15 +201,39 @@ pub fn framework_status() -> FrameworkStatus {
                         };
                     }
                 };
-                if response.protocol != 1 {
+                if response.protocol != PROTOCOL_VERSION
+                    || response.request_id.as_deref() != Some("availability")
+                {
                     return FrameworkStatus::Unavailable {
                         detail: "helper protocol mismatch".into(),
                     };
                 }
                 return if response.available {
-                    FrameworkStatus::Available {
-                        detail: String::new(),
-                    }
+                    let detail = response
+                        .capabilities
+                        .map(|capabilities| {
+                            format!(
+                                " · {} · {} · context {} · {} · {}",
+                                display_text(&capabilities.provider),
+                                display_text(&capabilities.helper_version),
+                                capabilities
+                                    .context_size
+                                    .map(|size| size.to_string())
+                                    .unwrap_or_else(|| "unknown".into()),
+                                if capabilities.dynamic_schemas {
+                                    "constrained decisions"
+                                } else {
+                                    "basic schemas"
+                                },
+                                if capabilities.token_counting {
+                                    "token preflight"
+                                } else {
+                                    "byte preflight"
+                                }
+                            )
+                        })
+                        .unwrap_or_default();
+                    FrameworkStatus::Available { detail }
                 } else {
                     FrameworkStatus::Unavailable {
                         detail: display_text(&response.error.unwrap_or_else(|| {
@@ -369,7 +407,20 @@ pub fn triage(request: &Request, cancelled: &Arc<AtomicBool>) -> Result<Triage, 
     if prompt.len() > 10_000 {
         return Err("Select fewer findings for local triage.".into());
     }
-    let payload = serde_json::json!({"protocol":1,"operation":"triage","prompt":prompt});
+    let request_id = format!("triage:{}", request.revision);
+    let key_areas = request
+        .subjects
+        .iter()
+        .filter(|subject| !subject.quick_win)
+        .map(|subject| subject.id.clone())
+        .collect::<Vec<_>>();
+    let quick_wins = request
+        .subjects
+        .iter()
+        .filter(|subject| subject.quick_win)
+        .map(|subject| subject.id.clone())
+        .collect::<Vec<_>>();
+    let payload = serde_json::json!({"protocol":PROTOCOL_VERSION,"request_id":request_id,"operation":"triage","prompt":prompt,"allowed_key_areas":key_areas,"allowed_quick_wins":quick_wins});
     let mut child = Command::new(helper)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -410,7 +461,9 @@ pub fn triage(request: &Request, cancelled: &Arc<AtomicBool>) -> Result<Triage, 
                 }
                 let response: Response =
                     serde_json::from_str(output.trim()).map_err(|_| "Invalid Apple AI response")?;
-                if response.protocol != 1 {
+                if response.protocol != PROTOCOL_VERSION
+                    || response.request_id.as_deref() != Some(request_id.as_str())
+                {
                     return Err("Apple AI helper version mismatch.".into());
                 }
                 if !response.available {
@@ -435,6 +488,135 @@ pub fn triage(request: &Request, cancelled: &Arc<AtomicBool>) -> Result<Triage, 
         }
     }
 }
+
+/// Ask the on-device model for exactly one next diagnostic step. Rust supplies
+/// the complete allowed set and validates the returned references before the
+/// caller may execute anything.
+pub fn decide(
+    case: &InvestigationCase,
+    available: &[AvailableCheck],
+    cancelled: &Arc<AtomicBool>,
+) -> Result<AgentDecision, String> {
+    if available.is_empty() {
+        return Ok(AgentDecision::Finish {
+            conclusion: case.conclusion_text(),
+            phase: CasePhase::Inconclusive,
+            evidence_ids: case
+                .evidence
+                .iter()
+                .filter(|evidence| evidence.status.can_support_hypothesis())
+                .map(|evidence| evidence.id.clone())
+                .take(4)
+                .collect(),
+        });
+    }
+    let helper = std::env::current_exe()
+        .map_err(|error| error.to_string())?
+        .with_file_name("mac-cleanup-ai");
+    if !helper.is_file() {
+        return Err("Apple AI helper missing. Install the release bundle or build with scripts/build-release.sh.".into());
+    }
+    let packet = serde_json::json!({
+        "case_id": case.id,
+        "revision": case.revision,
+        "target": case.target,
+        "phase": case.phase,
+        "decision_count": case.decision_count,
+        "decision_budget": case.decision_budget,
+        "hypotheses": case.hypotheses,
+        "evidence": case.evidence,
+        "available_checks": available,
+    });
+    let prompt = serde_json::to_string(&packet).map_err(|error| error.to_string())?;
+    if prompt.len() > 14_000 {
+        return Err("Investigation evidence exceeds the local decision context.".into());
+    }
+    let request_id = format!("decision:{}:{}", case.id, case.decision_count);
+    let payload = serde_json::json!({
+        "protocol": PROTOCOL_VERSION,
+        "request_id": request_id,
+        "operation": "decide",
+        "prompt": prompt,
+        "allowed_checks": available.iter().map(|check| check.id.clone()).collect::<Vec<_>>(),
+        "allowed_evidence": case.evidence.iter().map(|evidence| evidence.id.clone()).collect::<Vec<_>>(),
+        "allowed_hypotheses": case.hypotheses.iter().map(|hypothesis| hypothesis.id.clone()).collect::<Vec<_>>(),
+    });
+    let mut child = Command::new(helper)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let mut stdin = child.stdin.take().ok_or("Missing helper input")?;
+    if let Err(error) = writeln!(stdin, "{payload}") {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error.to_string());
+    }
+    drop(stdin);
+    let stdout = child.stdout.take().ok_or("Missing helper output")?;
+    let reader = thread::spawn(move || {
+        let mut output = String::new();
+        stdout
+            .take(32_769)
+            .read_to_string(&mut output)
+            .map(|_| output)
+    });
+    let started = Instant::now();
+    loop {
+        if cancelled.load(Ordering::Relaxed) || started.elapsed() > Duration::from_secs(20) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            return Err("Local investigation decision stopped.".into());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let output = reader
+                    .join()
+                    .map_err(|_| "AI reader stopped")?
+                    .map_err(|error| error.to_string())?;
+                if !status.success() || output.len() > 32_768 {
+                    return Err("Apple AI helper failed.".into());
+                }
+                let response: Response =
+                    serde_json::from_str(output.trim()).map_err(|_| "Invalid Apple AI response")?;
+                if response.protocol != PROTOCOL_VERSION
+                    || response.request_id.as_deref() != Some(request_id.as_str())
+                {
+                    return Err("Apple AI helper version or request mismatch.".into());
+                }
+                if !response.available {
+                    return Err(response.error.unwrap_or_else(|| {
+                        "Enable Apple Intelligence and allow its model to download.".into()
+                    }));
+                }
+                if let Some(error) = response.error {
+                    return Err(display_text(&error));
+                }
+                let mut decision = response
+                    .decision
+                    .ok_or("No investigation decision returned")?;
+                match &mut decision {
+                    AgentDecision::Check { reason, .. } => *reason = display_text(reason),
+                    AgentDecision::Finish { conclusion, .. } => {
+                        *conclusion = display_text(conclusion)
+                    }
+                    AgentDecision::Research { .. } | AgentDecision::AwaitApproval { .. } => {}
+                }
+                case.validate_decision(&decision, available)?;
+                return Ok(decision);
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err(error.to_string());
+            }
+        }
+    }
+}
 /// Summarize already-completed outcomes. The request contains no executable targets.
 pub fn summarize(request: &Request, cancelled: &Arc<AtomicBool>) -> Result<Insight, String> {
     let helper = std::env::current_exe()
@@ -447,7 +629,16 @@ pub fn summarize(request: &Request, cancelled: &Arc<AtomicBool>) -> Result<Insig
     if prompt.len() > 10_000 {
         return Err("Action results are too large for a local summary.".into());
     }
-    let payload = serde_json::json!({"protocol":1,"operation":"result","prompt":prompt});
+    let request_id = format!("result:{}", request.revision);
+    let payload = serde_json::json!({
+        "protocol":PROTOCOL_VERSION,
+        "request_id":request_id,
+        "operation":"result",
+        "prompt":prompt,
+        "allowed_evidence":request.subjects.iter().map(|subject| subject.id.clone()).collect::<Vec<_>>(),
+        "allowed_actions":[],
+        "allowed_checks":[],
+    });
     let mut child = Command::new(helper)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -488,7 +679,9 @@ pub fn summarize(request: &Request, cancelled: &Arc<AtomicBool>) -> Result<Insig
                 }
                 let response: Response =
                     serde_json::from_str(output.trim()).map_err(|_| "Invalid Apple AI response")?;
-                if response.protocol != 1 {
+                if response.protocol != PROTOCOL_VERSION
+                    || response.request_id.as_deref() != Some(request_id.as_str())
+                {
                     return Err("Apple AI helper version mismatch.".into());
                 }
                 if !response.available {
@@ -529,7 +722,16 @@ fn explain_once(request: &Request, cancelled: &Arc<AtomicBool>) -> Result<Insigh
     if prompt.len() > 10_000 {
         return Err("Select fewer findings for a local insight.".into());
     }
-    let payload = serde_json::json!({"protocol":1,"operation":"explain","prompt":prompt});
+    let request_id = format!("explain:{}", request.revision);
+    let payload = serde_json::json!({
+        "protocol":PROTOCOL_VERSION,
+        "request_id":request_id,
+        "operation":"explain",
+        "prompt":prompt,
+        "allowed_evidence":request.subjects.iter().map(|subject| subject.id.clone()).collect::<Vec<_>>(),
+        "allowed_actions":request.subjects.iter().flat_map(|subject| subject.action_ids.clone()).collect::<Vec<_>>(),
+        "allowed_checks":if request.investigation { vec!["inspect_children","refresh_processes","check_open_handles","compare_history","fs_usage","volume_context","research_sources"] } else { vec![] },
+    });
     let mut child = Command::new(helper)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -570,7 +772,9 @@ fn explain_once(request: &Request, cancelled: &Arc<AtomicBool>) -> Result<Insigh
                 }
                 let response: Response =
                     serde_json::from_str(output.trim()).map_err(|_| "Invalid Apple AI response")?;
-                if response.protocol != 1 {
+                if response.protocol != PROTOCOL_VERSION
+                    || response.request_id.as_deref() != Some(request_id.as_str())
+                {
                     return Err("Apple AI helper version mismatch.".into());
                 }
                 if !response.available {

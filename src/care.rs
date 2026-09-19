@@ -2,6 +2,7 @@
 use crate::{
     ai,
     cache::{self, CacheEntry, CacheStatus, CacheTier},
+    investigation::{CheckObservation, EvidenceKind, EvidenceStatus},
     processes::{self, ProcessEntry},
     storage::{self, StorageInventory, VolumeStats},
     whitelist::Whitelist,
@@ -24,6 +25,7 @@ use std::{
 };
 
 pub const HISTORY_SUBPATH: &str = "Library/Application Support/mac-cleanup/sessions";
+pub const SETTINGS_SUBPATH: &str = "Library/Application Support/mac-cleanup/settings.json";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -150,35 +152,44 @@ pub fn query(program: &str, args: &[&str], timeout: Duration) -> io::Result<Stri
     }
 }
 
-/// Capture a short, read-only filesystem-activity sample for fseventsd.
-/// `sudo -n` is deliberate: an interactive password prompt must never appear
-/// inside the TUI. A missing cached authorization is reported as unavailable.
-pub fn observe_fseventsd(cancel_requested: &AtomicBool) -> Result<String, String> {
-    let mut child = Command::new("/usr/bin/sudo")
-        .args([
-            "-n",
-            "/usr/bin/fs_usage",
-            "-w",
-            "-f",
-            "filesys",
-            "fseventsd",
-        ])
+/// Capture a short, read-only filesystem-activity sample for fseventsd. The
+/// caller must obtain explicit in-app approval first. macOS owns the
+/// administrator prompt; this process never reads or stores a password.
+pub fn observe_fseventsd(cancel_requested: &AtomicBool) -> CheckObservation {
+    const SCRIPT: &str = "do shell script \"/usr/bin/fs_usage -w -f filesys -t 8 fseventsd\" with administrator privileges";
+    let child = Command::new("/usr/bin/osascript")
+        .args(["-e", SCRIPT])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("filesystem activity probe unavailable: {error}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "filesystem activity probe returned no output".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "filesystem activity probe returned no diagnostics".to_string())?;
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            return CheckObservation::unavailable(
+                EvidenceKind::FilesystemActivity,
+                EvidenceStatus::Unsupported,
+                format!("Filesystem activity probe unavailable: {error}"),
+            );
+        }
+    };
+    let Some(stdout) = child.stdout.take() else {
+        return CheckObservation::unavailable(
+            EvidenceKind::FilesystemActivity,
+            EvidenceStatus::Failed,
+            "Filesystem activity probe returned no output.",
+        );
+    };
+    let Some(stderr) = child.stderr.take() else {
+        return CheckObservation::unavailable(
+            EvidenceKind::FilesystemActivity,
+            EvidenceStatus::Failed,
+            "Filesystem activity probe returned no diagnostics.",
+        );
+    };
     let output_reader = thread::spawn(move || {
         let mut output = String::new();
         stdout
-            .take(64_001)
+            .take(1_000_001)
             .read_to_string(&mut output)
             .map(|_| output)
     });
@@ -196,11 +207,15 @@ pub fn observe_fseventsd(cancel_requested: &AtomicBool) -> Result<String, String
             let _ = child.wait();
             let _ = output_reader.join();
             let _ = error_reader.join();
-            return Err("filesystem activity probe cancelled".into());
+            return CheckObservation::unavailable(
+                EvidenceKind::FilesystemActivity,
+                EvidenceStatus::Cancelled,
+                "Filesystem activity probe cancelled.",
+            );
         }
         match child.try_wait() {
             Ok(Some(_)) => break false,
-            Ok(None) if started.elapsed() < Duration::from_secs(8) => {
+            Ok(None) if started.elapsed() < Duration::from_secs(10) => {
                 thread::sleep(Duration::from_millis(50));
             }
             Ok(None) => {
@@ -213,64 +228,139 @@ pub fn observe_fseventsd(cancel_requested: &AtomicBool) -> Result<String, String
                 let _ = child.wait();
                 let _ = output_reader.join();
                 let _ = error_reader.join();
-                return Err(format!("filesystem activity probe failed: {error}"));
+                return CheckObservation::unavailable(
+                    EvidenceKind::FilesystemActivity,
+                    EvidenceStatus::Failed,
+                    format!("Filesystem activity probe failed: {error}"),
+                );
             }
         }
     };
-    let output = output_reader
+    let output = match output_reader
         .join()
         .map_err(|_| "filesystem activity reader stopped".to_string())
-        .and_then(|result| result.map_err(|error| error.to_string()))?;
-    let error = error_reader
+        .and_then(|result| result.map_err(|error| error.to_string()))
+    {
+        Ok(output) => output,
+        Err(error) => {
+            return CheckObservation::unavailable(
+                EvidenceKind::FilesystemActivity,
+                EvidenceStatus::Failed,
+                error,
+            );
+        }
+    };
+    let error = match error_reader
         .join()
         .map_err(|_| "filesystem activity diagnostics stopped".to_string())
-        .and_then(|result| result.map_err(|error| error.to_string()))?;
-    let lines = output
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .take(12)
-        .map(ai::display_text)
-        .collect::<Vec<_>>();
-    if !lines.is_empty() {
-        let swap_events = lines
-            .iter()
-            .filter(|line| line.to_ascii_lowercase().contains("swapfile"))
-            .count();
-        let pattern = if swap_events > 0 {
-            format!(
-                "Pattern: {swap_events}/{} sampled lines mention VM swapfiles. This indicates fseventsd is observing swap-backed filesystem activity; it does not prove fseventsd caused memory pressure.",
-                lines.len()
-            )
-        } else {
-            "Pattern: no VM swapfile path appeared in the sampled lines.".into()
-        };
-        let timing = if timed_out {
-            "The 8-second sample reached its safety limit."
-        } else {
-            "The bounded sample completed."
-        };
-        return Ok(format!(
-            "{pattern}\n{timing}\nSampled filesystem events from fseventsd:\n{}",
-            lines.join("\n")
-        ));
+        .and_then(|result| result.map_err(|error| error.to_string()))
+    {
+        Ok(error) => error,
+        Err(error) => error,
+    };
+    if !output.lines().all(|line| line.trim().is_empty()) {
+        return summarize_fseventsd_sample(&output, timed_out);
     }
     let diagnostic = ai::display_text(error.trim());
-    Err(if diagnostic.is_empty() {
-        "No filesystem events were captured. Existing sudo authorization may be required.".into()
-    } else {
-        format!("No filesystem events captured: {diagnostic}")
-    })
+    let lowered = diagnostic.to_ascii_lowercase();
+    let cancelled = lowered.contains("user canceled") || lowered.contains("-128");
+    let permission = lowered.contains("not authorized")
+        || lowered.contains("administrator")
+        || lowered.contains("privilege");
+    CheckObservation::unavailable(
+        EvidenceKind::FilesystemActivity,
+        if cancelled {
+            EvidenceStatus::Cancelled
+        } else if permission {
+            EvidenceStatus::PermissionRequired
+        } else if timed_out {
+            EvidenceStatus::TimedOut
+        } else {
+            EvidenceStatus::Failed
+        },
+        if diagnostic.is_empty() {
+            "No filesystem events were captured.".into()
+        } else {
+            format!("No filesystem events captured: {diagnostic}")
+        },
+    )
+}
+
+fn summarize_fseventsd_sample(output: &str, timed_out: bool) -> CheckObservation {
+    let mut total = 0_usize;
+    let mut page_ins = 0_usize;
+    let mut page_outs = 0_usize;
+    let mut reads = 0_usize;
+    let mut writes = 0_usize;
+    let mut metadata = 0_usize;
+    let mut swap_paths = 0_usize;
+    let mut external_paths = 0_usize;
+    for raw in output.lines().filter(|line| !line.trim().is_empty()) {
+        let line = raw.to_ascii_lowercase();
+        total += 1;
+        page_ins += usize::from(line.contains("pgin"));
+        page_outs += usize::from(line.contains("pgout"));
+        reads += usize::from(line.contains(" read "));
+        writes += usize::from(line.contains(" write "));
+        metadata += usize::from(
+            line.contains(" getattrlist ")
+                || line.contains(" stat ")
+                || line.contains(" open ")
+                || line.contains(" lstat "),
+        );
+        swap_paths += usize::from(line.contains("/system/volumes/vm/swapfile"));
+        external_paths +=
+            usize::from(line.contains("/volumes/") && !line.contains("/system/volumes/"));
+    }
+    let ordinary_ops = reads + writes + metadata;
+    let mut observation = CheckObservation::complete(
+        EvidenceKind::FilesystemActivity,
+        format!(
+            "Eight-second fseventsd trace: {total} events · page-ins {page_ins} · page-outs {page_outs} · reads {reads} · writes {writes} · metadata {metadata} · VM swap paths {swap_paths} · external-volume paths {external_paths}. {} Thread-number suffixes in fs_usage output are not process IDs. Paging shows observed VM filesystem work; it does not prove an event storm or that fseventsd caused memory pressure.",
+            if timed_out {
+                "The outer safety deadline ended the sample."
+            } else {
+                "The requested sample completed."
+            }
+        ),
+    );
+    if timed_out || output.len() > 1_000_000 {
+        observation.status = EvidenceStatus::Partial;
+    }
+    if ordinary_ops > 0 {
+        observation.supports.push("filesystem_activity".into());
+    }
+    if external_paths > 0 {
+        observation.supports.push("volume_specific".into());
+    }
+    observation
 }
 
 /// Capture mounted-volume context without reading file contents or changing mounts.
-pub fn observe_volume_context(cancel_requested: &AtomicBool) -> Result<String, String> {
+pub fn observe_volume_context(cancel_requested: &AtomicBool) -> CheckObservation {
     if cancel_requested.load(Ordering::Relaxed) {
-        return Err("volume context check cancelled".into());
+        return CheckObservation::unavailable(
+            EvidenceKind::VolumeContext,
+            EvidenceStatus::Cancelled,
+            "Volume context check cancelled.",
+        );
     }
-    let mounts = query("/sbin/mount", &[], Duration::from_secs(3))
-        .map_err(|error| format!("mounted-volume inventory unavailable: {error}"))?;
+    let mounts = match query("/sbin/mount", &[], Duration::from_secs(3)) {
+        Ok(mounts) => mounts,
+        Err(error) => {
+            return CheckObservation::unavailable(
+                EvidenceKind::VolumeContext,
+                EvidenceStatus::Failed,
+                format!("Mounted-volume inventory unavailable: {error}"),
+            );
+        }
+    };
     if cancel_requested.load(Ordering::Relaxed) {
-        return Err("volume context check cancelled".into());
+        return CheckObservation::unavailable(
+            EvidenceKind::VolumeContext,
+            EvidenceStatus::Cancelled,
+            "Volume context check cancelled.",
+        );
     }
     let disk = query("/bin/df", &["-k", "-P"], Duration::from_secs(3))
         .unwrap_or_else(|_| "disk capacity details unavailable".into());
@@ -286,24 +376,37 @@ pub fn observe_volume_context(cancel_requested: &AtomicBool) -> Result<String, S
         .take(12)
         .map(ai::display_text)
         .collect::<Vec<_>>();
-    Ok(format!(
-        "Mounted-volume context (read-only):\n{}\nCapacity context:\n{}",
-        if mount_lines.is_empty() {
-            "unavailable".into()
-        } else {
-            mount_lines.join("\n")
-        },
-        if disk_lines.is_empty() {
-            "unavailable".into()
-        } else {
-            disk_lines.join("\n")
-        }
-    ))
+    let external_or_custom = mount_lines
+        .iter()
+        .filter(|line| line.contains(" on /Volumes/") || !line.contains("(apfs"))
+        .count();
+    let mut observation = CheckObservation::complete(
+        EvidenceKind::VolumeContext,
+        format!(
+            "Mounted-volume context (read-only):\n{}\nCapacity context:\n{}",
+            if mount_lines.is_empty() {
+                "unavailable".into()
+            } else {
+                mount_lines.join("\n")
+            },
+            if disk_lines.is_empty() {
+                "unavailable".into()
+            } else {
+                disk_lines.join("\n")
+            }
+        ),
+    );
+    if external_or_custom > 0 {
+        observation.summary.push_str(&format!(
+            "\nObserved {external_or_custom} external or non-APFS mount entries; presence alone does not establish activity."
+        ));
+    }
+    observation
 }
 
-/// Research a fixed, no-key source catalog. Network fetching is opt-in through
-/// MAC_CLEANUP_RESEARCH=1 so an automatic case never unexpectedly sends data.
-pub fn research_sources(cancel_requested: &AtomicBool) -> Result<String, String> {
+/// Research a fixed, no-key source catalog. The caller supplies the saved
+/// explicit network-consent state, so an automatic case never enables access.
+pub fn research_sources(cancel_requested: &AtomicBool, online: bool) -> Result<String, String> {
     const SOURCES: [(&str, &str); 2] = [
         (
             "Apple File System Events Programming Guide",
@@ -314,12 +417,13 @@ pub fn research_sources(cancel_requested: &AtomicBool) -> Result<String, String>
             "https://developer.apple.com/library/archive/documentation/Darwin/Reference/ManPages/man1/fs_usage.1.html",
         ),
     ];
-    let online = std::env::var("MAC_CLEANUP_RESEARCH").ok().as_deref() == Some("1");
     let mut lines = vec![if online {
         "Online research enabled for the fixed Apple source catalog.".into()
     } else {
-        "Online research is disabled. Showing the fixed source catalog; enable MAC_CLEANUP_RESEARCH=1 to fetch it.".into()
+        "Bundled Apple reference notes; online research is disabled.".into()
     }];
+    lines.push("Bundled · FSEvents stores per-volume event logs; clients may receive coarse notifications and must rescan affected hierarchy when events are coalesced.".into());
+    lines.push("Bundled · fs_usage reports system calls and page faults; PgIn/PgOut rows are paging observations, while a wide-mode process suffix is a thread identifier.".into());
     for (title, url) in SOURCES {
         if cancel_requested.load(Ordering::Relaxed) {
             return Err("source research cancelled".into());
@@ -338,7 +442,14 @@ pub fn research_sources(cancel_requested: &AtomicBool) -> Result<String, String>
                 ],
                 Duration::from_secs(6),
             )
-            .map(|body| format!("{} · fetched {} bytes", title, body.len()))
+            .map(|body| {
+                let excerpt = document_excerpt(&body, 900);
+                if excerpt.is_empty() {
+                    format!("{title} · fetched, but no readable excerpt was extracted")
+                } else {
+                    format!("{title} · excerpt: {excerpt}")
+                }
+            })
             .unwrap_or_else(|error| {
                 format!(
                     "{} · fetch unavailable: {}",
@@ -352,6 +463,45 @@ pub fn research_sources(cancel_requested: &AtomicBool) -> Result<String, String>
         }
     }
     Ok(lines.join("\n"))
+}
+
+fn document_excerpt(body: &str, limit: usize) -> String {
+    let mut text = String::with_capacity(limit);
+    let mut inside_tag = false;
+    let mut last_space = false;
+    for character in body.chars() {
+        match character {
+            '<' => inside_tag = true,
+            '>' => {
+                inside_tag = false;
+                if !last_space && !text.is_empty() {
+                    text.push(' ');
+                    last_space = true;
+                }
+            }
+            _ if inside_tag => {}
+            '&' => {
+                if !last_space && !text.is_empty() {
+                    text.push(' ');
+                    last_space = true;
+                }
+            }
+            value if value.is_whitespace() => {
+                if !last_space && !text.is_empty() {
+                    text.push(' ');
+                    last_space = true;
+                }
+            }
+            value => {
+                text.push(value);
+                last_space = false;
+            }
+        }
+        if text.len() >= limit {
+            break;
+        }
+    }
+    ai::display_text(text.trim())
 }
 fn cpu_seconds(value: &str) -> Option<f64> {
     let mut total = 0.;
@@ -834,6 +984,7 @@ pub struct RecordedAction {
     pub removed_kb: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Session {
     pub schema_version: u32,
     pub id: u64,
@@ -845,11 +996,12 @@ pub struct Session {
     pub free_before_kb: Option<u64>,
     pub free_after_kb: Option<u64>,
     pub measurements: HashMap<String, u64>,
+    pub investigations: Vec<crate::investigation::InvestigationCase>,
 }
 impl Default for Session {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             id: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -862,26 +1014,91 @@ impl Default for Session {
             free_before_kb: None,
             free_after_kb: None,
             measurements: HashMap::new(),
+            investigations: Vec::new(),
         }
     }
 }
-fn history_directory(home: &Path) -> io::Result<PathBuf> {
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Settings {
+    online_research: bool,
+}
+
+fn app_data_directory(home: &Path) -> io::Result<PathBuf> {
     if !fs::symlink_metadata(home)?.is_dir() {
-        return Err(io::Error::other("History home must be a real directory"));
+        return Err(io::Error::other(
+            "Application home must be a real directory",
+        ));
     }
     let mut directory = home.to_path_buf();
-    for component in Path::new(HISTORY_SUBPATH).components() {
+    for component in Path::new("Library/Application Support/mac-cleanup").components() {
         directory.push(component);
         match fs::symlink_metadata(&directory) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
                 return Err(io::Error::other(
-                    "History directory redirects or is not a directory",
+                    "Application data directory redirects or is not a directory",
                 ));
             }
             Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => fs::create_dir(&directory)?,
-            Err(e) => return Err(e),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(&directory)?,
+            Err(error) => return Err(error),
         }
+    }
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    Ok(directory)
+}
+
+pub fn online_research_enabled(home: &Path) -> bool {
+    let path = home.join(SETTINGS_SUBPATH);
+    let Ok(metadata) = fs::symlink_metadata(&path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 16_384 {
+        return false;
+    }
+    serde_json::from_slice::<Settings>(&fs::read(path).unwrap_or_default())
+        .is_ok_and(|settings| settings.online_research)
+}
+
+pub fn set_online_research(home: &Path, enabled: bool) -> io::Result<()> {
+    let directory = app_data_directory(home)?;
+    let target = directory.join("settings.json");
+    if fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(io::Error::other(
+            "Settings file redirects through a symlink",
+        ));
+    }
+    let temporary = directory.join(format!(".settings-{}.tmp", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    let bytes = serde_json::to_vec(&Settings {
+        online_research: enabled,
+    })?;
+    if let Err(error) = file
+        .write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .and_then(|_| fs::rename(&temporary, &target))
+    {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn history_directory(home: &Path) -> io::Result<PathBuf> {
+    let mut directory = app_data_directory(home)?;
+    directory.push("sessions");
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(io::Error::other(
+                "History directory redirects or is not a directory",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(&directory)?,
+        Err(error) => return Err(error),
     }
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
     Ok(directory)
@@ -965,7 +1182,7 @@ pub fn sessions(home: &Path) -> Vec<Session> {
                 session.state =
                     format!("Verification incomplete · {} · not resumed", session.state);
             }
-            (session.schema_version == 1).then_some(session)
+            matches!(session.schema_version, 1 | 2).then_some(session)
         })
         .collect::<Vec<_>>();
     results.sort_by_key(|s| std::cmp::Reverse(s.id));
@@ -1048,6 +1265,25 @@ mod tests {
         assert!(!finding.quick_win);
     }
     #[test]
+    fn fseventsd_trace_separates_paging_from_filesystem_operations() {
+        let paging = summarize_fseventsd_sample(
+            "15:41:40.014840 PgIn[S] D=0x1 B=0x1000 /System/Volumes/VM/swapfile10 0.0005 W fseventsd.74514539\n",
+            false,
+        );
+        assert!(paging.summary.contains("page-ins 1"));
+        assert!(paging.summary.contains("not process IDs"));
+        assert!(paging.supports.is_empty());
+
+        let activity = summarize_fseventsd_sample(
+            "15:41:40.021310 read F=4 B=0x1a1 /Volumes/Work/project 0.28 fseventsd.74514552\n",
+            false,
+        );
+        assert_eq!(
+            activity.supports,
+            vec!["filesystem_activity", "volume_specific"]
+        );
+    }
+    #[test]
     fn interrupted_sessions_are_not_resumed_and_clear_preserves_other_files() {
         let home = tempfile::tempdir().unwrap();
         let session = Session {
@@ -1075,5 +1311,55 @@ mod tests {
         std::os::unix::fs::symlink(other.path(), home.path().join("redirect")).unwrap();
         assert!(save_session(&home.path().join("redirect"), &session).is_err());
         assert!(sessions(&home.path().join("redirect")).is_empty());
+    }
+
+    #[test]
+    fn online_research_preference_is_private_and_persistent() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(!online_research_enabled(home.path()));
+        set_online_research(home.path(), true).unwrap();
+        assert!(online_research_enabled(home.path()));
+        let settings = fs::metadata(home.path().join(SETTINGS_SUBPATH)).unwrap();
+        assert_eq!(settings.permissions().mode() & 0o777, 0o600);
+        set_online_research(home.path(), false).unwrap();
+        assert!(!online_research_enabled(home.path()));
+    }
+
+    #[test]
+    fn document_excerpt_removes_markup_and_stays_bounded() {
+        let excerpt = document_excerpt(
+            "<html><head><title>Events</title></head><body><p>Per-volume event history.</p></body></html>",
+            48,
+        );
+        assert!(!excerpt.contains('<'));
+        assert!(excerpt.contains("Events"));
+        assert!(excerpt.len() <= 48);
+    }
+
+    #[test]
+    fn schema_one_history_remains_readable_with_empty_investigations() {
+        let home = tempfile::tempdir().unwrap();
+        let directory = history_directory(home.path()).unwrap();
+        let session = Session::default();
+        let legacy = serde_json::json!({
+            "schema_version": 1,
+            "id": session.id,
+            "updated": session.updated,
+            "state": "Assessment",
+            "actions": [],
+            "before": null,
+            "after": null,
+            "free_before_kb": null,
+            "free_after_kb": null,
+            "measurements": {}
+        });
+        fs::write(
+            directory.join(format!("{}.json", session.id)),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let loaded = sessions(home.path());
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].investigations.is_empty());
     }
 }
