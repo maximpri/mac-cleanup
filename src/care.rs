@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Shared assessment, policy, and outcome records for the visual care workflow.
 use crate::{
     ai,
@@ -24,8 +25,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub const HISTORY_SUBPATH: &str = "Library/Application Support/mac-cleanup/sessions";
-pub const SETTINGS_SUBPATH: &str = "Library/Application Support/mac-cleanup/settings.json";
+pub use crate::paths::{HISTORY_SUBPATH, SETTINGS_SUBPATH};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -88,7 +88,20 @@ pub enum Event {
     Entry(CacheEntry),
     Inventory(StorageInventory),
     Stage(String),
+    Progress(AssessmentProgress),
     Finished,
+}
+
+#[derive(Clone, Default)]
+pub enum AssessmentProgress {
+    #[default]
+    Starting,
+    Cleanup {
+        completed: usize,
+        total: usize,
+    },
+    Discovering,
+    Inventory(storage::ScanProgress),
 }
 pub struct Assessment {
     pub receiver: Receiver<Event>,
@@ -109,6 +122,18 @@ pub fn timestamp() -> u64 {
 
 /// Query with a hard deadline; no pressure-generation or privileged commands.
 pub fn query(program: &str, args: &[&str], timeout: Duration) -> io::Result<String> {
+    query_accepting(program, args, timeout, &[])
+}
+
+/// Like [`query`], but also accepts the listed non-zero exit codes. Some
+/// read-only tools (for example `lsof` with no matches) report "nothing
+/// found" through their exit status.
+pub fn query_accepting(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    accepted_codes: &[i32],
+) -> io::Result<String> {
     let mut child = Command::new(program)
         .args(args)
         .stdout(Stdio::piped())
@@ -133,7 +158,11 @@ pub fn query(program: &str, args: &[&str], timeout: Duration) -> io::Result<Stri
                 let data = reader
                     .join()
                     .map_err(|_| io::Error::other("reader stopped"))??;
-                return if status.success() && data.len() <= 2_000_000 {
+                let accepted = status.success()
+                    || status
+                        .code()
+                        .is_some_and(|code| accepted_codes.contains(&code));
+                return if accepted && data.len() <= 2_000_000 {
                     Ok(data)
                 } else {
                     Err(io::Error::other("query failed or exceeded output limit"))
@@ -402,6 +431,224 @@ pub fn observe_volume_context(cancel_requested: &AtomicBool) -> CheckObservation
         ));
     }
     observation
+}
+
+/// Processes holding files open anywhere under `path`, as `(pid, command)`.
+/// `lsof` exits 1 when nothing is open; that is a complete, empty answer.
+pub fn open_handle_owners(path: &Path, timeout: Duration) -> io::Result<Vec<(u32, String)>> {
+    let target = path
+        .to_str()
+        .ok_or_else(|| io::Error::other("path is not valid UTF-8"))?;
+    let output = query_accepting("/usr/sbin/lsof", &["-Fpc", "+D", target], timeout, &[1])?;
+    Ok(parse_lsof_owners(&output))
+}
+
+/// A heuristic guess at which app or tool owns a folder. It never proves ownership.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnerGuess {
+    pub owner: Option<String>,
+    pub basis: String,
+    pub app_path: Option<String>,
+    pub last_used: Option<String>,
+}
+
+fn bundle_like(value: &str) -> bool {
+    value.len() <= 120
+        && value.split('.').count() >= 2
+        && value.split('.').all(|part| {
+            !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+}
+
+fn app_name_like(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 80
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-'))
+}
+
+/// Guess the owner of `path` from well-known macOS layouts, then look up a
+/// matching installed app through Spotlight. Every query value is validated
+/// against a strict character set before it reaches `mdfind`.
+pub fn identify_owner(path: &Path, home: &Path, timeout: Duration) -> OwnerGuess {
+    let relative = path.strip_prefix(home).unwrap_or(path);
+    let parts: Vec<String> = relative
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let part = |index: usize| parts.get(index).map(String::as_str).unwrap_or("");
+    let known = |owner: &str, basis: &str| OwnerGuess {
+        owner: Some(owner.into()),
+        basis: basis.into(),
+        ..Default::default()
+    };
+    if let Some(app) = parts.iter().find(|part| part.ends_with(".app")) {
+        return OwnerGuess {
+            owner: Some(app.trim_end_matches(".app").into()),
+            basis: "inside the application bundle".into(),
+            app_path: Some(path.display().to_string()),
+            last_used: None,
+        };
+    }
+    if parts.iter().any(|part| part == "node_modules") {
+        return known("Node.js project dependencies", "a node_modules folder");
+    }
+    let (candidate, basis) = match (part(0), part(1)) {
+        ("Library", "Containers") => (part(2).to_string(), "a sandboxed app container"),
+        ("Library", "Group Containers") => (
+            part(2)
+                .split_once('.')
+                .filter(|(team, _)| team.len() == 10)
+                .map_or(part(2), |(_, rest)| rest)
+                .to_string(),
+            "a shared app group container",
+        ),
+        ("Library", "Application Support") => {
+            (part(2).to_string(), "an Application Support folder")
+        }
+        ("Library", "Caches") => (part(2).to_string(), "a Caches folder"),
+        ("Library", "Developer") => {
+            return known("Xcode and Apple developer tools", "~/Library/Developer");
+        }
+        ("Library", "Mobile Documents") => {
+            return known("iCloud Drive", "~/Library/Mobile Documents");
+        }
+        ("Library", "Mail") => return known("Mail", "~/Library/Mail"),
+        ("Library", "Messages") => return known("Messages", "~/Library/Messages"),
+        (".npm", _) => return known("npm", "~/.npm"),
+        (".cargo", _) | (".rustup", _) => {
+            return known("Rust toolchain (cargo/rustup)", "a Rust toolchain folder");
+        }
+        (".gradle", _) => return known("Gradle", "~/.gradle"),
+        (".m2", _) => return known("Maven", "~/.m2"),
+        (".docker", _) => return known("Docker", "~/.docker"),
+        (".orbstack", _) => return known("OrbStack", "~/.orbstack"),
+        (".Trash", _) => return known("Finder Trash", "the account Trash"),
+        (".cache", tool) if !tool.is_empty() => return known(tool, "a ~/.cache tool folder"),
+        ("go", "pkg") => return known("Go module cache", "~/go/pkg"),
+        ("Documents" | "Desktop" | "Downloads" | "Pictures" | "Movies" | "Music", _) => {
+            return known("your personal files", "a personal folder");
+        }
+        _ => {
+            return OwnerGuess {
+                basis: "no known owner layout matched this path".into(),
+                ..Default::default()
+            };
+        }
+    };
+    let mut guess = OwnerGuess {
+        owner: (!candidate.is_empty()).then(|| ai::display_text(&candidate)),
+        basis: basis.into(),
+        ..Default::default()
+    };
+    let query_text = if bundle_like(&candidate) {
+        format!("kMDItemCFBundleIdentifier == \"{candidate}\"")
+    } else if app_name_like(&candidate) {
+        format!(
+            "kMDItemContentType == \"com.apple.application-bundle\" && kMDItemFSName == \"{candidate}.app\""
+        )
+    } else {
+        return guess;
+    };
+    let Some(app) = query("/usr/bin/mdfind", &[&query_text], timeout)
+        .ok()
+        .and_then(|found| {
+            found
+                .lines()
+                .find(|line| line.ends_with(".app"))
+                .map(str::to_owned)
+        })
+    else {
+        return guess;
+    };
+    guess.last_used = query(
+        "/usr/bin/mdls",
+        &["-raw", "-name", "kMDItemLastUsedDate", &app],
+        timeout,
+    )
+    .ok()
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty() && value != "(null)")
+    .map(|value| ai::display_text(&value));
+    guess.app_path = Some(ai::display_text(&app));
+    guess
+}
+
+/// One point-in-time reading of an exact process identity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcessSample {
+    pub present: bool,
+    pub cpu_seconds: f64,
+    pub rss_kb: u64,
+    pub state: String,
+}
+
+/// Sample one process `count` times, `interval` apart. A PID whose start time
+/// no longer matches is reported absent rather than treated as the same work.
+pub fn sample_process(
+    pid: u32,
+    start_time: &str,
+    count: usize,
+    interval: Duration,
+    cancel: &AtomicBool,
+) -> Result<Vec<ProcessSample>, String> {
+    let pid_text = pid.to_string();
+    let mut samples = Vec::new();
+    for index in 0..count {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("sampling cancelled".into());
+        }
+        if index > 0 && !wait(cancel, interval) {
+            return Err("sampling cancelled".into());
+        }
+        let text = query_accepting(
+            "/bin/ps",
+            &["-o", "time=,rss=,state=,lstart=", "-p", &pid_text],
+            Duration::from_secs(2),
+            &[1],
+        )
+        .map_err(|error| error.to_string())?;
+        samples.push(parse_process_sample(&text, start_time));
+    }
+    Ok(samples)
+}
+
+fn parse_process_sample(text: &str, start_time: &str) -> ProcessSample {
+    let absent = ProcessSample {
+        present: false,
+        cpu_seconds: 0.,
+        rss_kb: 0,
+        state: String::new(),
+    };
+    let Some(line) = text.lines().find(|line| !line.trim().is_empty()) else {
+        return absent;
+    };
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    if fields.len() < 8 || fields[3..8].join(" ") != start_time {
+        return absent;
+    }
+    ProcessSample {
+        present: true,
+        cpu_seconds: cpu_seconds(fields[0]).unwrap_or_default(),
+        rss_kb: fields[1].parse().unwrap_or_default(),
+        state: ai::display_text(fields[2]),
+    }
+}
+
+fn parse_lsof_owners(output: &str) -> Vec<(u32, String)> {
+    let mut owners: Vec<(u32, String)> = Vec::new();
+    let mut pid = None;
+    for line in output.lines() {
+        if let Some(value) = line.strip_prefix('p') {
+            pid = value.parse::<u32>().ok();
+        } else if let (Some(value), Some(current)) = (line.strip_prefix('c'), pid)
+            && !owners.iter().any(|(known, _)| *known == current)
+        {
+            owners.push((current, ai::display_text(value)));
+        }
+    }
+    owners
 }
 
 /// Research a fixed, no-key source catalog. The caller supplies the saved
@@ -694,22 +941,32 @@ pub fn assess(
     });
     let scan_stop = stop.clone();
     thread::spawn(move || {
-        let capacity = storage::read_volume_stats(&root).map_err(|e| e.to_string());
+        // For `/`, measure the APFS Data volume, the same filesystem the
+        // folder walk accounts; `/` itself is the small sealed system volume.
+        let capacity = storage::read_volume_stats(&storage::accounting_path(&root, &home))
+            .map_err(|e| e.to_string());
         if sender.send(Event::Capacity(capacity)).is_err() {
             return;
         }
+        // Resource telemetry samples independently in its own lane. Do not
+        // hold actionable cache findings behind an arbitrary baseline delay:
+        // users should be able to make a safe decision as soon as each
+        // allowlisted target has been measured.
         let _ = sender.send(Event::Stage(
-            "Measuring resource baseline · 10 seconds".into(),
+            "Measuring cleanup candidates · activity readings include the scan".into(),
         ));
-        if !wait(&scan_stop, Duration::from_secs(10)) {
-            return;
-        }
         let whitelist = Whitelist::load(&home);
-        for spec in cache::scan_specs(&root, &home) {
+        let specs = cache::scan_specs(&root, &home);
+        let total = specs.len();
+        for (index, spec) in specs.into_iter().enumerate() {
             if scan_stop.load(Ordering::Relaxed) {
                 return;
             }
             let _ = sender.send(Event::Stage(format!("Measuring {}", spec.label)));
+            let _ = sender.send(Event::Progress(AssessmentProgress::Cleanup {
+                completed: index,
+                total,
+            }));
             let mut entry = cache::scan_cache(&spec, include_optional);
             if whitelist.protects(&entry.spec.path) {
                 entry.status = CacheStatus::Whitelisted;
@@ -717,7 +974,12 @@ pub fn assess(
             if sender.send(Event::Entry(entry)).is_err() {
                 return;
             }
+            let _ = sender.send(Event::Progress(AssessmentProgress::Cleanup {
+                completed: index + 1,
+                total,
+            }));
         }
+        let _ = sender.send(Event::Progress(AssessmentProgress::Discovering));
         let _ = sender.send(Event::Stage(
             "Checking temporary retention and downloads".into(),
         ));
@@ -727,10 +989,16 @@ pub fn assess(
         if root == Path::new("/") || root == home {
             extra_specs.extend(crate::downloads::discover_specs(&home, retention_days));
         }
-        for spec in extra_specs {
+        let extra_total = extra_specs.len();
+        for (index, spec) in extra_specs.into_iter().enumerate() {
             if scan_stop.load(Ordering::Relaxed) {
                 return;
             }
+            let _ = sender.send(Event::Stage(format!("Measuring {}", spec.label)));
+            let _ = sender.send(Event::Progress(AssessmentProgress::Cleanup {
+                completed: total + index,
+                total: total + extra_total,
+            }));
             let mut entry = cache::scan_cache(&spec, include_optional);
             if whitelist.protects(&entry.spec.path) {
                 entry.status = CacheStatus::Whitelisted;
@@ -742,7 +1010,13 @@ pub fn assess(
         let _ = sender.send(Event::Stage(
             "Exploring volume · folder totals still measuring".into(),
         ));
-        let inventory = StorageInventory::scan_with_cancel(&root, &home, &scan_stop);
+        let _ = sender.send(Event::Progress(AssessmentProgress::Inventory(
+            storage::ScanProgress::default(),
+        )));
+        let inventory =
+            StorageInventory::scan_with_progress(&root, &home, &scan_stop, &mut |progress| {
+                let _ = sender.send(Event::Progress(AssessmentProgress::Inventory(progress)));
+            });
         if !scan_stop.load(Ordering::Relaxed) {
             let _ = sender.send(Event::Inventory(inventory));
             let _ = sender.send(Event::Finished);
@@ -769,35 +1043,150 @@ pub struct Finding {
     pub target: Target,
     pub related_pids: Vec<u32>,
 }
+/// A finding when free space is low: under 10 GiB or 10% of capacity.
+pub fn disk_finding(volume: &VolumeStats) -> Option<Finding> {
+    let free = volume.disk_free_kb();
+    let ratio = free as f64 / volume.capacity_kb.max(1) as f64;
+    if free >= 10 * 1_048_576 && ratio >= 0.10 {
+        return None;
+    }
+    let urgent = free < 5 * 1_048_576 || ratio < 0.05;
+    Some(Finding {
+        id: "system:disk".into(),
+        title: if urgent {
+            "Disk space is very low"
+        } else {
+            "Disk space needs attention"
+        }
+        .into(),
+        observation: format!(
+            "{} free · {:.1}% of capacity. Start with confirmed quick wins, then inspect large useful data.",
+            cache::format_kb(free),
+            ratio * 100.
+        ),
+        consequence: "Capacity is measured; reclaimable space is only the eligible cleanup targets. Large useful folders may be moved instead of deleted.".into(),
+        size_kb: 0,
+        quick_win: false,
+        target: Target::System,
+        related_pids: vec![],
+    })
+}
+
+/// Sizes worth comparing across sessions: every measured cleanup target and,
+/// for a complete scan, the top-level folders.
+pub fn measurements(
+    entries: &[CacheEntry],
+    inventory: Option<&StorageInventory>,
+) -> HashMap<String, u64> {
+    let mut measurements: HashMap<String, u64> = entries
+        .iter()
+        .filter(|entry| {
+            !matches!(
+                entry.status,
+                CacheStatus::ScanError
+                    | CacheStatus::Missing
+                    | CacheStatus::Symlink
+                    | CacheStatus::Invalid
+            )
+        })
+        .map(|entry| (entry.spec.path.display().to_string(), entry.size_kb))
+        .collect();
+    if let Some(inventory) = inventory.filter(|inventory| inventory.complete) {
+        measurements.extend(
+            inventory
+                .top_level
+                .iter()
+                .map(|item| (item.path.display().to_string(), item.size_kb)),
+        );
+        // Two levels below the ten largest folders, so growth can be traced
+        // to a specific subfolder. Small items are skipped to limit noise.
+        const MAX_KEYS: usize = 400;
+        const MIN_KB: u64 = 50 * 1024;
+        let mut level: Vec<&Path> = inventory
+            .top_level
+            .iter()
+            .take(10)
+            .map(|item| item.path.as_path())
+            .collect();
+        for _ in 0..2 {
+            let mut next = Vec::new();
+            for parent in level {
+                for child in inventory.children.get(parent).into_iter().flatten() {
+                    if child.size_kb < MIN_KB || measurements.len() >= MAX_KEYS {
+                        continue;
+                    }
+                    measurements.insert(child.path.display().to_string(), child.size_kb);
+                    next.push(child.path.as_path());
+                }
+            }
+            level = next;
+        }
+    }
+    measurements
+}
+
+/// The APFS volume UUID for a path, when `diskutil` reports one.
+pub fn volume_id(path: &Path) -> Option<String> {
+    let text = query(
+        "/usr/sbin/diskutil",
+        &["info", "-plist", path.to_str()?],
+        Duration::from_secs(3),
+    )
+    .ok()?;
+    let value = text.split_once("<key>VolumeUUID</key>")?.1;
+    let value = value.split_once("<string>")?.1;
+    let uuid = value.split_once("</string>")?.0.trim();
+    (!uuid.is_empty() && uuid.len() <= 64).then(|| ai::display_text(uuid))
+}
+
+/// The plan-action id the on-device model may suggest for a target: a
+/// cleanup that is ready now, or a graceful stop of a signalable account
+/// process. The format matches the interface's plan actions exactly.
+pub fn suggestion_id(
+    entries: &[CacheEntry],
+    processes: &[ProcessEntry],
+    target: &Target,
+) -> Option<String> {
+    match target {
+        Target::Cache(path) => entries
+            .iter()
+            .find(|entry| &entry.spec.path == path)
+            .filter(|entry| matches!(entry.status, CacheStatus::Ready | CacheStatus::Optional))
+            .map(|entry| format!("clean:{}", entry.spec.path.display())),
+        Target::Process(pid, start) => processes
+            .iter()
+            .find(|process| process.pid == *pid && &process.start_time == start)
+            .filter(|process| process.signalable && !process.system_owned)
+            .map(|process| {
+                format!(
+                    "signal:{}:{}:{}",
+                    process.pid,
+                    process.start_time,
+                    processes::ProcessSignal::Terminate.label()
+                )
+            }),
+        _ => None,
+    }
+}
+
 pub fn quick_win(entry: &CacheEntry) -> bool {
     entry.status == CacheStatus::Ready
         && entry.spec.tier == CacheTier::Routine
         && entry.identity.is_some()
         && entry.size_kb >= 100 * 1024
-        && matches!(
-            entry.spec.label,
-            "pip cache"
-                | "Python cache"
-                | "Homebrew cache"
-                | "npm package cache"
-                | "uv package cache"
-                | "Yarn package cache"
-                | "OpenCode cache"
-                | "node-gyp cache"
-        )
+        && crate::rules::for_label(entry.spec.label).is_some_and(|rule| rule.quick_win)
 }
+/// Whether a running command belongs to the app or tool behind a rule.
 fn association(label: &str, command: &str) -> bool {
     let command = command.to_lowercase();
-    match label {
-        "Xcode derived data" | "Xcode archives" | "Xcode device support" => {
-            command.contains("/xcode.app/") || command.ends_with("/xcodebuild")
-        }
-        "OpenCode cache" => command.ends_with("/opencode"),
-        "Codex runtimes" => command.contains("/codex.app/"),
-        "Playwright browsers" | "Playwright Go browsers" => command.contains("/ms-playwright/"),
-        _ => false,
-    }
+    crate::rules::for_label(label)
+        .is_some_and(|rule| rule.associate.iter().any(|needle| command.contains(needle)))
 }
+/// Folders smaller than this are not reported on their own.
+pub const BREAKDOWN_MIN_KB: u64 = 100 * 1024;
+/// The single row that sums macOS-managed space.
+pub const MACOS_FINDING_ID: &str = "group:macos";
+
 pub fn findings(
     entries: &[CacheEntry],
     processes: &[ProcessEntry],
@@ -849,6 +1238,7 @@ pub fn findings(
     }
     for process in processes
         .iter()
+        .filter(|p| !p.is_diskray_or_ancestor())
         .filter(|p| {
             p.health != processes::ProcessHealth::Running
                 || metrics.cpu.get(&p.pid).is_some_and(|cpu| *cpu >= 25.)
@@ -889,7 +1279,7 @@ pub fn findings(
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.eq_ignore_ascii_case("fseventsd"))
         {
-            "fseventsd is macOS's filesystem-event journal service. High RAM can reflect event backlog or heavy filesystem activity; it is not reclaimable storage. Inspect filesystem activity before taking action; never terminate this system daemon from Mac Cleanup."
+            "fseventsd is macOS's filesystem-event journal service. High RAM can reflect event backlog or heavy filesystem activity; it is not reclaimable storage. Inspect filesystem activity before taking action; never terminate this system daemon from Diskray."
         } else if process.system_owned {
             "This system-owned process is read-only here. High RAM is an observation, not reclaimable memory; inspect its activity and memory pressure before deciding what to do."
         } else {
@@ -939,31 +1329,47 @@ pub fn findings(
         });
     }
     if let Some(inventory) = inventory {
-        for item in &inventory.top_level {
-            if results
-                .iter()
-                .any(|f| matches!(&f.target,Target::Cache(path) if path==&item.path))
-            {
+        let targets: Vec<PathBuf> = entries.iter().map(|e| e.spec.path.clone()).collect();
+        // Small volumes and folders still get a breakdown: 1% of what was
+        // scanned, never more than the usual minimum.
+        let min_kb = BREAKDOWN_MIN_KB.min((inventory.scanned_kb / 100).max(1));
+        let breakdown = storage::breakdown(inventory, &targets, min_kb);
+        let measured = if inventory.complete {
+            "measured"
+        } else {
+            "observed in a partial scan"
+        };
+        for item in breakdown.items.iter().take(40) {
+            if targets.contains(&item.path) {
                 continue;
             }
             results.push(Finding {
                 id: format!("path:{}", item.path.display()),
                 title: ai::display_text(&item.path.display().to_string()),
                 observation: format!(
-                    "{} {} · size does not establish waste",
+                    "{} {measured} · {}",
                     cache::format_kb(item.size_kb),
-                    if inventory.complete {
-                        "measured"
-                    } else {
-                        "observed in a partial scan"
-                    }
+                    item.category.description()
                 ),
-                consequence:
-                    "Inspect contents; useful data can be moved to a verified external destination."
-                        .into(),
+                consequence: item.category.advice().into(),
                 size_kb: item.size_kb,
                 quick_win: false,
                 target: Target::Folder(item.path.clone()),
+                related_pids: vec![],
+            });
+        }
+        if breakdown.macos_kb >= min_kb {
+            results.push(Finding {
+                id: MACOS_FINDING_ID.into(),
+                title: "macOS system files".into(),
+                observation: format!(
+                    "{} {measured} in /System, /usr, swap files, and other macOS-managed locations",
+                    cache::format_kb(breakdown.macos_kb)
+                ),
+                consequence: "macOS manages this space. Diskray never changes it.".into(),
+                size_kb: breakdown.macos_kb,
+                quick_win: false,
+                target: Target::Folder(PathBuf::from("/System")),
                 related_pids: vec![],
             });
         }
@@ -997,11 +1403,19 @@ pub struct Session {
     pub free_after_kb: Option<u64>,
     pub measurements: HashMap<String, u64>,
     pub investigations: Vec<crate::investigation::InvestigationCase>,
+    /// The scan root the measurements describe (schema 3).
+    pub root: Option<String>,
+    /// The APFS volume UUID, so different disks are never compared.
+    pub volume_id: Option<String>,
+    /// The folder walk finished, so the measurements are comparable.
+    pub complete: bool,
+    /// What recorded the session: `tui`, `why`, `ask`, or `mcp`.
+    pub source: String,
 }
 impl Default for Session {
     fn default() -> Self {
         Self {
-            schema_version: 2,
+            schema_version: 3,
             id: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1015,22 +1429,52 @@ impl Default for Session {
             free_after_kb: None,
             measurements: HashMap::new(),
             investigations: Vec::new(),
+            root: None,
+            volume_id: None,
+            complete: false,
+            source: "tui".into(),
         }
     }
 }
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Settings {
+    #[serde(default)]
     online_research: bool,
+    /// Bundled rule packs the user turned off.
+    #[serde(default)]
+    disabled_packs: Vec<String>,
 }
 
-fn app_data_directory(home: &Path) -> io::Result<PathBuf> {
+fn read_settings(home: &Path) -> Settings {
+    let path = home.join(SETTINGS_SUBPATH);
+    let Ok(metadata) = fs::symlink_metadata(&path) else {
+        return Settings::default();
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 16_384 {
+        return Settings::default();
+    }
+    serde_json::from_slice(&fs::read(path).unwrap_or_default()).unwrap_or_default()
+}
+
+/// Bundled rule packs the user has turned off.
+pub fn disabled_packs(home: &Path) -> Vec<String> {
+    read_settings(home).disabled_packs
+}
+
+pub fn set_disabled_packs(home: &Path, packs: &[String]) -> io::Result<()> {
+    let mut settings = read_settings(home);
+    settings.disabled_packs = packs.to_vec();
+    write_settings(home, &settings)
+}
+
+pub(crate) fn app_data_directory(home: &Path) -> io::Result<PathBuf> {
     if !fs::symlink_metadata(home)?.is_dir() {
         return Err(io::Error::other(
             "Application home must be a real directory",
         ));
     }
     let mut directory = home.to_path_buf();
-    for component in Path::new("Library/Application Support/mac-cleanup").components() {
+    for component in Path::new(crate::paths::APP_DATA_SUBPATH).components() {
         directory.push(component);
         match fs::symlink_metadata(&directory) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
@@ -1048,18 +1492,17 @@ fn app_data_directory(home: &Path) -> io::Result<PathBuf> {
 }
 
 pub fn online_research_enabled(home: &Path) -> bool {
-    let path = home.join(SETTINGS_SUBPATH);
-    let Ok(metadata) = fs::symlink_metadata(&path) else {
-        return false;
-    };
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 16_384 {
-        return false;
-    }
-    serde_json::from_slice::<Settings>(&fs::read(path).unwrap_or_default())
-        .is_ok_and(|settings| settings.online_research)
+    read_settings(home).online_research
 }
 
 pub fn set_online_research(home: &Path, enabled: bool) -> io::Result<()> {
+    let mut settings = read_settings(home);
+    settings.online_research = enabled;
+    write_settings(home, &settings)
+}
+
+/// Replace settings.json atomically, keeping every setting in one file.
+fn write_settings(home: &Path, settings: &Settings) -> io::Result<()> {
     let directory = app_data_directory(home)?;
     let target = directory.join("settings.json");
     if fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
@@ -1073,9 +1516,7 @@ pub fn set_online_research(home: &Path, enabled: bool) -> io::Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(&temporary)?;
-    let bytes = serde_json::to_vec(&Settings {
-        online_research: enabled,
-    })?;
+    let bytes = serde_json::to_vec(settings)?;
     if let Err(error) = file
         .write_all(&bytes)
         .and_then(|_| file.sync_all())
@@ -1121,26 +1562,69 @@ pub fn save_session(home: &Path, session: &Session) -> io::Result<()> {
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
-    let mut records = fs::read_dir(&directory)?
+    prune_history(&directory, &target)
+}
+
+/// Keep 30 days of history plus one complete baseline per week (per scan
+/// root) for 12 weeks, so weekly growth can still be compared. The total is
+/// capped at 50 MiB, oldest first; the record just written always stays.
+fn prune_history(directory: &Path, keep: &Path) -> io::Result<()> {
+    const DAY: u64 = 86_400;
+    let now = timestamp();
+    let mut records: Vec<(PathBuf, u64, u64)> = fs::read_dir(directory)?
         .filter_map(Result::ok)
-        .filter(|e| e.path().extension().is_some_and(|e| e == "json"))
-        .collect::<Vec<_>>();
-    records.sort_by_key(|e| e.file_name());
-    let mut total = records
-        .iter()
-        .filter_map(|e| e.metadata().ok())
-        .map(|m| m.len())
-        .sum::<u64>();
-    for record in records {
-        let metadata = fs::symlink_metadata(record.path())?;
-        let old = metadata
-            .modified()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|path| {
+            let metadata = fs::symlink_metadata(&path).ok()?;
+            if !metadata.is_file() {
+                return None;
+            }
+            let modified = metadata
+                .modified()
+                .ok()?
+                .duration_since(UNIX_EPOCH)
+                .ok()?
+                .as_secs();
+            Some((path, modified, metadata.len()))
+        })
+        .collect();
+    records.sort_by_key(|(_, modified, _)| *modified);
+    // The newest complete record in each (week, root) older than 30 days.
+    let mut baselines: HashMap<(u64, String), (u64, PathBuf)> = HashMap::new();
+    for (path, modified, _) in &records {
+        let age = now.saturating_sub(*modified);
+        if age <= 30 * DAY || age > 84 * DAY {
+            continue;
+        }
+        let Some(session) = fs::read(path)
             .ok()
-            .and_then(|t| SystemTime::now().duration_since(t).ok())
-            .is_some_and(|age| age > Duration::from_secs(30 * 86400));
-        if metadata.is_file() && (old || total > 50 * 1024 * 1024) && record.path() != target {
-            fs::remove_file(record.path())?;
-            total = total.saturating_sub(metadata.len());
+            .and_then(|bytes| serde_json::from_slice::<Session>(&bytes).ok())
+        else {
+            continue;
+        };
+        let Some(root) = session.root.filter(|_| session.complete) else {
+            continue;
+        };
+        let slot = baselines
+            .entry((modified / (7 * DAY), root))
+            .or_insert((0, PathBuf::new()));
+        if *modified >= slot.0 {
+            *slot = (*modified, path.clone());
+        }
+    }
+    let kept: std::collections::HashSet<PathBuf> =
+        baselines.into_values().map(|(_, path)| path).collect();
+    let mut total: u64 = records.iter().map(|(_, _, len)| len).sum();
+    for (path, modified, len) in &records {
+        if path == keep {
+            continue;
+        }
+        let age = now.saturating_sub(*modified);
+        let expired = age > 30 * DAY && !kept.contains(path);
+        if expired || total > 50 * 1024 * 1024 {
+            fs::remove_file(path)?;
+            total = total.saturating_sub(*len);
         }
     }
     Ok(())
@@ -1182,7 +1666,7 @@ pub fn sessions(home: &Path) -> Vec<Session> {
                 session.state =
                     format!("Verification incomplete · {} · not resumed", session.state);
             }
-            matches!(session.schema_version, 1 | 2).then_some(session)
+            matches!(session.schema_version, 1..=3).then_some(session)
         })
         .collect::<Vec<_>>();
     results.sort_by_key(|s| std::cmp::Reverse(s.id));
@@ -1206,6 +1690,144 @@ pub fn clear_sessions(home: &Path) -> io::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn history_keeps_weekly_baselines_beyond_thirty_days() {
+        let home = tempfile::tempdir().unwrap();
+        let day = 86_400;
+        let now = timestamp();
+        let write = |id: u64, age_days: u64, complete: bool| {
+            let session = Session {
+                id,
+                updated: now - age_days * day,
+                complete,
+                root: Some("/".into()),
+                ..Session::default()
+            };
+            save_session(home.path(), &session).unwrap();
+            let path = home.path().join(HISTORY_SUBPATH).join(format!("{id}.json"));
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(now - age_days * day))
+                .unwrap();
+            path
+        };
+        let recent = write(1, 3, true);
+        let week_old_a = write(2, 40, true);
+        let week_old_b = write(3, 41, true);
+        let partial = write(4, 50, false);
+        let ancient = write(5, 120, true);
+        save_session(home.path(), &Session::default()).unwrap();
+        assert!(recent.exists());
+        assert!(
+            week_old_a.exists() != week_old_b.exists() || week_old_a.exists(),
+            "one baseline per week survives"
+        );
+        assert!(!partial.exists(), "partial scans are not baselines");
+        assert!(!ancient.exists(), "nothing older than 12 weeks is kept");
+    }
+    #[test]
+    fn accepted_exit_codes_are_answers_and_others_fail() {
+        assert!(query("/bin/sh", &["-c", "exit 1"], Duration::from_secs(2)).is_err());
+        assert_eq!(
+            query_accepting(
+                "/bin/sh",
+                &["-c", "echo none; exit 1"],
+                Duration::from_secs(2),
+                &[1]
+            )
+            .unwrap(),
+            "none\n"
+        );
+        assert!(
+            query_accepting("/bin/sh", &["-c", "exit 2"], Duration::from_secs(2), &[1]).is_err()
+        );
+    }
+    #[test]
+    fn owner_guesses_use_known_layouts_and_never_query_unsafe_names() {
+        let home = Path::new("/Users/demo");
+        let never = Duration::from_millis(1);
+        let npm = identify_owner(&home.join(".npm/_cacache"), home, never);
+        assert_eq!(npm.owner.as_deref(), Some("npm"));
+        let modules = identify_owner(&home.join("code/app/node_modules/react"), home, never);
+        assert_eq!(
+            modules.owner.as_deref(),
+            Some("Node.js project dependencies")
+        );
+        let group = identify_owner(
+            &home.join("Library/Group Containers/UBF8T346G9.com.microsoft.teams/data"),
+            home,
+            never,
+        );
+        assert_eq!(group.owner.as_deref(), Some("com.microsoft.teams"));
+        assert!(bundle_like("ru.keepcoder.Telegram"));
+        assert!(!bundle_like("x\" || kMDItemFSName == \"*"));
+        assert!(!app_name_like("Evil\"App"));
+        let unknown = identify_owner(Path::new("/opt/data"), home, never);
+        assert!(unknown.owner.is_none());
+    }
+    #[test]
+    fn process_samples_require_the_same_start_time() {
+        let start = "Mon Sep 22 10:00:00 2026";
+        let sample = parse_process_sample(&format!("  1:02.50  2048 S    {start}\n"), start);
+        assert!(sample.present);
+        assert_eq!(sample.cpu_seconds, 62.5);
+        assert_eq!(sample.rss_kb, 2048);
+        assert!(
+            !parse_process_sample(&format!("0:01.00 10 R {start}"), "Tue Sep 23 10:00:00 2026")
+                .present
+        );
+        assert!(!parse_process_sample("", start).present);
+        let never = AtomicBool::new(false);
+        let own = crate::processes::review_processes()
+            .unwrap()
+            .into_iter()
+            .find(|process| process.pid == std::process::id())
+            .map(|process| process.start_time);
+        if let Some(start_time) = own {
+            let samples = sample_process(
+                std::process::id(),
+                &start_time,
+                2,
+                Duration::from_millis(50),
+                &never,
+            )
+            .unwrap();
+            assert_eq!(samples.len(), 2);
+            assert!(samples.iter().all(|sample| sample.present));
+        }
+    }
+    #[test]
+    fn lsof_owner_fields_are_deduplicated_and_sanitized() {
+        let owners =
+            parse_lsof_owners("p12\ncCode\nf4\nf5\np12\ncCode\np40\ncno\u{1b}de\nf1\nbad\n");
+        assert_eq!(owners, vec![(12, "Code".into()), (40, "node".into())]);
+    }
+    #[test]
+    fn open_handle_owners_finds_a_process_holding_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("held.log");
+        fs::write(&file, b"x").unwrap();
+        let mut holder = Command::new("/usr/bin/tail")
+            .args(["-f", file.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        thread::sleep(Duration::from_millis(300));
+        let owners = open_handle_owners(dir.path(), Duration::from_secs(10));
+        let _ = holder.kill();
+        let _ = holder.wait();
+        assert!(
+            owners.unwrap().iter().any(|(pid, _)| *pid == holder.id()),
+            "the tail process holds the file open"
+        );
+        assert!(
+            open_handle_owners(dir.path(), Duration::from_secs(10))
+                .unwrap()
+                .is_empty()
+        );
+    }
     #[test]
     fn cpu_duration_is_parsed_as_seconds() {
         assert_eq!(cpu_seconds("01:02.50"), Some(62.5));

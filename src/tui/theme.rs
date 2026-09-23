@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 
 // High-contrast slate surfaces. Color is supplemental: every state has a text label.
@@ -12,6 +13,8 @@ pub(super) const BLUE: Color = Color::Rgb(111, 190, 255);
 pub(super) const AMBER: Color = Color::Rgb(230, 184, 104);
 pub(super) const CORAL: Color = Color::Rgb(230, 137, 119);
 pub(super) const ORCHID: Color = Color::Rgb(152, 183, 188);
+/// The one accent reserved for model output, so AI text is never mistaken for a measurement.
+pub(super) const VIOLET: Color = Color::Rgb(196, 167, 255);
 
 pub(super) fn panel<'a>(app: &App, title: impl Into<Line<'a>>) -> Block<'a> {
     Block::bordered()

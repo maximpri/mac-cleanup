@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+schema = 1
+pack = "ai-tools"
+description = "Caches and profiles from AI coding tools."
+
+[[rule]]
+id = "opencode"
+label = "OpenCode cache"
+path = ".cache/opencode"
+tier = "routine"
+processes = ["[o]pencode"]
+associate = ["/opencode"]
+note = "OpenCode regenerates this cache"
+quick_win = true
+
+[[rule]]
+id = "codex-runtimes"
+label = "Codex runtimes"
+path = ".cache/codex-runtimes"
+tier = "reinstallable"
+processes = ["/Codex.app/", "[c]odex-runtimes"]
+associate = ["/codex.app/"]
+note = "Codex runtime downloads may return"
+
+[[rule]]
+id = "chrome-devtools-mcp"
+label = "Chrome DevTools MCP profile"
+path = ".cache/chrome-devtools-mcp"
+tier = "review"
+processes = ["[c]hrome-devtools-mcp"]
+note = "persistent browser profile with sessions, cookies, and site data; review before deleting"
+[rule.guidance]
+classification = "PERSISTENT BROWSER PROFILE — NOT A CACHE"
+delete_scope = "The dedicated Chrome profile, including sessions, cookies, settings, and site data."
+impact = "MCP browser sessions and authenticated state stored in this profile will be lost."
+recovery = "The profile can be recreated, but unsynced session and site data cannot be restored automatically."
+recommendation = "Keep it unless you intentionally want to reset the Chrome DevTools MCP browser profile."
+
+[[rule]]
+id = "cursor"
+label = "Cursor user data"
+path = "Library/Application Support/Cursor/User"
+tier = "review"
+processes = ["/Cursor.app/", "[C]ursor Helper"]
+note = "settings, workspace state, and history; review inside Cursor"
+[rule.guidance]
+classification = "EDITOR USER DATA — NOT A CACHE"
+delete_scope = "Cursor settings, keybindings, snippets, workspace state, history, and other user data here."
+impact = "Editor configuration and local workspace history may be permanently lost."
+recovery = "Only data already synced or backed up can be restored reliably."
+recommendation = "Clean up from Cursor or back up this directory before considering full deletion."

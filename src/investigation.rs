@@ -1,17 +1,13 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Bounded, evidence-driven investigations.
 //!
-//! The model may choose which supported check is useful next, but this module
-//! owns the case lifecycle, evidence provenance, and resource budget. A case
-//! can therefore explain an unresolved cause without turning a plausible story
-//! into a claim of fact.
+//! The on-device model may choose which read-only tool is useful next, but
+//! this module owns the case record, evidence provenance, and hypothesis
+//! status. A case can therefore explain an unresolved cause without turning a
+//! plausible story into a claim of fact.
 
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-pub const AUTOMATIC_DECISION_BUDGET: u8 = 3;
-pub const EXPLICIT_DECISION_BUDGET: u8 = 8;
-pub const AUTOMATIC_CASE_WINDOW: Duration = Duration::from_secs(60);
-pub const EXPLICIT_CASE_WINDOW: Duration = Duration::from_secs(180);
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -23,6 +19,24 @@ pub enum CasePhase {
     Verifying,
     Complete,
     Inconclusive,
+}
+
+impl CasePhase {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Observing => "Observing",
+            Self::Checking => "Checking",
+            Self::Researching => "Reading reference material",
+            Self::AwaitingApproval => "Waiting for your approval",
+            Self::Verifying => "Verifying evidence",
+            Self::Complete => "Complete",
+            Self::Inconclusive => "Inconclusive",
+        }
+    }
+
+    pub fn finished(self) -> bool {
+        matches!(self, Self::Complete | Self::Inconclusive)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +59,8 @@ pub enum InvestigationFamily {
     CpuActivity,
     FilesystemActivity,
     DeveloperOwnership,
+    /// A free-form question asked through the Ask box.
+    Question,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +103,18 @@ pub enum HypothesisStatus {
     Unresolved,
 }
 
+impl HypothesisStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Leading => "leading",
+            Self::Weakened => "weakened",
+            Self::Supported => "supported",
+            Self::Unresolved => "unresolved",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvidenceRecord {
     pub id: String,
@@ -100,6 +128,7 @@ pub struct EvidenceRecord {
     pub contradicts: Vec<String>,
 }
 
+/// A collector result before it becomes a numbered evidence record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckObservation {
     pub kind: EvidenceKind,
@@ -139,11 +168,23 @@ impl CheckObservation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AvailableCheck {
-    pub id: String,
-    pub question: String,
-    pub requires_approval: bool,
+/// One tool call in an investigation timeline, including rejected calls.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallRecord {
+    pub tool: String,
+    pub label: String,
+    /// The evidence record produced, if the call ran.
+    #[serde(default)]
+    pub evidence_id: Option<String>,
+    pub status: EvidenceStatus,
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    /// False when the measured fallback, not the model, chose the call.
+    #[serde(default)]
+    pub chosen_by_model: bool,
+    /// Why the call did not run, if it was rejected.
+    #[serde(default)]
+    pub rejected: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,82 +206,50 @@ pub struct InvestigationCase {
     pub revision: u64,
     pub automatic: bool,
     pub phase: CasePhase,
+    /// Tool calls used, including rejected ones.
     pub decision_count: u8,
+    /// Tool calls allowed.
     pub decision_budget: u8,
     pub hypotheses: Vec<Hypothesis>,
     pub evidence: Vec<EvidenceRecord>,
     pub checks_run: Vec<String>,
     pub conclusion: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum AgentDecision {
-    Check {
-        check: String,
-        reason: String,
-        #[serde(default)]
-        evidence_ids: Vec<String>,
-        #[serde(default)]
-        hypothesis_ids: Vec<String>,
-    },
-    Research {
-        topic: String,
-        reason: String,
-    },
-    AwaitApproval {
-        experiment: String,
-        reason: String,
-    },
-    Finish {
-        conclusion: String,
-        phase: CasePhase,
-        #[serde(default)]
-        evidence_ids: Vec<String>,
-    },
+    /// The Ask-box question, for question cases.
+    #[serde(default)]
+    pub question: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCallRecord>,
+    /// Validated plan-action IDs the model suggested. Never added automatically.
+    #[serde(default)]
+    pub suggested_actions: Vec<String>,
 }
 
 impl InvestigationCase {
     pub fn new_fseventsd(target: impl Into<String>, revision: u64, automatic: bool) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        Self {
-            id: format!("investigation:fseventsd:{now}"),
-            target: target.into(),
-            family: InvestigationFamily::FilesystemActivity,
-            started_at: now,
+        let mut case = Self::base(
+            target,
             revision,
             automatic,
-            phase: CasePhase::Observing,
-            decision_count: 0,
-            decision_budget: if automatic {
-                AUTOMATIC_DECISION_BUDGET
-            } else {
-                EXPLICIT_DECISION_BUDGET
-            },
-            hypotheses: vec![
-                hypothesis(
-                    "filesystem_activity",
-                    "A workload is producing a large filesystem event stream",
-                    "Activity tracing can identify repeated writes, scans, or paging-related work.",
-                ),
-                hypothesis(
-                    "volume_specific",
-                    "One mounted volume or filesystem is contributing disproportionately",
-                    "Volume context can separate the startup volume from external or custom filesystems.",
-                ),
-                hypothesis(
-                    "daemon_or_history",
-                    "fseventsd or its event history is behaving abnormally",
-                    "This remains a fallback hypothesis until activity and volume evidence fail to explain the pattern.",
-                ),
-            ],
-            evidence: Vec::new(),
-            checks_run: Vec::new(),
-            conclusion: None,
-        }
+            InvestigationFamily::FilesystemActivity,
+        );
+        case.hypotheses = vec![
+            hypothesis(
+                "filesystem_activity",
+                "A workload is producing a large filesystem event stream",
+                "Activity tracing can identify repeated writes, scans, or paging-related work.",
+            ),
+            hypothesis(
+                "volume_specific",
+                "One mounted volume or filesystem is contributing disproportionately",
+                "Volume context can separate the startup volume from external or custom filesystems.",
+            ),
+            hypothesis(
+                "daemon_or_history",
+                "fseventsd or its event history is behaving abnormally",
+                "This remains a fallback hypothesis until activity and volume evidence fail to explain the pattern.",
+            ),
+        ];
+        case
     }
 
     pub fn new_storage(target: impl Into<String>, revision: u64, automatic: bool) -> Self {
@@ -264,7 +273,7 @@ impl InvestigationCase {
             hypothesis(
                 "active_writer",
                 "An active workload is creating or retaining the data",
-                "Open handles and comparable history can establish activity without claiming ownership.",
+                "Open handles, recent changes, and comparable history can establish activity without claiming ownership.",
             ),
         ];
         case
@@ -291,7 +300,7 @@ impl InvestigationCase {
             hypothesis(
                 "active_writer",
                 "A running developer workload still owns or uses this data",
-                "Open-handle and current-process evidence can prevent cleanup while work is active.",
+                "Open-handle and recent-change evidence can prevent cleanup while work is active.",
             ),
         ];
         case
@@ -355,6 +364,19 @@ impl InvestigationCase {
         case
     }
 
+    /// A question has no predefined hypotheses; its report must still cite evidence.
+    pub fn new_question(question: impl Into<String>, revision: u64) -> Self {
+        let question = question.into();
+        let mut case = Self::base(
+            question.clone(),
+            revision,
+            false,
+            InvestigationFamily::Question,
+        );
+        case.question = Some(question);
+        case
+    }
+
     fn base(
         target: impl Into<String>,
         revision: u64,
@@ -363,30 +385,33 @@ impl InvestigationCase {
     ) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+            .unwrap_or_default();
         Self {
-            id: format!("investigation:{family:?}:{now}"),
+            id: format!("investigation:{family:?}:{}", now.as_nanos()),
             target: target.into(),
             family,
-            started_at: now,
+            started_at: now.as_secs(),
             revision,
             automatic,
             phase: CasePhase::Observing,
             decision_count: 0,
-            decision_budget: if automatic {
-                AUTOMATIC_DECISION_BUDGET
-            } else {
-                EXPLICIT_DECISION_BUDGET
-            },
+            decision_budget: 0,
             hypotheses: Vec::new(),
             evidence: Vec::new(),
             checks_run: Vec::new(),
             conclusion: None,
+            question: None,
+            tool_calls: Vec::new(),
+            suggested_actions: Vec::new(),
         }
     }
 
-    pub fn add_evidence(&mut self, evidence: EvidenceRecord) {
+    /// Record evidence. Only complete or partial evidence can change a
+    /// hypothesis, and relationships to unknown hypotheses are dropped.
+    pub fn add_evidence(&mut self, mut evidence: EvidenceRecord) {
+        let known = |id: &String| self.hypotheses.iter().any(|h| &h.id == id);
+        evidence.supports.retain(known);
+        evidence.contradicts.retain(known);
         if evidence.status.can_support_hypothesis() {
             for hypothesis in &mut self.hypotheses {
                 if evidence.supports.iter().any(|id| id == &hypothesis.id) {
@@ -402,268 +427,37 @@ impl InvestigationCase {
             }
         }
         self.evidence.push(evidence);
-        self.phase = CasePhase::Checking;
+        if !self.phase.finished() && self.phase != CasePhase::AwaitingApproval {
+            self.phase = CasePhase::Checking;
+        }
     }
 
-    /// Attach only relationships that the deterministic collector can establish.
-    /// Unknown relationship IDs are removed before evidence is persisted or sent
-    /// to the model.
-    pub fn classify_observation(&self, check: &str, observation: &mut CheckObservation) {
-        if observation.status.can_support_hypothesis() {
-            match (self.family, check) {
-                (
-                    InvestigationFamily::StorageGrowth | InvestigationFamily::DeveloperOwnership,
-                    "inspect_children",
-                ) => observation.supports.push("measured_children".into()),
-                (InvestigationFamily::CapacityCoverage, "inspect_children") => {
-                    observation.supports.push("measured_consumers".into());
-                }
-                (InvestigationFamily::CapacityCoverage, "volume_context")
-                    if observation
+    pub fn evidence_by_id(&self, id: &str) -> Option<&EvidenceRecord> {
+        self.evidence.iter().find(|evidence| evidence.id == id)
+    }
+
+    /// Usable evidence that supports `hypothesis`, among the cited IDs.
+    pub fn cited_support(&self, hypothesis: &str, cited: &[String]) -> bool {
+        cited.iter().any(|id| {
+            self.evidence_by_id(id).is_some_and(|evidence| {
+                evidence.status.can_support_hypothesis()
+                    && evidence
                         .supports
                         .iter()
-                        .any(|id| id == "volume_specific") =>
-                {
-                    observation.supports.push("missing_coverage".into());
-                }
-                _ => {}
-            }
-        }
-        let known = self
-            .hypotheses
-            .iter()
-            .map(|hypothesis| hypothesis.id.as_str())
-            .collect::<std::collections::HashSet<_>>();
-        observation
-            .supports
-            .retain(|id| known.contains(id.as_str()));
-        observation
-            .contradicts
-            .retain(|id| known.contains(id.as_str()));
-        observation.supports.sort();
-        observation.supports.dedup();
-        observation.contradicts.sort();
-        observation.contradicts.dedup();
+                        .any(|supported| supported == hypothesis)
+            })
+        })
     }
 
-    pub fn record_check(&mut self, check: impl Into<String>) {
-        let check = check.into();
-        if !self.checks_run.iter().any(|known| known == &check) {
-            self.checks_run.push(check);
-            self.decision_count = self.decision_count.saturating_add(1);
-        }
+    /// Any usable evidence that contradicts `hypothesis`.
+    pub fn contradicted(&self, hypothesis: &str) -> bool {
+        self.evidence.iter().any(|evidence| {
+            evidence.status.can_support_hypothesis()
+                && evidence.contradicts.iter().any(|id| id == hypothesis)
+        })
     }
 
-    pub fn next_local_decision(&self) -> AgentDecision {
-        if self.decision_count >= self.decision_budget {
-            return AgentDecision::Finish {
-                conclusion: "The investigation budget is exhausted. The measured evidence identifies the leading area, but does not prove a root cause.".into(),
-                phase: CasePhase::Inconclusive,
-                evidence_ids: self.supporting_evidence_ids(),
-            };
-        }
-        if self.target.eq_ignore_ascii_case("fseventsd") {
-            if !self.has_check("fs_usage") {
-                return AgentDecision::Check {
-                    check: "fs_usage".into(),
-                    reason: "Separate fseventsd memory correlation from the filesystem activity it is observing.".into(),
-                    evidence_ids: self.supporting_evidence_ids(),
-                    hypothesis_ids: vec!["filesystem_activity".into()],
-                };
-            }
-            if !self.has_check("volume_context") {
-                return AgentDecision::Check {
-                    check: "volume_context".into(),
-                    reason: "Identify whether activity is concentrated on an external or custom mounted volume.".into(),
-                    evidence_ids: self.supporting_evidence_ids(),
-                    hypothesis_ids: vec!["volume_specific".into()],
-                };
-            }
-            if !self.has_check("research_sources") {
-                return AgentDecision::Research {
-                    topic: "fseventsd memory growth filesystem event backlog macOS".into(),
-                    reason: "Compare the observed pattern with documented platform behavior and known reports.".into(),
-                };
-            }
-        }
-        AgentDecision::Finish {
-            conclusion: self.conclusion_text(),
-            phase: CasePhase::Inconclusive,
-            evidence_ids: self.supporting_evidence_ids(),
-        }
-    }
-
-    pub fn available_checks(&self, research_enabled: bool) -> Vec<AvailableCheck> {
-        let mut checks = Vec::new();
-        if self.target.eq_ignore_ascii_case("fseventsd") {
-            if !self.has_check("fs_usage") {
-                checks.push(AvailableCheck {
-                    id: "fs_usage".into(),
-                    question: "Is fseventsd handling ordinary paging, file activity, or sustained filesystem operations?".into(),
-                    requires_approval: true,
-                });
-            }
-            if !self.has_check("volume_context") {
-                checks.push(AvailableCheck {
-                    id: "volume_context".into(),
-                    question:
-                        "Are external or custom filesystems mounted while the symptom is present?"
-                            .into(),
-                    requires_approval: false,
-                });
-            }
-            if research_enabled && !self.has_check("research_sources") {
-                checks.push(AvailableCheck {
-                    id: "research_sources".into(),
-                    question: "What does current Apple documentation say that applies to this observation?".into(),
-                    requires_approval: false,
-                });
-            }
-        }
-        match self.family {
-            InvestigationFamily::StorageGrowth | InvestigationFamily::DeveloperOwnership => {
-                if !self.has_check("inspect_children") {
-                    checks.push(AvailableCheck {
-                        id: "inspect_children".into(),
-                        question: "Which direct children account for this space?".into(),
-                        requires_approval: false,
-                    });
-                }
-                if !self.has_check("check_open_handles") {
-                    checks.push(AvailableCheck {
-                        id: "check_open_handles".into(),
-                        question: "Is an active process holding this location open?".into(),
-                        requires_approval: false,
-                    });
-                }
-                if !self.has_check("compare_history") {
-                    checks.push(AvailableCheck {
-                        id: "compare_history".into(),
-                        question: "Do comparable complete measurements show growth or regrowth?"
-                            .into(),
-                        requires_approval: false,
-                    });
-                }
-            }
-            InvestigationFamily::MemoryPressure | InvestigationFamily::CpuActivity => {
-                if !self.has_check("refresh_processes") {
-                    checks.push(AvailableCheck {
-                        id: "refresh_processes".into(),
-                        question: "Is the exact process identity still present and active?".into(),
-                        requires_approval: false,
-                    });
-                }
-            }
-            InvestigationFamily::CapacityCoverage => {
-                if !self.has_check("inspect_children") {
-                    checks.push(AvailableCheck {
-                        id: "inspect_children".into(),
-                        question: "Which measured children account for used storage?".into(),
-                        requires_approval: false,
-                    });
-                }
-                if !self.has_check("volume_context") {
-                    checks.push(AvailableCheck {
-                        id: "volume_context".into(),
-                        question: "Does APFS or mounted-volume accounting explain missing space?"
-                            .into(),
-                        requires_approval: false,
-                    });
-                }
-            }
-            InvestigationFamily::FilesystemActivity => {}
-        }
-        let mut seen = std::collections::HashSet::new();
-        checks.retain(|check| seen.insert(check.id.clone()));
-        checks
-    }
-
-    pub fn validate_decision(
-        &self,
-        decision: &AgentDecision,
-        available: &[AvailableCheck],
-    ) -> Result<(), String> {
-        let evidence = self
-            .evidence
-            .iter()
-            .map(|item| item.id.as_str())
-            .collect::<std::collections::HashSet<_>>();
-        let hypotheses = self
-            .hypotheses
-            .iter()
-            .map(|item| item.id.as_str())
-            .collect::<std::collections::HashSet<_>>();
-        let valid_evidence = |ids: &[String]| ids.iter().all(|id| evidence.contains(id.as_str()));
-        match decision {
-            AgentDecision::Check {
-                check,
-                evidence_ids,
-                hypothesis_ids,
-                reason,
-            } => {
-                if reason.trim().is_empty()
-                    || !available.iter().any(|item| &item.id == check)
-                    || !valid_evidence(evidence_ids)
-                    || hypothesis_ids
-                        .iter()
-                        .any(|id| !hypotheses.contains(id.as_str()))
-                {
-                    return Err("AI returned an unsupported investigation decision.".into());
-                }
-            }
-            AgentDecision::Finish {
-                conclusion,
-                evidence_ids,
-                phase,
-            } => {
-                let supported = evidence_ids.iter().any(|id| {
-                    self.evidence.iter().any(|evidence| {
-                        &evidence.id == id
-                            && evidence.status.can_support_hypothesis()
-                            && (!evidence.supports.is_empty() || !evidence.contradicts.is_empty())
-                    })
-                });
-                if conclusion.trim().is_empty()
-                    || !valid_evidence(evidence_ids)
-                    || (*phase == CasePhase::Complete && !supported)
-                {
-                    return Err("AI returned an unsupported investigation conclusion.".into());
-                }
-            }
-            AgentDecision::Research { .. } | AgentDecision::AwaitApproval { .. } => {
-                return Err("AI returned a legacy investigation decision.".into());
-            }
-        }
-        Ok(())
-    }
-
-    fn supporting_evidence_ids(&self) -> Vec<String> {
-        self.evidence
-            .iter()
-            .filter(|item| item.status.can_support_hypothesis())
-            .map(|item| item.id.clone())
-            .take(4)
-            .collect()
-    }
-
-    pub fn apply_decision(&mut self, decision: &AgentDecision) {
-        self.phase = match decision {
-            AgentDecision::Check { .. } => CasePhase::Checking,
-            AgentDecision::Research { .. } => CasePhase::Researching,
-            AgentDecision::AwaitApproval { .. } => CasePhase::AwaitingApproval,
-            AgentDecision::Finish {
-                conclusion, phase, ..
-            } => {
-                self.conclusion = Some(conclusion.clone());
-                *phase
-            }
-        };
-    }
-
-    pub fn has_check(&self, check: &str) -> bool {
-        self.checks_run.iter().any(|known| known == check)
-    }
-
+    /// A measured, model-free conclusion.
     pub fn conclusion_text(&self) -> String {
         let supported = self
             .hypotheses
@@ -676,7 +470,9 @@ impl InvestigationCase {
             })
             .map(|hypothesis| hypothesis.label.as_str())
             .collect::<Vec<_>>();
-        if supported.is_empty() {
+        if self.hypotheses.is_empty() {
+            "Measured checks finished; the evidence list shows what was observed.".into()
+        } else if supported.is_empty() {
             "No single cause is supported by the available evidence yet.".into()
         } else {
             format!(
@@ -728,29 +524,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fseventsd_case_chooses_distinguishing_checks_in_order() {
-        let mut case = InvestigationCase::new_fseventsd("fseventsd", 4, false);
-        assert!(matches!(
-            case.next_local_decision(),
-            AgentDecision::Check { ref check, .. } if check == "fs_usage"
-        ));
-        case.record_check("fs_usage");
-        assert!(matches!(
-            case.next_local_decision(),
-            AgentDecision::Check { ref check, .. } if check == "volume_context"
-        ));
-        case.record_check("volume_context");
-        assert!(matches!(
-            case.next_local_decision(),
-            AgentDecision::Research { ref topic, .. } if topic.contains("fseventsd")
-        ));
-    }
-
-    #[test]
     fn evidence_updates_hypothesis_status_without_claiming_causation() {
         let mut case = InvestigationCase::new_fseventsd("fseventsd", 1, true);
         case.add_evidence(evidence(
-            "fs-1",
+            "E1",
             EvidenceKind::FilesystemActivity,
             "fseventsd",
             "Repeated swap-backed filesystem reads observed.",
@@ -760,13 +537,15 @@ mod tests {
         ));
         assert_eq!(case.hypotheses[0].status, HypothesisStatus::Leading);
         assert!(case.conclusion.is_none());
+        assert!(case.cited_support("filesystem_activity", &["E1".into()]));
+        assert!(!case.cited_support("filesystem_activity", &["E9".into()]));
     }
 
     #[test]
     fn failed_evidence_never_strengthens_a_hypothesis() {
         let mut case = InvestigationCase::new_fseventsd("fseventsd", 1, true);
         case.add_evidence(evidence(
-            "fs-failed",
+            "E1",
             EvidenceKind::FilesystemActivity,
             "fseventsd",
             "Authorization was not granted.",
@@ -776,66 +555,34 @@ mod tests {
         ));
         assert_eq!(case.hypotheses[0].status, HypothesisStatus::Open);
         assert!(case.hypotheses[0].supporting_evidence.is_empty());
+        assert!(!case.cited_support("filesystem_activity", &["E1".into()]));
     }
 
     #[test]
-    fn automatic_budget_finishes_as_inconclusive() {
-        let mut case = InvestigationCase::new_fseventsd("fseventsd", 1, true);
-        case.record_check("fs_usage");
-        case.record_check("volume_context");
-        case.record_check("research_sources");
-        assert!(matches!(
-            case.next_local_decision(),
-            AgentDecision::Finish {
-                phase: CasePhase::Inconclusive,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn storage_inventory_supports_distribution_without_calling_it_waste() {
-        let case = InvestigationCase::new_storage("/example", 1, false);
-        let mut observation =
-            CheckObservation::complete(EvidenceKind::VolumeContext, "Measured direct children.");
-        observation.supports.push("invented".into());
-        case.classify_observation("inspect_children", &mut observation);
-        assert_eq!(observation.supports, vec!["measured_children"]);
-        assert!(!observation.supports.iter().any(|id| id.contains("waste")));
-    }
-
-    #[test]
-    fn complete_conclusion_requires_related_usable_evidence() {
-        let mut case = InvestigationCase::new_fseventsd("fseventsd", 1, false);
+    fn unknown_relationships_are_dropped_before_recording() {
+        let mut case = InvestigationCase::new_storage("/example", 1, false);
         case.add_evidence(evidence(
-            "denied",
-            EvidenceKind::FilesystemActivity,
-            "fseventsd",
-            "Authorization denied.",
-            &[],
-            &[],
-            EvidenceStatus::PermissionRequired,
+            "E1",
+            EvidenceKind::VolumeContext,
+            "/example",
+            "Measured direct children.",
+            &["measured_children", "invented_waste"],
+            &["process_persists"],
+            EvidenceStatus::Complete,
         ));
-        let finish = AgentDecision::Finish {
-            conclusion: "A cause was established.".into(),
-            phase: CasePhase::Complete,
-            evidence_ids: vec!["denied".into()],
-        };
-        assert!(case.validate_decision(&finish, &[]).is_err());
+        assert_eq!(case.evidence[0].supports, vec!["measured_children"]);
+        assert!(case.evidence[0].contradicts.is_empty());
     }
 
     #[test]
-    fn model_can_only_choose_an_available_check() {
-        let case = InvestigationCase::new_storage("/example", 1, false);
-        let decision = AgentDecision::Check {
-            check: "run_shell".into(),
-            reason: "Try an unrestricted command.".into(),
-            evidence_ids: vec![],
-            hypothesis_ids: vec![],
-        };
-        assert!(
-            case.validate_decision(&decision, &case.available_checks(false))
-                .is_err()
-        );
+    fn questions_have_no_hypotheses_and_older_records_still_load() {
+        let case = InvestigationCase::new_question("Why is my disk full?", 3);
+        assert_eq!(case.family, InvestigationFamily::Question);
+        assert!(case.hypotheses.is_empty());
+        assert_eq!(case.question.as_deref(), Some("Why is my disk full?"));
+        let legacy = r#"{"id":"investigation:fseventsd:1","target":"fseventsd","family":"filesystem_activity","started_at":1,"revision":1,"automatic":true,"phase":"researching","decision_count":2,"decision_budget":3,"hypotheses":[],"evidence":[],"checks_run":["fs_usage"],"conclusion":null}"#;
+        let parsed: InvestigationCase = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.tool_calls.is_empty() && parsed.question.is_none());
+        assert_eq!(parsed.phase, CasePhase::Researching);
     }
 }

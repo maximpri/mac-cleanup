@@ -11,9 +11,9 @@ body:
   - type: input
     id: version
     attributes:
-      label: Mac Cleanup version
-      description: Run `mac-cleanup --version` or provide the commit SHA.
-      placeholder: mac-cleanup 0.2.0
+      label: Diskray version
+      description: Run `diskray --version` or provide the commit SHA.
+      placeholder: diskray 0.4.0
     validations:
       required: true
 
@@ -21,7 +21,7 @@ body:
     id: macos
     attributes:
       label: macOS version and architecture
-      placeholder: macOS 15.x, Apple silicon
+      placeholder: macOS 26.x, Apple silicon
     validations:
       required: true
 
@@ -74,7 +74,7 @@ body:
     attributes:
       label: Safety checks
       options:
-        - label: I did not run Mac Cleanup with `sudo` or as root.
+        - label: I did not run Diskray with `sudo` or as root.
           required: true
         - label: I removed personal and secret data from this report.
           required: true

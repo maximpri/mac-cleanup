@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 
 /// Background result combining `/private/tmp` retention discovery with any

@@ -1,11 +1,11 @@
 # Contributing
 
-Thank you for helping improve Mac Cleanup. Changes that affect deletion need
+Thank you for helping improve Diskray. Changes that affect deletion need
 extra care because the program operates on real user data.
 
 ## Development setup
 
-Mac Cleanup requires macOS and Rust 1.88 or newer. Fork and clone the
+Diskray requires macOS and Rust 1.88 or newer. Fork and clone the
 repository, then run:
 
 ```bash
@@ -40,7 +40,7 @@ allowlisted path, it is not suitable for this project.
 
 ## Pull requests
 
-Keep changes focused and update the README when behavior, controls, output, or
+Keep changes focused and update the docs (`README.md` or `docs/USAGE.md`, `docs/SAFETY.md`) when behavior, controls, output, or
 safety guarantees change. Add an entry under `Unreleased` in `CHANGELOG.md` for
 user-visible changes.
 
@@ -54,5 +54,8 @@ cargo package --locked
 Do not include real cache listings, usernames, home-directory paths, tokens,
 cookies, browser profiles, or cleanup reports in issues, fixtures, or commits.
 
-By contributing, you agree that your contribution is licensed under the MIT
-License.
+By contributing, you agree that your contribution is licensed under the GNU
+General Public License, version 3 or (at your option) any later version
+(GPL-3.0-or-later), the same license as the project. Sign off each commit
+(`git commit -s`) to certify the [Developer Certificate of
+Origin](https://developercertificate.org/).

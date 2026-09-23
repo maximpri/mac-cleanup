@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Terminal adapter: session state, lifecycle, and focused presentation modules.
 
 use std::{
@@ -309,6 +310,23 @@ pub fn can_run() -> bool {
 }
 
 pub fn run(cli: &Cli, home: &Path) -> Result<i32, String> {
+    run_with(cli, home, None)
+}
+
+/// Open the workspace with an agent's proposal waiting to be reviewed.
+pub fn run_review(
+    cli: &Cli,
+    home: &Path,
+    proposal: (PathBuf, crate::pending::PendingPlan),
+) -> Result<i32, String> {
+    run_with(cli, home, Some(proposal))
+}
+
+fn run_with(
+    cli: &Cli,
+    home: &Path,
+    proposal: Option<(PathBuf, crate::pending::PendingPlan)>,
+) -> Result<i32, String> {
     let mut stdout = io::stdout();
     enable_raw_mode().map_err(|error| format!("could not enable terminal raw mode: {error}"))?;
     if let Err(error) = execute!(
@@ -349,7 +367,12 @@ pub fn run(cli: &Cli, home: &Path) -> Result<i32, String> {
     };
 
     let app = match App::new_with_care(cli, home, true) {
-        Ok(app) => app,
+        Ok(mut app) => {
+            if let (Some(workspace), Some(proposal)) = (app.care.as_mut(), proposal) {
+                workspace.load_proposal(proposal);
+            }
+            app
+        }
         Err(error) => {
             let _ = disable_raw_mode();
             let _ = execute!(

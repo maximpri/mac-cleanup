@@ -8,6 +8,31 @@ the accepted scope: a Rust/Ratatui utility for developers and AI-tool users,
 Apple Intelligence in the first release, macOS 26+ on compatible Apple silicon,
 and a visual workflow without chat.
 
+## Tool-calling checkpoint — 2026-09-23
+
+Apple Foundation Models now calls bounded read-only tools itself (protocol v3,
+`src/agent.rs`, `src/agent_tools.rs`) instead of choosing one check per helper
+process. Investigations (`i`), the Ask box (`/`), and one automatic top-area run
+share the same tool dispatch, evidence numbering, budgets, and report validation.
+Model suggestions are badges on actions Rust already allows. Without a model, the
+same tools run as a measured sequence. Verified by unit tests, the helper bridge
+self-test, and the PTY smoke test. The live `--live` tool loop and token budgets
+still need a Mac whose Apple Intelligence model is ready.
+
+## UX checkpoint — 2026-09-22
+
+The care workspace now separates navigation, health, scan progress, decisions,
+and feedback. Findings explain measured evidence, next steps, and tradeoffs
+before AI interpretation. Compact terminals use full-width list/detail pages;
+wide terminals include measured folder maps. Explore adds relative size bars.
+Help is a scrollable page and contextual footer commands remain whole and clickable.
+
+Progress comes from completed checks and throttled inventory checkpoints, with
+explicit unknown totals and partial coverage. Plan execution exposes baseline /
+action / verification phases and actual sample counts. Empty plans do not ask
+for a confirmation phrase. Navigation, result access, read-only feedback, and
+diagnostic approval remain usable at 60 × 16. See `TUI_NAVIGATION.md` for controls.
+
 ## Implementation checkpoint — 2026-09-18
 
 Implemented in source:
@@ -22,8 +47,8 @@ Implemented in source:
 - Adaptive cases for capacity, storage, memory, CPU, filesystem activity, and
   developer data. Apple FM chooses one permitted read-only check at a time; Rust
   owns collectors, typed outcomes, budgets, deadlines, and conclusion validation.
-- Actual-work cyan/violet activity visuals, completion accent, reduced motion,
-  no-color support, and terminal focus tracking.
+- Actual-work progress indicators, reduced motion, no-color support, and
+  terminal focus tracking (updated by the UX checkpoint above).
 - Shared exact-target plans for cleanup, signals, and relocation; protected-data
   deletion remains a separate single-item typed confirmation. Process signals and
   relocation now have separate acknowledgments in mixed plans.
@@ -48,6 +73,17 @@ Implemented in source:
   persistent results, confirmed history clearing, and recheck.
 - Regression tests for focus, read-only behavior, hidden confirmations, overlapping
   plans, stale inference, responsive rendering, and reduced motion.
+- Cleanup candidates now stream into Findings as soon as their allowlisted paths
+  are measured; the resource sampler continues independently instead of blocking
+  the first useful answer behind a fixed delay.
+- Investigation history appends and updates cases by stable ID, process-local-AI
+  insights expire when a newer telemetry sample arrives, and each case starts
+  with the measured observation that triggered it.
+- Native cleanup commands are limited to exact scoped targets. Broader owner
+  commands remain visible as guidance only; a failed native command never falls
+  through to an unreviewed filesystem sweep.
+- Compact terminals use a full-width Findings list and an explicit detail page
+  with a visible Escape/back path instead of two unreadable split panes.
 
 The implementation deliberately does not certify the remaining release
 acceptance gates below. Outstanding work includes richer app/session ownership
@@ -56,7 +92,7 @@ budgets. The current CPU/pressure observations must not be
 presented as causal performance gains. Folder investigation is a bounded read-only
 measurement; the model never receives a general shell or filesystem mutation tool.
 
-Validation on the development Mac passed 142 Rust tests, strict Clippy, private
+Validation on the development Mac passed 145 Rust tests, strict Clippy, private
 Rust documentation warnings, Swift typechecking, protocol-v2 framing, release
 packaging, and disposable-fixture TUI smoke coverage. Live Apple Foundation
 Models checks passed for explanation, triage, result summary, and constrained
@@ -147,11 +183,13 @@ thread. Use stable subject, evidence, and action IDs plus an assessment generati
 to reject results from cancelled or replaced work.
 
 Launch capacity/process/VM collection immediately and sample resources every two
-seconds. Gather a ten-second quiet baseline before starting deep inventory or
-AI inference. Show available readings throughout that interval. Then run one
-filesystem measurement worker and a bounded metadata/check worker, prioritizing
-known cleanup locations before the remaining inventory. Run at most one model
-request at a time. Cancel obsolete selected-item requests.
+seconds. Stream known cleanup findings while the resource baseline is forming;
+do not make a fixed quiet-period delay a prerequisite for the first useful
+answer. Keep automatic triage bounded until an initial sample exists, label
+readings taken during active scanning honestly, and run one filesystem
+measurement worker plus a bounded metadata/check worker, prioritizing known
+cleanup locations before the remaining inventory. Run at most one model request
+at a time. Cancel obsolete selected-item requests.
 
 The filesystem worker yields between bounded work slices and emits completed
 subtree measurements. A shallow directory listing cannot supply recursive sizes.

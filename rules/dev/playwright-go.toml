@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+schema = 1
+pack = "playwright-go"
+description = "Browser binaries downloaded by Playwright for Go."
+
+[[rule]]
+id = "browsers"
+label = "Playwright Go browsers"
+path = "Library/Caches/ms-playwright-go"
+tier = "reinstallable"
+processes = ["[p]laywright", "[m]s-playwright-go"]
+associate = ["/ms-playwright/"]
+note = "browser binaries download again"

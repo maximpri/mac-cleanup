@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Selected-folder map. Geometry represents bytes, never cleanup eligibility.
 use super::*;
 
@@ -213,7 +214,7 @@ fn render_map(frame: &mut Frame<'_>, area: Rect, app: &App, item: &StorageItem, 
     let block = panel(
         app,
         if care {
-            " FOLDER MAP · d expand evidence "
+            " FOLDER MAP · area = measured size "
         } else if app.storage_tab == StorageTab::Heatmap {
             " STORAGE MAP · e back to list "
         } else {
@@ -280,7 +281,7 @@ fn render_map(frame: &mut Frame<'_>, area: Rect, app: &App, item: &StorageItem, 
         heading(
             app,
             if care {
-                "Enter  Explore    o  Finder    d  Evidence"
+                "e  Explore    o  Finder · click a folder"
             } else if item.kind == StorageItemKind::Directory {
                 "Enter  Open folder    i  Details"
             } else {

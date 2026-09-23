@@ -1,7 +1,8 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Append-only audit log for cleanup actions.
 //!
 //! Cleanup is permanent, so every attempted deletion is appended to
-//! `~/Library/Logs/mac-cleanup/deletions.log` with the outcome, reclaimed
+//! `~/Library/Logs/diskray/deletions.log` with the outcome, reclaimed
 //! size, and exact path. Logging is best-effort: a logging failure never
 //! blocks or changes a cleanup outcome.
 
@@ -15,7 +16,7 @@ use std::{
 use crate::cache::{CacheEntry, CleanupOutcome};
 
 pub fn log_path(account_home: &Path) -> PathBuf {
-    account_home.join("Library/Logs/mac-cleanup/deletions.log")
+    account_home.join(crate::paths::LOG_SUBPATH)
 }
 
 /// Append one cleanup attempt to the deletions log.

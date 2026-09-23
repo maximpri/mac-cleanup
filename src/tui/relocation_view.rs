@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 
 pub(super) fn render_relocation_sources(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -198,7 +199,7 @@ pub(super) fn render_relocation_destination(frame: &mut Frame<'_>, area: Rect, a
                 .fg(app.color(INK))
                 .add_modifier(Modifier::BOLD),
         )),
-        Line::from("Example: /Volumes/EXT_DISK/MacCleanup"),
+        Line::from("Example: /Volumes/EXT_DISK/Diskray"),
         Line::from("~ is expanded to the current account home."),
     ];
     if let Some(error) = &app.relocation_destination_error {

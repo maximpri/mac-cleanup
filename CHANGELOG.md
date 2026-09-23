@@ -6,8 +6,81 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- The startup volume's capacity came from the sealed system volume, so the
+  Data volume was reported as "other volumes" and the capacity figures did not
+  add up. Capacity and before/after free space now come from the Data volume.
+- In-use caches name the processes that block them.
+- Diskray and the terminal running it are no longer listed as findings.
+- Storage-only plans no longer spend about 25 seconds sampling CPU activity.
+
+### Safety
+
+- Whitelisted files inside a cleanup target are kept, and native cleanup
+  commands are skipped when they would remove one.
+- Age-based cleanup checks a folder's whole contents, not just its top level,
+  and skips anything held open.
+- Recycle bins on network and Windows-formatted volumes are review-only.
+- Relocation re-checks the source immediately before replacing it and never
+  deletes the only copy during a rollback.
+
+### Renamed and relicensed
+
+- **Mac Cleanup is now Diskray.** The binary is `diskray` and the AI helper is
+  `diskray-ai`. On first run, existing data moves automatically from
+  `~/Library/Application Support/mac-cleanup`, `~/Library/Logs/mac-cleanup`,
+  and `~/.config/mac-cleanup` to the matching `diskray` locations. A location is
+  moved only when the new one does not exist yet.
+- **License changed from MIT to GPL-3.0-or-later.** Every source file carries an
+  SPDX identifier.
+
 ### Added
 
+- `diskray why`: a one-screen, screenshot-friendly explanation of what fills
+  the disk, including hidden space, quick wins, and growth since an earlier
+  assessment (`--json`, `--since DAYS`, `--quick`).
+- `diskray ask "<question>"`: the on-device investigation without the
+  interface. Exit code 3 means local AI is unavailable (measured facts are still
+  printed); 4 means it timed out.
+- `diskray mcp`: a read-only Model Context Protocol server for coding agents,
+  speaking both the 2025-11-25 and 2026-07-28 protocol versions. Agents can only
+  save a cleanup proposal, which `diskray review` re-checks and confirms.
+- `diskray artifacts`: a report of build output in projects untouched for 60+
+  days, with how to rebuild each. Also on the `why` card and as an MCP tool.
+- Cleanup rules are data: bundled TOML rule packs, optional app packs that can
+  be disabled, user packs in `~/.config/diskray/rules`, and
+  `diskray rules list|check`.
+- Redesigned interface after a supervised usability run. The **Overview**
+  home screen lists where the space went, largest first, one line per item with
+  a plain verdict (*Safe to clear*, *In use by npx*, *App data · review*, *Your
+  files*); folders are opened until their names mean something; `a` adds every
+  quick win; three tabs (Overview · Explore · History) switch with `1`–`3` or
+  `Tab`; one status line replaces the progress band; `:` opens a command
+  palette; explanations lead with a plain sentence and what the checks found;
+  messages clear on the next key; Explore opens at the home folder.
+- `scripts/eval_agent.py`: fixture-based checks of `diskray ask` answers
+  (citations exist, suggestions eligible, fixtures unchanged, prompt injection
+  ignored).
+- Release engineering: `build-release.sh` skips the AI helper on unsupported
+  Macs, a tag-driven release workflow publishes a source tarball and updates
+  the Homebrew tap, and `packaging/homebrew/diskray.rb` is the formula.
+- Growth tracking: assessments record their volume, and History, the `why`
+  card, and a "What grew" finding show significant growth since the previous
+  complete assessment. Weekly baselines are kept for 12 weeks.
+
+- On-device tool calling: Apple Foundation Models now calls the app's own
+  read-only tools during an investigation. It can list folder children, profile
+  file ages, find open files, compare history, check cleanup rules, guess the
+  owning app, inspect and sample processes, read memory and disk accounting,
+  list mounted volumes, and read bundled Apple notes. Results become numbered
+  evidence the report must cite, and Rust validates every report.
+- `/` Ask box: one question answered with read-only tools on an answer page.
+- **AI SUGGESTS** badges on actions Rust already allows. The user still adds
+  and confirms every action.
+- One automatic investigation of the top key area after a scan, with a
+  three-call budget, memory-pressure pause, and stop on review.
+- Tool timelines, questions, and suggestions are kept in private History.
 - Unified Findings, Explore, History, and exact-action review plans across
   storage cleanup, process signals, and relocation.
 - On-device Apple FoundationModels explanations and bounded investigations,
@@ -25,6 +98,16 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   saved consent for fixed-catalog Apple documentation research.
 
 ### Changed
+
+- Helper protocol v3: one long-lived helper per investigation with concurrent,
+  call-ID-routed tool calls. This replaces the one-process-per-step `decide` loop.
+  One shared transport replaces five duplicated helper call paths.
+- Helper failures are reported in plain language (for example "still preparing
+  its model") instead of framework enum names.
+- Without a model, investigations run the same tools as a fixed measured
+  sequence and label the conclusion as having no AI.
+- The automatic investigation no longer starts under elevated pressure and then
+  silently never retries.
 
 - Replaced fixed post-insight diagnostic sequencing with one-step Apple FM
   decisions. Rust still owns every collector, timeout, evidence relationship,
@@ -141,4 +224,4 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - PID owner, parent, start-time, health, and ancestry revalidation immediately
   before any requested process signal; unattended cleanup never sends signals.
 
-[Unreleased]: https://github.com/maximpri/mac-cleanup/commits/main
+[Unreleased]: https://github.com/maximpri/diskray/commits/main

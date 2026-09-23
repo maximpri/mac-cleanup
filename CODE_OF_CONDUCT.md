@@ -1,6 +1,6 @@
 # Code of conduct
 
-Mac Cleanup is committed to a welcoming, safe, and respectful community.
+Diskray is committed to a welcoming, safe, and respectful community.
 
 ## Expected behavior
 

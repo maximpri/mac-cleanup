@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 
 pub(super) const MIN_WIDTH: u16 = 60;
@@ -58,7 +59,7 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &App) {
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         frame.render_widget(
             Paragraph::new(vec![
-                heading(app, "Mac Cleanup"),
+                heading(app, "Diskray"),
                 Line::from(""),
                 Line::from("Expand the terminal to at least 60 × 16."),
                 label(app, "Actions are paused. Esc goes back; q quits."),
@@ -233,7 +234,7 @@ pub(super) fn render_navigation(frame: &mut Frame<'_>, area: Rect, app: &App, _a
         Rect::new(area.x, area.y, area.width, TOP_BAR_HEIGHT),
     );
     frame.render_widget(
-        Paragraph::new(heading(app, " MAC CLEANUP")),
+        Paragraph::new(heading(app, " DISKRAY")),
         Rect::new(area.x, area.y, title_width, 1),
     );
     let names = if area.width >= 90 {

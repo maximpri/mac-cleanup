@@ -1,4 +1,4 @@
-# Mac Cleanup: purpose, product goals, and architecture
+# Diskray: purpose, product goals, and architecture
 
 The current product direction and end-to-end findings are in the
 [performance and cleanup journey review](PRODUCT_REVIEW.md). That review
@@ -11,39 +11,55 @@ provides historical design context. The current implementation checkpoint is in
   storage inventory; classifies deterministic quick wins; records read-only
   high-memory system daemons such as `fseventsd`; and stores private bounded
   session records.
-- `src/ai.rs` sends bounded structured metadata to a sibling helper, validates
-  response references/checks and policy-safe triage rankings, caches validated
-  insights by evidence revision, detects the Apple Foundation Models runtime,
-  falls back to visibly labeled measured triage ordering when needed, and
-  enforces inference cancellation and timeout. Triage uses short model-facing
-  IDs mapped back to findings; generated reasons are not shown as evidence.
-- `src/investigation.rs` owns bounded investigation cases for capacity coverage,
-  storage growth, memory pressure, CPU activity, filesystem activity, and
-  developer-data ownership. It validates typed evidence status, competing
-  hypotheses, model-selected check IDs, budgets, and supported/inconclusive
-  outcomes. A failed or denied collector cannot strengthen a hypothesis.
-- `native/AIHelper.swift` calls Apple's on-device FoundationModels API. It has
-  no filesystem action tool or remote fallback. Protocol v2 correlates request
-  IDs and reports helper/model capabilities. Dynamic generation schemas constrain
-  every evidence, action, hypothesis, and diagnostic reference to the IDs Rust
-  supplies; token preflight is used where the installed framework supports it.
-  The app revalidates evidence after generation because valid JSON alone does
-  not establish truthful prose. Online source research uses a fixed no-key Apple
-  catalog, short extracted passages, and a saved explicit opt-in.
-- `src/tui/care_view.rs` owns Findings/Explore/History, model activity visuals,
+- `src/ai.rs` owns the helper transport: one `HelperProcess` with non-blocking
+  line I/O (killed on drop), protocol-v3 correlation, a 32 KB line cap, and
+  plain-language error codes. One-shot requests serve capabilities, triage
+  (short model-facing IDs mapped back to findings, with a visibly labeled
+  measured fallback), and History outcome summaries.
+- `src/agent_tools.rs` defines the read-only tools the model may call, the
+  per-family toolsets (at most six, to fit the 4,096-token context), the
+  per-investigation handle table (`n#` folders, `p#` processes, `A#` eligible
+  actions), 560-byte output caps, and deterministic supports/contradicts
+  classification. Tools borrow app state or run existing collectors
+  (`storage::folder_age`, `care::open_handle_owners`, `care::identify_owner`,
+  `care::sample_process`, volume context, and the approval-gated trace).
+- `src/agent.rs` drives one investigation. The interface tick owns the run:
+  model tool calls arrive over the helper's pipe, are dispatched against a
+  borrowed `ToolWorld`, slow collectors run on threads, and results return as
+  numbered evidence. Budgets, deadlines, a context byte budget, approval waits,
+  a measured fallback sequence, and a report-only finisher are enforced here.
+  `validate_report` drops unissued references, downgrades unsupported verdicts,
+  recomputes completeness, and keeps only still-eligible suggestions.
+- `src/investigation.rs` owns the case record: hypotheses, typed evidence status,
+  the tool-call timeline, the question for Ask cases, and validated suggestions.
+  A failed or denied collector cannot strengthen a hypothesis. New fields default
+  so older History records still load.
+- `native/AIHelper.swift` calls Apple's on-device FoundationModels API. The
+  `agent` operation creates a `LanguageModelSession` with one bridged `Tool` per
+  Rust spec; each call is forwarded to Rust and answered on stdin through an
+  actor that routes replies by call ID, so concurrent calls are safe. Handle
+  arguments use regex-guided string schemas, and the final report uses a
+  dynamic schema whose hypothesis IDs are constrained to the case. A hard cap
+  stops a model that ignores its budget. The helper has no filesystem, shell,
+  or remote capability of its own. `selftest` exercises the bridge without a
+  model, and `measure` reports token budgets.
+- `src/tui/care_view.rs` owns Overview/Explore/History, the command palette, model activity visuals,
   shared review plans, sequential execution, and before/after observations.
 - Existing cache, process, whitelist, and relocation engines own all mutation
-  safeguards. No model-generated path or signal is executed.
+  safeguards. No model-generated path or signal is executed. Model suggestions
+  are badges on actions Rust already allows; the user adds and confirms them.
 - Administrator-assisted diagnostics are fixed read-only collectors. The TUI
   obtains explicit approval before invoking macOS authorization, records denial
   as unusable evidence, and never gives the model a shell or command arguments.
 - `scripts/build-release.sh` builds both binaries. `check_ai_helper.py` checks
-  framing without model assets, or exercises synthetic inference with `--live`.
+  framing and the tool bridge (concurrent calls, routing, caps, cancellation)
+  without model assets, or runs a live synthetic tool-using investigation and
+  prints token budgets with `--live`.
   `smoke_tui.py` checks terminal interactions and disposable-fixture cleanup.
 
 ## Purpose
 
-Mac Cleanup helps a Mac owner understand storage pressure and make deliberate
+Diskray helps a Mac owner understand storage pressure and make deliberate
 maintenance decisions. It accounts for filesystem usage, finds known disposable
 data, reviews process health, and can move useful directories to external storage.
 The useful outcome is an informed decision about an exact target; a large number
@@ -137,6 +153,14 @@ flowchart TD
 | `src/processes.rs` | Process inventory, identity checks, explicit signals |
 | `src/relocation.rs` | Validate destination, copy, verify, link, and rollback |
 | `src/plain.rs` | Plain text and JSON schema version 5 |
+| `src/rules.rs`, `rules/` | Cleanup rule packs as TOML: loading, validation, pinned native commands |
+| `src/headless.rs` | The read-only assessment without the interface, shared by `why`, `ask`, and MCP |
+| `src/why.rs` | The "why is the disk full" overview shared by `diskray why` and the Overview |
+| `src/commands.rs` | `why`, `ask`, `artifacts`, and `rules` subcommands |
+| `src/growth.rs` | Growth between comparable complete assessments |
+| `src/artifacts.rs` | Report-only search for stale build output in untouched projects |
+| `src/mcp.rs`, `src/pending.rs` | Read-only MCP server; agent proposals saved for `diskray review` |
+| `src/paths.rs`, `src/migrate.rs` | User-data locations and the one-time move from `mac-cleanup` |
 | `src/tui/mod.rs` | Session types, terminal lifecycle, event loop |
 | `src/tui/app.rs` | Scan and action orchestration, eligibility, worker results |
 | `src/tui/input.rs` | Keyboard/mouse routing, navigation, modal ownership |
@@ -184,7 +208,7 @@ MAC_CLEANUP_RENDER_DIR=target/design-previews \
 The live terminal smoke test is repeatable with:
 
 ```bash
-python3 scripts/smoke_tui.py target/release/mac-cleanup
+python3 scripts/smoke_tui.py target/release/diskray
 ```
 
 It checks navigation, help, resize behavior, JSON analysis, confirmation/cancel,

@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+schema = 1
+pack = "telegram"
+description = "Telegram for macOS: cached media and local account data."
+
+[[rule]]
+id = "cache"
+label = "Telegram cache"
+path = "Library/Caches/ru.keepcoder.Telegram"
+tier = "routine"
+processes = ["/Telegram.app/Contents/MacOS/Telegram"]
+note = "messages remain; media thumbnails reload"
+
+[[rule]]
+id = "local-data"
+label = "Telegram local data"
+path = "Library/Group Containers/6N38VWS5BX.ru.keepcoder.Telegram/stable"
+tier = "review"
+processes = ["/Telegram.app/Contents/MacOS/Telegram"]
+note = "local account and media data; use Telegram's Storage Usage controls"
+[rule.guidance]
+classification = "MESSAGING APP DATA — NOT A CACHE"
+delete_scope = "All Telegram account and media data stored inside this local directory."
+impact = "The app may require sign-in and downloads again; local-only state may be lost."
+recovery = "Cloud content may resync, but local-only data is not guaranteed to return."
+recommendation = "Use Telegram Settings → Data and Storage → Storage Usage first."

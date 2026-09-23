@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Explicit relocation of large user-owned directories to an external volume.
 //!
 //! Relocation is intentionally separate from cleanup. The source is copied to
@@ -233,6 +234,13 @@ fn execute_after_revalidation(prepared: &RelocationPlan) -> Result<ExecutionDeta
         )
     })?;
 
+    // Verifying a large copy takes time. Re-check right before the original
+    // moves aside so a file opened during verification is never stranded in a
+    // backup that is about to be deleted.
+    if let Err(error) = pre_link_checks(prepared) {
+        remove_owned_tree(&prepared.destination);
+        return Err(format!("{error}; the original was not moved"));
+    }
     if let Err(error) = fs::rename(&prepared.source, &backup) {
         remove_owned_tree(&prepared.destination);
         return Err(format!(
@@ -635,7 +643,8 @@ fn unique_sibling(path: &Path, role: &str) -> Result<PathBuf, String> {
         .map_err(|error| format!("system clock is before the Unix epoch: {error}"))?
         .as_nanos();
     let candidate = parent.join(format!(
-        ".mac-cleanup-{role}-{}-{}-{nonce}",
+        "{}-{role}-{}-{}-{nonce}",
+        crate::paths::RELOCATION_PREFIX,
         process::id(),
         name.to_string_lossy()
     ));
@@ -646,6 +655,21 @@ fn unique_sibling(path: &Path, role: &str) -> Result<PathBuf, String> {
         ));
     }
     Ok(candidate)
+}
+
+/// Last checks immediately before the source is renamed aside.
+fn pre_link_checks(plan: &RelocationPlan) -> Result<(), String> {
+    ensure_not_open(&plan.source)?;
+    ensure_related_process_closed(plan.process_pattern.as_deref())?;
+    let stats = tree_stats(&plan.source)
+        .map_err(|error| format!("the source could not be re-read before linking: {error}"))?;
+    if stats.logical_bytes != plan.logical_bytes
+        || stats.file_count != plan.file_count
+        || stats.directory_count != plan.directory_count
+    {
+        return Err("the source changed after the copy was verified".into());
+    }
+    Ok(())
 }
 
 fn remove_owned_tree(path: &Path) {
@@ -682,13 +706,18 @@ fn rollback_after_link_failure(
     {
         rollback_errors.push(format!("could not restore the original source: {error}"));
     }
-    remove_owned_tree(destination);
     if rollback_errors.is_empty() {
+        // The original is back in place, so the copy is redundant.
+        remove_owned_tree(destination);
         reason
     } else {
+        // Never delete the verified copy unless the original was restored:
+        // it may be the only intact version left.
         format!(
-            "{reason}; rollback also failed: {}",
-            rollback_errors.join("; ")
+            "{reason}; rollback also failed: {}. Your data is kept in two places: the original at {} and the verified copy at {}.",
+            rollback_errors.join("; "),
+            backup.display(),
+            destination.display()
         )
     }
 }
@@ -719,6 +748,63 @@ mod tests {
             account_home: source.parent().unwrap().to_path_buf(),
             process_pattern: None,
         }
+    }
+
+    #[test]
+    fn failed_rollback_keeps_both_copies_and_names_the_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let backup = temp.path().join(".backup");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&backup).unwrap();
+        fs::write(backup.join("data"), b"original").unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("data"), b"original").unwrap();
+        // An app recreated the source path, so the original cannot be restored.
+        fs::create_dir(&source).unwrap();
+
+        let message =
+            rollback_after_link_failure(&source, &backup, &destination, "link failed".into());
+
+        assert!(backup.join("data").exists(), "the original is kept");
+        assert!(
+            destination.join("data").exists(),
+            "the verified copy is kept"
+        );
+        assert!(message.contains(&backup.display().to_string()));
+        assert!(message.contains(&destination.display().to_string()));
+    }
+
+    #[test]
+    fn successful_rollback_restores_the_original_and_drops_the_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let backup = temp.path().join(".backup");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&backup).unwrap();
+        fs::write(backup.join("data"), b"original").unwrap();
+        fs::create_dir(&destination).unwrap();
+
+        let message =
+            rollback_after_link_failure(&source, &backup, &destination, "link failed".into());
+
+        assert_eq!(message, "link failed");
+        assert!(source.join("data").exists());
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn pre_link_checks_refuse_a_source_with_an_open_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination_root = temp.path().join("external");
+        let source = temp.path().join("source");
+        fs::create_dir(&destination_root).unwrap();
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("data"), b"content").unwrap();
+        let plan = test_plan(&source, &destination_root);
+        assert!(pre_link_checks(&plan).is_ok());
+        let _held = fs::File::open(source.join("data")).unwrap();
+        assert!(pre_link_checks(&plan).is_err());
     }
 
     #[test]

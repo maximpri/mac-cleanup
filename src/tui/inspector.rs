@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 
 pub(super) fn render_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -291,78 +292,29 @@ pub(super) fn decision_guidance(entry: &CacheEntry) -> DecisionGuidance {
     if entry.status == CacheStatus::Whitelisted {
         return DecisionGuidance {
             classification: "USER WHITELIST — NEVER CLEANED",
-            delete_scope: "Nothing. This path matches ~/.config/mac-cleanup/whitelist and every cleanup path refuses it.",
+            delete_scope: "Nothing. This path matches ~/.config/diskray/whitelist and every cleanup path refuses it.",
             impact: "The stored data stays exactly as it is until the whitelist entry is removed.",
             recovery: "Nothing to recover; no cleanup is attempted while it is whitelisted.",
             recommendation: "Remove the line from the whitelist file only if you want this location to become cleanable again.",
             color: BLUE,
         };
     }
-    match entry.spec.label {
-        "Xcode device support" => DecisionGuidance {
-            classification: "DEVELOPER SUPPORT DATA — NOT A CACHE",
-            delete_scope: "All installed iOS device-support files in this directory.",
-            impact: "Debugging connected devices may pause while Xcode restores compatible support files.",
-            recovery: "Usually downloadable again by Xcode, but older device support may be harder to restore.",
-            recommendation: "Remove unneeded Developer storage through Xcode or System Settings first.",
-            color: ORCHID,
-        },
-        "Xcode archives" => DecisionGuidance {
-            classification: "BUILD ARCHIVES — NOT A CACHE",
-            delete_scope: "Every Xcode archive here, including archived builds and their symbols.",
-            impact: "You may lose distribution history and dSYMs needed to symbolicate old crash reports.",
-            recovery: "Not automatically recoverable; keep archives or symbols required by shipped apps.",
-            recommendation: "Delete individual obsolete archives from Xcode Organizer instead.",
-            color: ORCHID,
-        },
-        "Simulator devices" => DecisionGuidance {
-            classification: "SIMULATOR DEVICES — NOT A CACHE",
-            delete_scope: "All simulator devices here, including installed apps, settings, and local app data.",
-            impact: "Simulator-only test data and configured devices will be lost.",
-            recovery: "Devices can be recreated, but their apps and local data cannot be reconstructed automatically.",
-            recommendation: "Remove only unwanted devices through Xcode's Devices and Simulators window.",
-            color: ORCHID,
-        },
-        "Cursor user data" => DecisionGuidance {
-            classification: "EDITOR USER DATA — NOT A CACHE",
-            delete_scope: "Cursor settings, keybindings, snippets, workspace state, history, and other user data here.",
-            impact: "Editor configuration and local workspace history may be permanently lost.",
-            recovery: "Only data already synced or backed up can be restored reliably.",
-            recommendation: "Clean up from Cursor or back up this directory before considering full deletion.",
-            color: ORCHID,
-        },
-        "Chrome DevTools MCP profile" => DecisionGuidance {
-            classification: "PERSISTENT BROWSER PROFILE — NOT A CACHE",
-            delete_scope: "The dedicated Chrome profile, including sessions, cookies, settings, and site data.",
-            impact: "MCP browser sessions and authenticated state stored in this profile will be lost.",
-            recovery: "The profile can be recreated, but unsynced session and site data cannot be restored automatically.",
-            recommendation: "Keep it unless you intentionally want to reset the Chrome DevTools MCP browser profile.",
-            color: ORCHID,
-        },
-        "OrbStack data" => DecisionGuidance {
-            classification: "CONTAINER AND VM DATA — NOT A CACHE",
-            delete_scope: "All OrbStack containers, images, Linux machines, and volumes stored here.",
-            impact: "Local services and persistent volume or machine data can be permanently lost.",
-            recovery: "Images may be pulled again; deleted machines and volume data are not automatically recoverable.",
-            recommendation: "Open OrbStack and remove unused items individually; use d here only to reset all local OrbStack data.",
-            color: ORCHID,
-        },
-        "Telegram local data" => DecisionGuidance {
-            classification: "MESSAGING APP DATA — NOT A CACHE",
-            delete_scope: "All Telegram account and media data stored inside this local directory.",
-            impact: "The app may require sign-in and downloads again; local-only state may be lost.",
-            recovery: "Cloud content may resync, but local-only data is not guaranteed to return.",
-            recommendation: "Use Telegram Settings → Data and Storage → Storage Usage first.",
-            color: ORCHID,
-        },
-        "Hugging Face models" => DecisionGuidance {
-            classification: "REINSTALLABLE MODEL DOWNLOADS",
-            delete_scope: "Cached Hugging Face repository snapshots, model files, and related hub data.",
-            impact: "Offline model use will stop and future runs may need a large download.",
-            recovery: "Usually downloadable again if the repository, revision, access, and network remain available.",
-            recommendation: "Prefer `hf cache rm <repo> --dry-run` or `hf cache prune --dry-run` to preview selective cleanup.",
-            color: AMBER,
-        },
+    if let Some(guidance) = crate::rules::for_label(entry.spec.label).and_then(|rule| rule.guidance)
+    {
+        return DecisionGuidance {
+            classification: guidance.classification,
+            delete_scope: guidance.delete_scope,
+            impact: guidance.impact,
+            recovery: guidance.recovery,
+            recommendation: guidance.recommendation,
+            color: match entry.spec.tier {
+                CacheTier::ReviewOnly => ORCHID,
+                CacheTier::Reinstallable => AMBER,
+                CacheTier::Routine => MINT,
+            },
+        };
+    }
+    match () {
         _ if entry.spec.tier == CacheTier::ReviewOnly => DecisionGuidance {
             classification: "APP-MANAGED DATA — NOT A CACHE",
             delete_scope: "Every item inside this app-managed directory; only the containing folder remains.",

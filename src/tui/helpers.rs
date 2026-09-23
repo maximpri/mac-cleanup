@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 
 pub(super) fn truncate_middle(value: &str, max_chars: usize) -> String {

@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+schema = 1
+pack = "orbstack"
+description = "OrbStack containers, images, machines, and volumes."
+
+[[rule]]
+id = "data"
+label = "OrbStack data"
+path = "Library/Group Containers/HUAQ24HBR6.dev.orbstack/data"
+tier = "review"
+processes = ["/OrbStack.app/", "[o]rbstack"]
+note = "containers, images, machines, and volumes; reclaim through OrbStack"
+advice = "Open OrbStack and remove unused items individually, or use `orbctl reset --yes` only when you accept its global scope; Diskray will not invoke it automatically."
+[rule.guidance]
+classification = "CONTAINER AND VM DATA — NOT A CACHE"
+delete_scope = "All OrbStack containers, images, Linux machines, and volumes stored here."
+impact = "Local services and persistent volume or machine data can be permanently lost."
+recovery = "Images may be pulled again; deleted machines and volume data are not automatically recoverable."
+recommendation = "Open OrbStack and remove unused items individually; use d here only to reset all local OrbStack data."

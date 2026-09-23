@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Read-only inventory of the storage behind a scan location.
 //!
 //! The cleanup candidates are intentionally narrow, but a useful storage
@@ -13,6 +14,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
 };
 
 use serde::Serialize;
@@ -92,6 +94,51 @@ pub enum StorageCategory {
 }
 
 impl StorageCategory {
+    /// One plain sentence about what this kind of folder usually holds.
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::PersonalData => "your own files: documents, media, projects",
+            Self::ApplicationData => "data that apps keep for you",
+            Self::DeveloperData => "developer tools, SDKs, simulators, and build data",
+            Self::Applications => "installed apps",
+            Self::SystemData => "macOS-managed data",
+            Self::TemporaryData => "temporary files",
+            Self::Other => "files outside the usual locations",
+        }
+    }
+
+    /// What to do about a large folder of this kind.
+    pub fn advice(self) -> &'static str {
+        match self {
+            Self::PersonalData => {
+                "These are your files. Open the folder to see what is large; move or archive what you no longer need."
+            }
+            Self::ApplicationData => {
+                "Reduce it from inside the app that owns it. Deleting app data directly can lose settings or content."
+            }
+            Self::DeveloperData => {
+                "Usually reduced from the tool that created it, for example Xcode or a package manager."
+            }
+            Self::Applications => "Uninstall apps you no longer use.",
+            Self::SystemData => "macOS manages this space. Diskray never changes it.",
+            Self::TemporaryData => "macOS and apps usually clean this up themselves.",
+            Self::Other => "Open the folder to see what is large before deciding anything.",
+        }
+    }
+
+    /// A short verdict for lists.
+    pub fn verdict(self) -> &'static str {
+        match self {
+            Self::PersonalData => "Your files",
+            Self::ApplicationData => "App data",
+            Self::DeveloperData => "Developer data",
+            Self::Applications => "Apps",
+            Self::SystemData => "macOS",
+            Self::TemporaryData => "Temporary",
+            Self::Other => "Other",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::PersonalData => "PERSONAL DATA",
@@ -143,6 +190,15 @@ pub struct StorageRoot {
     pub scan_errors: u64,
 }
 
+/// A measured walk checkpoint, not an estimate of the work remaining.
+#[derive(Debug, Clone, Default)]
+pub struct ScanProgress {
+    pub items: u64,
+    pub size_kb: u64,
+    pub errors: u64,
+    pub path: PathBuf,
+}
+
 impl StorageInventory {
     /// Run a complete inventory without a cancellation request.
     pub fn scan(scan_root: &Path, account_home: &Path) -> Self {
@@ -156,6 +212,15 @@ impl StorageInventory {
         account_home: &Path,
         cancel_requested: &AtomicBool,
     ) -> Self {
+        Self::scan_with_progress(scan_root, account_home, cancel_requested, &mut |_| {})
+    }
+
+    pub fn scan_with_progress(
+        scan_root: &Path,
+        account_home: &Path,
+        cancel_requested: &AtomicBool,
+        progress: &mut dyn FnMut(ScanProgress),
+    ) -> Self {
         let roots = inventory_roots(scan_root, account_home);
         let accounting_path = accounting_path(scan_root, account_home);
         let (volume, volume_error) = match read_volume_stats(&accounting_path) {
@@ -167,7 +232,7 @@ impl StorageInventory {
             .map(|stats| stats.device)
             .or_else(|| device_for(&accounting_path));
 
-        let mut scanner = InventoryScanner::new(cancel_requested);
+        let mut scanner = InventoryScanner::new(cancel_requested, progress);
         let mut root_reports = Vec::with_capacity(roots.len());
         for root in roots {
             if cancel_requested.load(Ordering::Relaxed) {
@@ -177,6 +242,7 @@ impl StorageInventory {
             let report = scanner.scan_root(&root);
             root_reports.push(report);
         }
+        scanner.report_progress(scan_root);
 
         let scanned_on_volume_kb = accounting_device.map_or(0, |device| {
             root_reports
@@ -283,6 +349,8 @@ impl StorageInventory {
 
 struct InventoryScanner<'a> {
     cancel_requested: &'a AtomicBool,
+    progress: &'a mut dyn FnMut(ScanProgress),
+    last_report: Instant,
     seen: HashSet<(u64, u64)>,
     top_level: Vec<StorageItem>,
     candidates: Vec<StorageItem>,
@@ -295,9 +363,11 @@ struct InventoryScanner<'a> {
 }
 
 impl<'a> InventoryScanner<'a> {
-    fn new(cancel_requested: &'a AtomicBool) -> Self {
+    fn new(cancel_requested: &'a AtomicBool, progress: &'a mut dyn FnMut(ScanProgress)) -> Self {
         Self {
             cancel_requested,
+            progress,
+            last_report: Instant::now(),
             seen: HashSet::new(),
             top_level: Vec::new(),
             candidates: Vec::new(),
@@ -308,6 +378,16 @@ impl<'a> InventoryScanner<'a> {
             error_paths: Vec::new(),
             cancelled: false,
         }
+    }
+
+    fn report_progress(&mut self, path: &Path) {
+        (self.progress)(ScanProgress {
+            items: self.scanned_items,
+            size_kb: self.scanned_kb,
+            errors: self.errors,
+            path: path.to_path_buf(),
+        });
+        self.last_report = Instant::now();
     }
 
     fn scan_root(&mut self, root: &Path) -> StorageRoot {
@@ -372,6 +452,9 @@ impl<'a> InventoryScanner<'a> {
         self.scanned_items += 1;
         let own_kb = blocks_to_kb(metadata.blocks());
         self.scanned_kb = self.scanned_kb.saturating_add(own_kb);
+        if self.scanned_items == 1 || self.last_report.elapsed() >= Duration::from_millis(200) {
+            self.report_progress(path);
+        }
 
         if kind != StorageItemKind::Directory {
             if own_kb > 0 && !is_root {
@@ -471,8 +554,196 @@ impl StorageItem {
     }
 }
 
+/// Folders whose names say nothing about what fills them. The breakdown
+/// always looks inside these instead of reporting them.
+const CONTAINER_NAMES: [&str; 16] = [
+    "Users",
+    "Library",
+    "Application Support",
+    "Containers",
+    "Group Containers",
+    "Caches",
+    "Developer",
+    "Xcode",
+    "CoreSimulator",
+    ".cache",
+    ".local",
+    "share",
+    "Data",
+    "private",
+    "var",
+    "opt",
+];
+
+/// macOS-managed locations, reported together as one row.
+fn is_macos_system(path: &Path) -> bool {
+    [
+        "/System",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/cores",
+        "/private/var/vm",
+    ]
+    .iter()
+    .any(|root| path.starts_with(root))
+        || path.ends_with("macOS Install Data")
+}
+
+/// Where the measured space went, as folders that mean something: folders
+/// are opened while their name is generic (`Library`, `Caches`), while one
+/// child holds most of their space, or while they contain a cleanup target,
+/// and never past a cleanup target. Items are non-overlapping and sorted
+/// largest first; macOS-managed space is summed into `macos_kb`.
+#[derive(Debug, Clone, Default)]
+pub struct Breakdown {
+    pub items: Vec<StorageItem>,
+    pub macos_kb: u64,
+}
+
+pub fn breakdown(inventory: &StorageInventory, targets: &[PathBuf], min_kb: u64) -> Breakdown {
+    let mut result = Breakdown::default();
+    let mut pending: Vec<(StorageItem, usize)> = inventory
+        .top_level
+        .iter()
+        .map(|item| (item.clone(), 0))
+        .collect();
+    while let Some((item, depth)) = pending.pop() {
+        if is_macos_system(&item.path) {
+            result.macos_kb += item.size_kb;
+            continue;
+        }
+        if item.size_kb < min_kb {
+            continue;
+        }
+        let children = inventory
+            .children
+            .get(&item.path)
+            .filter(|children| !children.is_empty());
+        let is_target = targets.iter().any(|target| target == &item.path);
+        let open = !is_target
+            && depth < 10
+            && item.kind == StorageItemKind::Directory
+            && children.is_some_and(|children| {
+                let generic = item
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| CONTAINER_NAMES.contains(&name))
+                    || item.path.parent() == Some(Path::new("/Users"));
+                let dominant = children
+                    .iter()
+                    .map(|child| child.size_kb)
+                    .max()
+                    .is_some_and(|largest| largest * 10 >= item.size_kb * 6);
+                let holds_target = targets
+                    .iter()
+                    .any(|target| target != &item.path && target.starts_with(&item.path));
+                generic || dominant || holds_target
+            });
+        match children.filter(|_| open) {
+            Some(children) => {
+                pending.extend(children.iter().map(|child| (child.clone(), depth + 1)))
+            }
+            None => result.items.push(item),
+        }
+    }
+    result.items.sort_by(|left, right| {
+        right
+            .size_kb
+            .cmp(&left.size_kb)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    result
+}
+
 fn blocks_to_kb(blocks: u64) -> u64 {
     blocks.saturating_add(1) / 2
+}
+
+/// Allocated space under a folder grouped by each file's last modification.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgeProfile {
+    pub files: u64,
+    pub total_kb: u64,
+    /// Allocated KB changed within 7 days, 7–90 days, 90–365 days, and earlier.
+    pub buckets_kb: [u64; 4],
+    /// Seconds since the most recent file modification.
+    pub newest_age_secs: Option<u64>,
+    /// False when the entry or time limit stopped the walk early.
+    pub complete: bool,
+    pub errors: u64,
+}
+
+/// Bounded, read-only walk that never follows symlinks or leaves the device.
+pub fn folder_age(
+    root: &Path,
+    max_entries: u64,
+    limit: Duration,
+    cancel: &AtomicBool,
+) -> io::Result<AgeProfile> {
+    const DAY: u64 = 86_400;
+    let metadata = fs::symlink_metadata(root)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::other("not a real directory"));
+    }
+    let device = metadata.dev();
+    let now = std::time::SystemTime::now();
+    let started = Instant::now();
+    let mut profile = AgeProfile {
+        complete: true,
+        ..Default::default()
+    };
+    let mut entries = 0_u64;
+    let mut pending = vec![root.to_path_buf()];
+    'walk: while let Some(directory) = pending.pop() {
+        let Ok(reader) = fs::read_dir(&directory) else {
+            profile.errors += 1;
+            continue;
+        };
+        for item in reader {
+            entries += 1;
+            if entries > max_entries || started.elapsed() > limit || cancel.load(Ordering::Relaxed)
+            {
+                profile.complete = false;
+                break 'walk;
+            }
+            let Ok(item) = item else {
+                profile.errors += 1;
+                continue;
+            };
+            let Ok(metadata) = fs::symlink_metadata(item.path()) else {
+                profile.errors += 1;
+                continue;
+            };
+            if metadata.file_type().is_symlink() || metadata.dev() != device {
+                continue;
+            }
+            if metadata.is_dir() {
+                pending.push(item.path());
+                continue;
+            }
+            let kb = blocks_to_kb(metadata.blocks());
+            let age = metadata
+                .modified()
+                .ok()
+                .map(|modified| now.duration_since(modified).unwrap_or_default().as_secs())
+                .unwrap_or(u64::MAX);
+            let bucket = match age {
+                age if age <= 7 * DAY => 0,
+                age if age <= 90 * DAY => 1,
+                age if age <= 365 * DAY => 2,
+                _ => 3,
+            };
+            profile.files += 1;
+            profile.total_kb += kb;
+            profile.buckets_kb[bucket] += kb;
+            if age != u64::MAX {
+                profile.newest_age_secs = Some(profile.newest_age_secs.map_or(age, |n| n.min(age)));
+            }
+        }
+    }
+    Ok(profile)
 }
 
 fn select_largest_candidates(mut candidates: Vec<StorageItem>) -> Vec<StorageItem> {
@@ -550,7 +821,7 @@ fn is_real_directory(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn accounting_path(scan_root: &Path, account_home: &Path) -> PathBuf {
+pub(crate) fn accounting_path(scan_root: &Path, account_home: &Path) -> PathBuf {
     if scan_root == Path::new("/") {
         // Prefer the APFS data volume itself so `df` describes the same
         // filesystem that contains the user's data. A network home or an
@@ -710,7 +981,16 @@ fn classify_path(path: &Path) -> StorageCategory {
         .collect();
     let joined = components.join("/");
 
-    if components.iter().any(|component| {
+    if joined.starts_with("private/tmp")
+        || joined.starts_with("private/var/folders")
+        || joined.starts_with("tmp")
+    {
+        StorageCategory::TemporaryData
+    } else if components.last().is_some_and(|last| last == "library") {
+        StorageCategory::ApplicationData
+    } else if joined.starts_with("opt/homebrew") || joined.starts_with("usr/local/cellar") {
+        StorageCategory::DeveloperData
+    } else if components.iter().any(|component| {
         matches!(
             component.as_str(),
             "documents" | "downloads" | "desktop" | "movies" | "music" | "pictures" | "public"
@@ -763,7 +1043,125 @@ fn classify_path(path: &Path) -> StorageCategory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn breakdown_opens_generic_folders_and_stops_at_cleanup_targets() {
+        let gib = 1_048_576;
+        let dir = |path: &str, size_kb: u64| {
+            StorageItem::new(Path::new(path), size_kb, StorageItemKind::Directory)
+        };
+        let mut inventory = StorageInventory::unavailable(Path::new("/"), "test");
+        inventory.top_level = vec![
+            dir("/Users", 60 * gib),
+            dir("/System", 20 * gib),
+            dir("/Applications", 8 * gib),
+        ];
+        let mut children = BTreeMap::new();
+        children.insert(PathBuf::from("/Users"), vec![dir("/Users/me", 60 * gib)]);
+        children.insert(
+            PathBuf::from("/Users/me"),
+            vec![
+                dir("/Users/me/Library", 35 * gib),
+                dir("/Users/me/Movies", 25 * gib),
+            ],
+        );
+        children.insert(
+            PathBuf::from("/Users/me/Library"),
+            vec![
+                dir("/Users/me/Library/Developer", 30 * gib),
+                dir("/Users/me/Library/Mail", 5 * gib),
+            ],
+        );
+        children.insert(
+            PathBuf::from("/Users/me/Library/Developer"),
+            vec![dir("/Users/me/Library/Developer/CoreSimulator", 30 * gib)],
+        );
+        children.insert(
+            PathBuf::from("/Users/me/Library/Developer/CoreSimulator"),
+            vec![dir(
+                "/Users/me/Library/Developer/CoreSimulator/Devices",
+                29 * gib,
+            )],
+        );
+        children.insert(
+            PathBuf::from("/Users/me/Library/Developer/CoreSimulator/Devices"),
+            vec![dir(
+                "/Users/me/Library/Developer/CoreSimulator/Devices/A",
+                29 * gib,
+            )],
+        );
+        children.insert(
+            PathBuf::from("/Users/me/Movies"),
+            vec![
+                dir("/Users/me/Movies/a", 13 * gib),
+                dir("/Users/me/Movies/b", 12 * gib),
+            ],
+        );
+        inventory.children = children;
+        let targets = [PathBuf::from(
+            "/Users/me/Library/Developer/CoreSimulator/Devices",
+        )];
+        let result = breakdown(&inventory, &targets, 1024);
+        let paths: Vec<_> = result
+            .items
+            .iter()
+            .map(|item| item.path.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "/Users/me/Library/Developer/CoreSimulator/Devices",
+                "/Users/me/Movies",
+                "/Applications",
+                "/Users/me/Library/Mail",
+            ],
+            "generic folders are opened, a cleanup target is never opened, and balanced folders stay whole"
+        );
+        assert_eq!(result.macos_kb, 20 * gib);
+    }
     use std::io::Write;
+
+    #[test]
+    fn folder_age_buckets_allocated_space_by_modification_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let day = Duration::from_secs(86_400);
+        let now = std::time::SystemTime::now();
+        fs::create_dir(temp.path().join("nested")).unwrap();
+        for (name, age) in [
+            ("fresh.bin", Duration::ZERO),
+            ("month.bin", day * 30),
+            ("nested/half-year.bin", day * 200),
+            ("nested/ancient.bin", day * 800),
+        ] {
+            let path = temp.path().join(name);
+            fs::write(&path, vec![1; 64 * 1024]).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(now - age)
+                .unwrap();
+        }
+        std::os::unix::fs::symlink("/", temp.path().join("root-link")).unwrap();
+        let never = AtomicBool::new(false);
+        let profile = folder_age(temp.path(), 1000, Duration::from_secs(5), &never).unwrap();
+        assert_eq!(profile.files, 4);
+        assert!(profile.complete);
+        assert!(profile.buckets_kb.iter().all(|kb| *kb > 0));
+        assert_eq!(profile.total_kb, profile.buckets_kb.iter().sum::<u64>());
+        assert!(profile.newest_age_secs.unwrap() < 60);
+        let limited = folder_age(temp.path(), 2, Duration::from_secs(5), &never).unwrap();
+        assert!(!limited.complete, "an entry cap reports a partial walk");
+        assert!(
+            folder_age(
+                &temp.path().join("fresh.bin"),
+                10,
+                Duration::from_secs(1),
+                &never
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn exploration_retains_all_children_and_classifies_user_app_data() {
@@ -880,6 +1278,44 @@ mod tests {
         assert_eq!(report.free_kb, 300);
         assert_eq!(report.device, 42);
         assert_eq!(report.container_free_kb, None);
+    }
+
+    #[test]
+    fn progress_reports_actual_monotonic_work_and_final_totals() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("documents")).unwrap();
+        fs::write(temp.path().join("documents/example"), [1_u8; 8192]).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut progress = Vec::new();
+        let inventory =
+            StorageInventory::scan_with_progress(temp.path(), temp.path(), &cancel, &mut |p| {
+                progress.push(p)
+            });
+        assert!(progress.len() >= 2);
+        assert!(
+            progress
+                .windows(2)
+                .all(|p| p[0].items <= p[1].items && p[0].size_kb <= p[1].size_kb)
+        );
+        let last = progress.last().unwrap();
+        assert_eq!(last.items, inventory.scanned_items);
+        assert_eq!(last.size_kb, inventory.scanned_kb);
+        assert_eq!(last.errors, inventory.scan_errors);
+        assert_eq!(last.path, temp.path());
+    }
+
+    #[test]
+    fn progress_preserves_cancellation_and_does_not_claim_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("untouched"), [1_u8; 8192]).unwrap();
+        let cancel = AtomicBool::new(false);
+        let inventory =
+            StorageInventory::scan_with_progress(temp.path(), temp.path(), &cancel, &mut |_| {
+                cancel.store(true, Ordering::Relaxed)
+            });
+        assert!(!inventory.complete);
+        assert!(temp.path().join("untouched").exists());
+        assert!(inventory.scanned_items <= 1);
     }
 
     #[test]

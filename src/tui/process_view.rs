@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 
 pub(super) fn render_process_table(frame: &mut Frame<'_>, area: Rect, app: &App) {

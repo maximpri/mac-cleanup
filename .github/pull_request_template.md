@@ -1,6 +1,6 @@
 ## Summary
 
-Describe the user-visible change and why it belongs in Mac Cleanup.
+Describe the user-visible change and why it belongs in Diskray.
 
 ## Safety impact
 
@@ -14,5 +14,5 @@ confirmations, or deletion behavior. Write `None` when they are unaffected.
 - [ ] `cargo test --all-targets --locked`
 - [ ] `cargo build --release --locked`
 - [ ] Tests use disposable directories and do not delete real user data.
-- [ ] User-visible behavior is documented in `README.md` and `CHANGELOG.md`.
+- [ ] User-visible behavior is documented (`README.md` or `docs/`) and in `CHANGELOG.md`.
 - [ ] No personal paths, cache listings, credentials, or generated reports are included.

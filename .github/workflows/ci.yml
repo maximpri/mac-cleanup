@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -30,6 +31,9 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
       - name: Check formatting
         run: cargo +stable fmt --all --check
 
@@ -50,6 +54,15 @@ jobs:
       - name: Check Apple helper protocol
         run: python3 scripts/check_ai_helper.py
 
+      - name: Check MCP server
+        run: python3 scripts/check_mcp.py target/release/diskray
+
+      - name: Check eval safety rules (quality needs Apple Intelligence)
+        run: python3 scripts/eval_agent.py target/release/diskray --runs 1
+
+      - name: Validate bundled rule packs
+        run: for pack in rules/*.toml rules/*/*.toml; do ./target/release/diskray rules check "$pack"; done
+
       - name: Validate source package
         run: cargo +stable package --locked
 
@@ -66,6 +79,9 @@ jobs:
 
       - name: Install Rust 1.88
         uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88.0
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Check minimum supported Rust version
         run: cargo +1.88.0 check --all-targets --locked

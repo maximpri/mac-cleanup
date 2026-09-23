@@ -1,0 +1,263 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Core cleanup rules. Every path is relative to the account home. See
+# docs/RULES.md for the schema and validation rules.
+schema = 1
+pack = "core"
+description = "Caches and temporary data that common macOS apps and developer tools rebuild."
+
+[[rule]]
+id = "trash"
+label = "Trash"
+path = ".Trash"
+tier = "routine"
+note = "files already moved to Trash"
+
+[[rule]]
+id = "pip"
+label = "pip cache"
+path = "Library/Caches/pip"
+tier = "routine"
+processes = ["[p]ip(3)? (install|download|cache)"]
+note = "downloaded Python packages"
+quick_win = true
+native = "pip"
+
+[[rule]]
+id = "node-gyp"
+label = "node-gyp cache"
+path = "Library/Caches/node-gyp"
+tier = "routine"
+processes = ["[n]ode-gyp"]
+note = "downloaded Node build files"
+quick_win = true
+
+[[rule]]
+id = "homebrew"
+label = "Homebrew cache"
+path = "Library/Caches/Homebrew"
+tier = "routine"
+processes = ["[b]rew (install|upgrade|update|cleanup)"]
+note = "downloaded Homebrew files"
+quick_win = true
+
+[[rule]]
+id = "python"
+label = "Python cache"
+path = "Library/Caches/com.apple.python"
+tier = "routine"
+processes = ["[p]ython(3)? .*pip"]
+note = "Python-generated cache files"
+quick_win = true
+
+[[rule]]
+id = "safari"
+label = "Safari cache"
+path = "Library/Caches/com.apple.Safari"
+tier = "routine"
+processes = ["/Safari.app/Contents/MacOS/Safari"]
+note = "website cache reloads; profiles and browsing data remain"
+
+[[rule]]
+id = "firefox"
+label = "Firefox cache"
+path = "Library/Caches/Firefox"
+tier = "routine"
+processes = ["/Firefox.app/Contents/MacOS/firefox"]
+note = "website cache reloads; profiles and browsing data remain"
+
+[[rule]]
+id = "npm"
+label = "npm package cache"
+path = ".npm/_cacache"
+tier = "routine"
+processes = ["[n]pm ", "[n]px "]
+note = "downloaded npm packages"
+quick_win = true
+advice = "Use npm's cache command only when you accept its cache-root scope; Diskray removes only the exact allowlisted directory and will not sweep the rest of `~/.npm`."
+
+[[rule]]
+id = "go-build"
+label = "Go build cache"
+path = "Library/Caches/go-build"
+tier = "routine"
+processes = ["[g]o (build|test|install|run)"]
+note = "compiled Go build artifacts"
+native = "go"
+
+[[rule]]
+id = "uv"
+label = "uv package cache"
+path = ".cache/uv"
+tier = "routine"
+processes = ["[u]v (add|build|cache|pip|run|sync)"]
+note = "downloaded Python packages and build artifacts"
+quick_win = true
+native = "uv"
+
+[[rule]]
+id = "yarn"
+label = "Yarn package cache"
+path = "Library/Caches/Yarn"
+tier = "routine"
+processes = ["[y]arn "]
+note = "downloaded JavaScript packages"
+quick_win = true
+native = "yarn"
+
+[[rule]]
+id = "xcode-derived-data"
+label = "Xcode derived data"
+path = "Library/Developer/Xcode/DerivedData"
+tier = "routine"
+processes = ["/Xcode.app/", "[x]codebuild"]
+associate = ["/xcode.app/", "/xcodebuild"]
+note = "indexes and build products will be regenerated"
+
+[[rule]]
+id = "simulator-cache"
+label = "Simulator cache"
+path = "Library/Developer/CoreSimulator/Caches"
+tier = "routine"
+processes = ["[S]imulator.app/", "[C]oreSimulator"]
+note = "simulator cache data will be regenerated"
+
+[[rule]]
+id = "swiftpm"
+label = "SwiftPM cache"
+path = "Library/Caches/org.swift.swiftpm"
+tier = "reinstallable"
+processes = ["[s]wift (build|package|run|test)", "[s]wift-(build|package)"]
+note = "package metadata and downloads will be regenerated"
+advice = "Use `swift package purge-cache` from the owning package workflow; Diskray only removes the exact allowlisted path and will not invoke a broader global command."
+
+[[rule]]
+id = "playwright"
+label = "Playwright browsers"
+path = "Library/Caches/ms-playwright"
+tier = "reinstallable"
+processes = ["[p]laywright", "[m]s-playwright"]
+associate = ["/ms-playwright/"]
+note = "browser binaries download again"
+native = "playwright"
+
+[[rule]]
+id = "npx"
+label = "npm npx packages"
+path = ".npm/_npx"
+tier = "reinstallable"
+processes = ["[n]pm ", "[n]px "]
+note = "temporary npx packages install again"
+advice = "Use npm's cache command only when you accept its cache-root scope; Diskray removes only the exact allowlisted directory and will not sweep the rest of `~/.npm`."
+
+[[rule]]
+id = "gradle"
+label = "Gradle caches"
+path = ".gradle/caches"
+tier = "reinstallable"
+processes = ["[g]radle", "[G]radleDaemon"]
+note = "dependencies and build tooling download again"
+
+[[rule]]
+id = "cocoapods"
+label = "CocoaPods cache"
+path = "Library/Caches/CocoaPods"
+tier = "reinstallable"
+processes = ["[/ ]pod (cache|install|repo|update)"]
+note = "downloaded Pods install again"
+advice = "Use `pod cache clean --all` from CocoaPods when you accept its global scope; Diskray only removes the exact allowlisted path and will not invoke that broader command."
+
+[[rule]]
+id = "cypress"
+label = "Cypress runtimes"
+path = "Library/Caches/Cypress"
+tier = "reinstallable"
+processes = ["[c]ypress"]
+note = "Cypress application binaries download again"
+native = "cypress"
+
+[[rule]]
+id = "huggingface"
+label = "Hugging Face models"
+path = ".cache/huggingface/hub"
+tier = "reinstallable"
+processes = ["[h]uggingface", "[t]ransformers"]
+note = "models and datasets download again"
+native = "huggingface"
+[rule.guidance]
+classification = "REINSTALLABLE MODEL DOWNLOADS"
+delete_scope = "Cached Hugging Face repository snapshots, model files, and related hub data."
+impact = "Offline model use will stop and future runs may need a large download."
+recovery = "Usually downloadable again if the repository, revision, access, and network remain available."
+recommendation = "Prefer `hf cache rm <repo> --dry-run` or `hf cache prune --dry-run` to preview selective cleanup."
+
+[[rule]]
+id = "xcode-device-support"
+label = "Xcode device support"
+path = "Library/Developer/Xcode/iOS DeviceSupport"
+tier = "review"
+processes = ["/Xcode.app/", "[x]codebuild"]
+associate = ["/xcode.app/", "/xcodebuild"]
+note = "old iOS support files; review Developer storage in System Settings"
+[rule.guidance]
+classification = "DEVELOPER SUPPORT DATA — NOT A CACHE"
+delete_scope = "All installed iOS device-support files in this directory."
+impact = "Debugging connected devices may pause while Xcode restores compatible support files."
+recovery = "Usually downloadable again by Xcode, but older device support may be harder to restore."
+recommendation = "Remove unneeded Developer storage through Xcode or System Settings first."
+
+[[rule]]
+id = "xcode-archives"
+label = "Xcode archives"
+path = "Library/Developer/Xcode/Archives"
+tier = "review"
+processes = ["/Xcode.app/", "[x]codebuild"]
+associate = ["/xcode.app/", "/xcodebuild"]
+note = "signed build archives may be needed for distribution or symbolication"
+[rule.guidance]
+classification = "BUILD ARCHIVES — NOT A CACHE"
+delete_scope = "Every Xcode archive here, including archived builds and their symbols."
+impact = "You may lose distribution history and dSYMs needed to symbolicate old crash reports."
+recovery = "Not automatically recoverable; keep archives or symbols required by shipped apps."
+recommendation = "Delete individual obsolete archives from Xcode Organizer instead."
+
+[[rule]]
+id = "simulator-devices"
+label = "Simulator devices"
+path = "Library/Developer/CoreSimulator/Devices"
+tier = "review"
+processes = ["[S]imulator.app/", "[C]oreSimulator"]
+note = "simulators may contain apps and data; remove unneeded devices in Xcode"
+advice = "Remove unneeded devices in Xcode or with `xcrun simctl` after reviewing their data; Diskray will not run a global delete-all command."
+[rule.guidance]
+classification = "SIMULATOR DEVICES — NOT A CACHE"
+delete_scope = "All simulator devices here, including installed apps, settings, and local app data."
+impact = "Simulator-only test data and configured devices will be lost."
+recovery = "Devices can be recreated, but their apps and local data cannot be reconstructed automatically."
+recommendation = "Remove only unwanted devices through Xcode's Devices and Simulators window."
+
+[[rule]]
+id = "user-logs"
+label = "User logs"
+path = "Library/Logs"
+target = "aged"
+min_age_days = 7
+tier = "routine"
+note = "log entries older than 7 days; applications start fresh logs"
+
+[[rule]]
+id = "saved-app-state"
+label = "Saved app state"
+path = "Library/Saved Application State"
+target = "aged"
+min_age_days = 30
+tier = "routine"
+note = "window-restoration data older than 30 days; newer entries stay"
+
+[[rule]]
+id = "crash-reports"
+label = "Crash reports"
+path = "Library/DiagnosticReports"
+target = "aged"
+min_age_days = 30
+tier = "routine"
+note = "crash and hang reports older than 30 days"

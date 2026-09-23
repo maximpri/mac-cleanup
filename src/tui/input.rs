@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 
 impl App {
@@ -847,6 +848,12 @@ impl App {
     }
 
     pub(super) fn begin_process_signal(&mut self, signal: ProcessSignal) {
+        // The shipped interface always runs the care workspace, which executes
+        // only reviewed plans after a typed confirmation. This older single-key
+        // path stays reachable only from its own tests.
+        if self.care.is_some() {
+            return;
+        }
         let Some(index) = self.process_target.take() else {
             self.phase = Phase::Processes;
             return;

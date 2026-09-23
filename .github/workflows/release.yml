@@ -1,0 +1,92 @@
+name: Release
+
+# On a version tag: run the full quality gate, publish a source tarball with a
+# SHA-256 checksum to the GitHub Release, and open a pull request in the
+# Homebrew tap that points the formula at it.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish source release
+    needs: quality
+    runs-on: macos-26
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Check the tag matches Cargo.toml
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          grep -q "^version = \"$version\"$" Cargo.toml || {
+            echo "Tag $GITHUB_REF_NAME does not match the version in Cargo.toml" >&2
+            exit 1
+          }
+
+      - name: Build source tarball and checksum
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          name="diskray-$version"
+          git archive --format=tar.gz --prefix="$name/" -o "$name.tar.gz" "$GITHUB_REF_NAME"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          cat "$name.tar.gz.sha256"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "See CHANGELOG.md." > notes.md
+          gh release create "$GITHUB_REF_NAME" \
+            "diskray-$version.tar.gz" "diskray-$version.tar.gz.sha256" \
+            --title "Diskray $version" --notes-file notes.md --verify-tag
+
+  tap:
+    name: Update the Homebrew tap
+    needs: publish
+    runs-on: macos-26
+    timeout-minutes: 10
+    # Needs a fine-grained TAP_TOKEN with contents and pull-request write
+    # access to maximpri/homebrew-diskray only.
+    if: ${{ vars.TAP_ENABLED == 'true' }}
+
+    steps:
+      - name: Open a formula update pull request
+        env:
+          GH_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/diskray-${version}.tar.gz"
+          sha=$(curl -fsSL "${url}.sha256" | cut -d' ' -f1)
+          gh repo clone maximpri/homebrew-diskray tap -- --depth 1
+          cd tap
+          branch="diskray-$version"
+          git checkout -b "$branch"
+          sed -i '' -E \
+            -e "s|^  url \".*\"|  url \"${url}\"|" \
+            -e "s|^  sha256 \".*\"|  sha256 \"${sha}\"|" \
+            Formula/diskray.rb
+          git -c user.name="diskray-release" -c user.email="diskray-release@users.noreply.github.com" \
+            commit -am "diskray $version"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/maximpri/homebrew-diskray.git" "$branch"
+          gh pr create --repo maximpri/homebrew-diskray --head "$branch" \
+            --title "diskray $version" --body "Update diskray to $version ($url)."

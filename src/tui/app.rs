@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 
 impl App {
@@ -530,6 +531,12 @@ impl App {
     }
 
     pub(super) fn begin_relocation(&mut self) {
+        // The shipped interface always runs the care workspace, which executes
+        // only reviewed plans after a typed confirmation. This older single-key
+        // path stays reachable only from its own tests.
+        if self.care.is_some() {
+            return;
+        }
         if self.analysis_only {
             self.phase = Phase::RelocationDestination;
             return;
@@ -849,6 +856,12 @@ impl App {
     }
 
     pub(super) fn begin_cleanup(&mut self) {
+        // The shipped interface always runs the care workspace, which executes
+        // only reviewed plans after a typed confirmation. This older single-key
+        // path stays reachable only from its own tests.
+        if self.care.is_some() {
+            return;
+        }
         self.cleanup_queue = self.selected.iter().copied().collect();
         self.cleanup_index = 0;
         self.cleanup_kind = CleanupKind::Cache;
@@ -861,6 +874,12 @@ impl App {
     }
 
     pub(super) fn begin_review_cleanup(&mut self) {
+        // The shipped interface always runs the care workspace, which executes
+        // only reviewed plans after a typed confirmation. This older single-key
+        // path stays reachable only from its own tests.
+        if self.care.is_some() {
+            return;
+        }
         let Some(target) = self.review_target.take() else {
             self.phase = Phase::Review;
             return;

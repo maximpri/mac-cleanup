@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+schema = 1
+pack = "tradingview"
+description = "TradingView Desktop updater downloads."
+
+[[rule]]
+id = "updater"
+label = "TradingView updater"
+path = "Library/Caches/tradingview-desktop-updater"
+tier = "routine"
+processes = ["/TradingView.app/", "[t]radingview-desktop-updater"]
+note = "obsolete updater downloads"

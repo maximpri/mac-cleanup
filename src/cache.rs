@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 use std::{
     collections::HashSet,
     env,
@@ -130,7 +131,7 @@ impl CacheStatus {
             Self::Invalid => "The allowlisted path is not a directory.",
             Self::Missing => "No cache directory exists at this location.",
             Self::Whitelisted => {
-                "Matches the user whitelist (~/.config/mac-cleanup/whitelist); it is never cleaned."
+                "Matches the user whitelist (~/.config/diskray/whitelist); it is never cleaned."
             }
         }
     }
@@ -161,16 +162,20 @@ pub enum CleanupOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CleanupMethod {
     ExactPath,
+    /// Exact-path cleanup that left whitelisted or still-open items in place.
+    ExactPathKeeping {
+        kept: usize,
+    },
     NativeUnavailableThenExactPath {
         command: &'static str,
     },
+    /// The native command was not run because a whitelisted path is inside.
+    NativeSkippedForWhitelist {
+        command: &'static str,
+        kept: usize,
+    },
     Native {
         command: &'static str,
-        fallback_used: bool,
-    },
-    NativeFailedThenExactPath {
-        command: &'static str,
-        error: String,
     },
 }
 
@@ -178,20 +183,16 @@ impl CleanupMethod {
     pub fn explanation(&self) -> String {
         match self {
             Self::ExactPath => "exact-path filesystem cleanup (no safe scoped command)".into(),
+            Self::ExactPathKeeping { kept } => format!(
+                "exact-path filesystem cleanup; kept {kept} whitelisted or still-open item(s)"
+            ),
+            Self::NativeSkippedForWhitelist { command, kept } => format!(
+                "exact-path cleanup; `{command}` was skipped because a whitelisted path is inside, and {kept} protected item(s) were kept"
+            ),
             Self::NativeUnavailableThenExactPath { command } => {
                 format!("exact-path cleanup (`{command}` was not available for this account)")
             }
-            Self::Native {
-                command,
-                fallback_used: false,
-            } => format!("native command: {command}"),
-            Self::Native {
-                command,
-                fallback_used: true,
-            } => format!("native command first ({command}), then exact-path leftovers"),
-            Self::NativeFailedThenExactPath { command, error } => {
-                format!("exact-path fallback after `{command}` failed: {error}")
-            }
+            Self::Native { command } => format!("native command: {command}"),
         }
     }
 }
@@ -229,302 +230,10 @@ impl ScanLocationKind {
     }
 }
 
+/// Every active rule under an account home. Rules come from the rule packs
+/// in `rules/` plus any user packs; see `crate::rules`.
 pub fn cache_specs(root: &Path) -> Vec<CacheSpec> {
-    let definitions = [
-        (
-            ".Trash",
-            "Trash",
-            CacheTier::Routine,
-            "",
-            "files already moved to Trash",
-        ),
-        (
-            "Library/Caches/pip",
-            "pip cache",
-            CacheTier::Routine,
-            "[p]ip(3)? (install|download|cache)",
-            "downloaded Python packages",
-        ),
-        (
-            "Library/Caches/node-gyp",
-            "node-gyp cache",
-            CacheTier::Routine,
-            "[n]ode-gyp",
-            "downloaded Node build files",
-        ),
-        (
-            "Library/Caches/Homebrew",
-            "Homebrew cache",
-            CacheTier::Routine,
-            "[b]rew (install|upgrade|update|cleanup)",
-            "downloaded Homebrew files",
-        ),
-        (
-            "Library/Caches/com.apple.python",
-            "Python cache",
-            CacheTier::Routine,
-            "[p]ython(3)? .*pip",
-            "Python-generated cache files",
-        ),
-        (
-            "Library/Caches/tradingview-desktop-updater",
-            "TradingView updater",
-            CacheTier::Routine,
-            "/TradingView.app/|[t]radingview-desktop-updater",
-            "obsolete updater downloads",
-        ),
-        (
-            "Library/Caches/@zcodedesktop-updater",
-            "ZCode updater",
-            CacheTier::Routine,
-            "/Zed.app/|/[Zz][Cc]ode.app/|@[z]codedesktop-updater",
-            "obsolete updater downloads",
-        ),
-        (
-            "Library/Caches/ru.keepcoder.Telegram",
-            "Telegram cache",
-            CacheTier::Routine,
-            "/Telegram.app/Contents/MacOS/Telegram",
-            "messages remain; media thumbnails reload",
-        ),
-        (
-            "Library/Caches/Google",
-            "Google app cache",
-            CacheTier::Routine,
-            "/Google Chrome.app/|/Google Drive.app/|[k]eystone.*Google",
-            "browser and app cache data reloads",
-        ),
-        (
-            "Library/Caches/com.apple.Safari",
-            "Safari cache",
-            CacheTier::Routine,
-            "/Safari.app/Contents/MacOS/Safari",
-            "website cache reloads; profiles and browsing data remain",
-        ),
-        (
-            "Library/Caches/Firefox",
-            "Firefox cache",
-            CacheTier::Routine,
-            "/Firefox.app/Contents/MacOS/firefox",
-            "website cache reloads; profiles and browsing data remain",
-        ),
-        (
-            "Library/Caches/Adobe",
-            "Adobe app cache",
-            CacheTier::Routine,
-            "[A]dobe|[P]hotoshop|[I]llustrator|[P]remiere|[A]fter Effects|[L]ightroom",
-            "Adobe applications regenerate cached files",
-        ),
-        (
-            ".npm/_cacache",
-            "npm package cache",
-            CacheTier::Routine,
-            "[n]pm |[n]px ",
-            "downloaded npm packages",
-        ),
-        (
-            ".cache/opencode",
-            "OpenCode cache",
-            CacheTier::Routine,
-            "[o]pencode",
-            "OpenCode regenerates this cache",
-        ),
-        (
-            "Library/Caches/go-build",
-            "Go build cache",
-            CacheTier::Routine,
-            "[g]o (build|test|install|run)",
-            "compiled Go build artifacts",
-        ),
-        (
-            ".cache/uv",
-            "uv package cache",
-            CacheTier::Routine,
-            "[u]v (add|build|cache|pip|run|sync)",
-            "downloaded Python packages and build artifacts",
-        ),
-        (
-            "Library/Caches/Yarn",
-            "Yarn package cache",
-            CacheTier::Routine,
-            "[y]arn ",
-            "downloaded JavaScript packages",
-        ),
-        (
-            "Library/Developer/Xcode/DerivedData",
-            "Xcode derived data",
-            CacheTier::Routine,
-            "/Xcode.app/|[x]codebuild",
-            "indexes and build products will be regenerated",
-        ),
-        (
-            "Library/Developer/CoreSimulator/Caches",
-            "Simulator cache",
-            CacheTier::Routine,
-            "[S]imulator.app/|[C]oreSimulator",
-            "simulator cache data will be regenerated",
-        ),
-        (
-            "Library/Caches/org.swift.swiftpm",
-            "SwiftPM cache",
-            CacheTier::Reinstallable,
-            "[s]wift (build|package|run|test)|[s]wift-(build|package)",
-            "package metadata and downloads will be regenerated",
-        ),
-        (
-            "Library/Caches/ms-playwright",
-            "Playwright browsers",
-            CacheTier::Reinstallable,
-            "[p]laywright|[m]s-playwright",
-            "browser binaries download again",
-        ),
-        (
-            "Library/Caches/ms-playwright-go",
-            "Playwright Go browsers",
-            CacheTier::Reinstallable,
-            "[p]laywright|[m]s-playwright-go",
-            "browser binaries download again",
-        ),
-        (
-            ".npm/_npx",
-            "npm npx packages",
-            CacheTier::Reinstallable,
-            "[n]pm |[n]px ",
-            "temporary npx packages install again",
-        ),
-        (
-            ".cache/chrome-devtools-mcp",
-            "Chrome DevTools MCP profile",
-            CacheTier::ReviewOnly,
-            "[c]hrome-devtools-mcp",
-            "persistent browser profile with sessions, cookies, and site data; review before deleting",
-        ),
-        (
-            ".cache/codex-runtimes",
-            "Codex runtimes",
-            CacheTier::Reinstallable,
-            "/Codex.app/|[c]odex-runtimes",
-            "Codex runtime downloads may return",
-        ),
-        (
-            ".gradle/caches",
-            "Gradle caches",
-            CacheTier::Reinstallable,
-            "[g]radle|[G]radleDaemon",
-            "dependencies and build tooling download again",
-        ),
-        (
-            "Library/Caches/CocoaPods",
-            "CocoaPods cache",
-            CacheTier::Reinstallable,
-            "[/ ]pod (cache|install|repo|update)",
-            "downloaded Pods install again",
-        ),
-        (
-            "Library/Caches/Cypress",
-            "Cypress runtimes",
-            CacheTier::Reinstallable,
-            "[c]ypress",
-            "Cypress application binaries download again",
-        ),
-        (
-            ".cache/huggingface/hub",
-            "Hugging Face models",
-            CacheTier::Reinstallable,
-            "[h]uggingface|[t]ransformers",
-            "models and datasets download again",
-        ),
-        (
-            "Library/Developer/Xcode/iOS DeviceSupport",
-            "Xcode device support",
-            CacheTier::ReviewOnly,
-            "/Xcode.app/|[x]codebuild",
-            "old iOS support files; review Developer storage in System Settings",
-        ),
-        (
-            "Library/Developer/Xcode/Archives",
-            "Xcode archives",
-            CacheTier::ReviewOnly,
-            "/Xcode.app/|[x]codebuild",
-            "signed build archives may be needed for distribution or symbolication",
-        ),
-        (
-            "Library/Developer/CoreSimulator/Devices",
-            "Simulator devices",
-            CacheTier::ReviewOnly,
-            "[S]imulator.app/|[C]oreSimulator",
-            "simulators may contain apps and data; remove unneeded devices in Xcode",
-        ),
-        (
-            "Library/Application Support/Cursor/User",
-            "Cursor user data",
-            CacheTier::ReviewOnly,
-            "/Cursor.app/|[C]ursor Helper",
-            "settings, workspace state, and history; review inside Cursor",
-        ),
-        (
-            "Library/Group Containers/HUAQ24HBR6.dev.orbstack/data",
-            "OrbStack data",
-            CacheTier::ReviewOnly,
-            "/OrbStack.app/|[o]rbstack",
-            "containers, images, machines, and volumes; reclaim through OrbStack",
-        ),
-        (
-            "Library/Group Containers/6N38VWS5BX.ru.keepcoder.Telegram/stable",
-            "Telegram local data",
-            CacheTier::ReviewOnly,
-            "/Telegram.app/Contents/MacOS/Telegram",
-            "local account and media data; use Telegram's Storage Usage controls",
-        ),
-    ];
-
-    let mut specs: Vec<CacheSpec> = definitions
-        .into_iter()
-        .map(|(relative, label, tier, process_pattern, note)| CacheSpec {
-            home: root.to_path_buf(),
-            path: root.join(relative),
-            label,
-            tier,
-            process_pattern,
-            note,
-            target: CacheTarget::DirectoryContents,
-        })
-        .collect();
-
-    // Aged directories keep their recent contents and only release entries
-    // that have been untouched past a conservative retention window.
-    let aged_definitions = [
-        (
-            "Library/Logs",
-            "User logs",
-            7,
-            "log entries older than 7 days; applications start fresh logs",
-        ),
-        (
-            "Library/Saved Application State",
-            "Saved app state",
-            30,
-            "window-restoration data older than 30 days; newer entries stay",
-        ),
-        (
-            "Library/DiagnosticReports",
-            "Crash reports",
-            30,
-            "crash and hang reports older than 30 days",
-        ),
-    ];
-    specs.extend(
-        aged_definitions.map(|(relative, label, min_age_days, note)| CacheSpec {
-            home: root.to_path_buf(),
-            path: root.join(relative),
-            label,
-            tier: CacheTier::Routine,
-            process_pattern: "",
-            note,
-            target: CacheTarget::AgedContents { min_age_days },
-        }),
-    );
-    specs
+    crate::rules::home_specs(root)
 }
 
 /// Build useful candidates for a selected scan location.
@@ -558,41 +267,59 @@ pub fn scan_specs(scan_root: &Path, account_home: &Path) -> Vec<CacheSpec> {
 }
 
 fn volume_specs(root: &Path) -> Vec<CacheSpec> {
+    volume_specs_for(root, scan_location_kind(root))
+}
+
+/// Volume-level waste. Server- and Windows-managed recycle bins can hold other
+/// people's deleted files, so they are always review-only. On a network share
+/// nothing here is routine: the share may be used by other accounts and
+/// machines that this Mac cannot see.
+fn volume_specs_for(root: &Path, kind: ScanLocationKind) -> Vec<CacheSpec> {
+    let shared_tier = if kind == ScanLocationKind::Network {
+        CacheTier::ReviewOnly
+    } else {
+        CacheTier::Routine
+    };
     let definitions = [
         (
             ".Trash",
             "Volume Trash",
             "files already moved to this volume's Trash",
+            shared_tier,
         ),
         (
             "#recycle",
             "NAS recycle bin",
-            "server-managed deleted files; this is separate from Finder Trash",
+            "server-managed deleted files that may belong to other users; empty it from the NAS instead",
+            CacheTier::ReviewOnly,
         ),
         (
             "@Recycle",
             "NAS recycle bin",
-            "server-managed deleted files; this is separate from Finder Trash",
+            "server-managed deleted files that may belong to other users; empty it from the NAS instead",
+            CacheTier::ReviewOnly,
         ),
         (
             "$RECYCLE.BIN",
             "Windows recycle bin",
-            "Windows-managed deleted files; this is separate from Finder Trash",
+            "Windows-managed deleted files that may belong to other accounts",
+            CacheTier::ReviewOnly,
         ),
         (
             ".TemporaryItems",
             "Temporary items",
-            "temporary files left on this volume",
+            "temporary files left on this volume; open files are kept",
+            shared_tier,
         ),
     ];
 
     let mut specs: Vec<_> = definitions
         .into_iter()
-        .map(|(relative, label, note)| CacheSpec {
+        .map(|(relative, label, note, tier)| CacheSpec {
             home: root.to_path_buf(),
             path: root.join(relative),
             label,
-            tier: CacheTier::Routine,
+            tier,
             process_pattern: "",
             note,
             target: CacheTarget::DirectoryContents,
@@ -608,7 +335,7 @@ fn volume_specs(root: &Path) -> Vec<CacheSpec> {
                 home: root.to_path_buf(),
                 path,
                 label: "Volume Trash",
-                tier: CacheTier::Routine,
+                tier: shared_tier,
                 process_pattern: "",
                 note: "files already moved to this volume's Trash",
                 target: CacheTarget::DirectoryContents,
@@ -617,6 +344,12 @@ fn volume_specs(root: &Path) -> Vec<CacheSpec> {
     }
 
     specs
+}
+
+/// Folders that any app may be writing to right now get an open-file check
+/// before their contents are removed.
+fn needs_open_check(spec: &CacheSpec) -> bool {
+    spec.label == "Temporary items"
 }
 
 fn looks_like_home(path: &Path) -> bool {
@@ -723,31 +456,26 @@ pub fn cleanup_plan(spec: &CacheSpec) -> String {
             "Remove only direct entries untouched for at least {min_age_days} day(s) from the exact allowlisted directory; newer entries stay."
         );
     }
-    match native_command_name(spec.label) {
+    match native_command_name(spec) {
         Some(command) => format!(
-            "Run `{command}` first when its tool is installed, then remove only leftovers from the exact allowlisted path."
+            "Run `{command}` only inside the exact allowlisted scope; if the tool is unavailable, use guarded exact-path cleanup. A failed command stops without a filesystem sweep."
         ),
-        None => "No safe command can clear this exact directory without broader side effects; remove only contents of the exact allowlisted path.".into(),
+        None => crate::rules::for_label(spec.label)
+            .and_then(|rule| rule.advice)
+            .map(str::to_owned)
+            .unwrap_or_else(|| "No safe command can clear this exact directory without broader side effects; remove only contents of the exact allowlisted path.".into()),
     }
 }
 
-fn native_command_name(label: &str) -> Option<&'static str> {
-    match label {
-        "pip cache" => Some("python3 -m pip cache purge"),
-        "npm package cache" => Some("npm cache clean --force"),
-        "Go build cache" => Some("go clean -cache -testcache -fuzzcache"),
-        "uv package cache" => Some("uv cache clean"),
-        "Yarn package cache" => Some("yarn cache clean"),
-        "SwiftPM cache" => Some("swift package purge-cache"),
-        "Playwright browsers" => Some("playwright uninstall --all"),
-        "npm npx packages" => Some("npm cache npx rm"),
-        "CocoaPods cache" => Some("pod cache clean --all"),
-        "Cypress runtimes" => Some("cypress cache clear"),
-        "Hugging Face models" => Some("hf cache prune --yes"),
-        "Simulator devices" => Some("xcrun simctl delete all"),
-        "OrbStack data" => Some("orbctl reset --yes"),
-        _ => None,
-    }
+/// The compiled-in native command a rule references, if its path is still
+/// exactly the path the command is pinned to.
+fn native_for(spec: &CacheSpec) -> Option<&'static crate::rules::Native> {
+    let native = crate::rules::for_label(spec.label)?.native?;
+    (spec.path == spec.home.join(native.path)).then_some(native)
+}
+
+fn native_command_name(spec: &CacheSpec) -> Option<&'static str> {
+    native_for(spec).map(|native| native.display)
 }
 
 fn native_cleanup_command(spec: &CacheSpec) -> Option<NativeCleanupCommand> {
@@ -756,9 +484,8 @@ fn native_cleanup_command(spec: &CacheSpec) -> Option<NativeCleanupCommand> {
     }
 
     let target = spec.path.as_os_str().to_os_string();
-    let target_parent = spec.path.parent()?.as_os_str().to_os_string();
-    let command = match spec.label {
-        "pip cache" => NativeCleanupCommand {
+    let command = match native_for(spec)?.id {
+        "pip" => NativeCleanupCommand {
             display: "python3 -m pip cache purge",
             program: resolve_executable(&[
                 "python3",
@@ -773,22 +500,13 @@ fn native_cleanup_command(spec: &CacheSpec) -> Option<NativeCleanupCommand> {
                 .collect(),
             environment: vec![],
         },
-        "npm package cache" => NativeCleanupCommand {
-            display: "npm cache clean --force",
-            program: resolve_executable(&["npm", "/opt/homebrew/bin/npm", "/usr/local/bin/npm"])?,
-            args: os_args(&["cache", "clean", "--force", "--cache"])
-                .into_iter()
-                .chain([target_parent])
-                .collect(),
-            environment: vec![],
-        },
-        "Go build cache" => NativeCleanupCommand {
+        "go" => NativeCleanupCommand {
             display: "go clean -cache -testcache -fuzzcache",
             program: resolve_executable(&["go", "/opt/homebrew/bin/go", "/usr/local/bin/go"])?,
             args: os_args(&["clean", "-cache", "-testcache", "-fuzzcache"]),
             environment: vec![(OsString::from("GOCACHE"), target)],
         },
-        "uv package cache" => NativeCleanupCommand {
+        "uv" => NativeCleanupCommand {
             display: "uv cache clean",
             program: resolve_executable(&["uv", "/opt/homebrew/bin/uv", "/usr/local/bin/uv"])?,
             args: os_args(&["cache", "clean", "--cache-dir"])
@@ -797,7 +515,7 @@ fn native_cleanup_command(spec: &CacheSpec) -> Option<NativeCleanupCommand> {
                 .collect(),
             environment: vec![],
         },
-        "Yarn package cache" => NativeCleanupCommand {
+        "yarn" => NativeCleanupCommand {
             display: "yarn cache clean",
             program: resolve_executable(&[
                 "yarn",
@@ -807,13 +525,7 @@ fn native_cleanup_command(spec: &CacheSpec) -> Option<NativeCleanupCommand> {
             args: os_args(&["cache", "clean"]),
             environment: vec![(OsString::from("YARN_CACHE_FOLDER"), target)],
         },
-        "SwiftPM cache" => NativeCleanupCommand {
-            display: "swift package purge-cache",
-            program: resolve_executable(&["/usr/bin/swift", "swift"])?,
-            args: os_args(&["package", "purge-cache"]),
-            environment: vec![],
-        },
-        "Playwright browsers" => NativeCleanupCommand {
+        "playwright" => NativeCleanupCommand {
             display: "playwright uninstall --all",
             // Deliberately do not invoke npx: it may download a package while
             // the application is trying to reclaim space.
@@ -825,22 +537,7 @@ fn native_cleanup_command(spec: &CacheSpec) -> Option<NativeCleanupCommand> {
             args: os_args(&["uninstall", "--all"]),
             environment: vec![(OsString::from("PLAYWRIGHT_BROWSERS_PATH"), target)],
         },
-        "npm npx packages" => NativeCleanupCommand {
-            display: "npm cache npx rm",
-            program: resolve_executable(&["npm", "/opt/homebrew/bin/npm", "/usr/local/bin/npm"])?,
-            args: os_args(&["cache", "npx", "rm", "--cache"])
-                .into_iter()
-                .chain([target_parent])
-                .collect(),
-            environment: vec![],
-        },
-        "CocoaPods cache" => NativeCleanupCommand {
-            display: "pod cache clean --all",
-            program: resolve_executable(&["pod", "/opt/homebrew/bin/pod", "/usr/local/bin/pod"])?,
-            args: os_args(&["cache", "clean", "--all"]),
-            environment: vec![],
-        },
-        "Cypress runtimes" => NativeCleanupCommand {
+        "cypress" => NativeCleanupCommand {
             display: "cypress cache clear",
             program: resolve_executable(&[
                 "cypress",
@@ -850,30 +547,13 @@ fn native_cleanup_command(spec: &CacheSpec) -> Option<NativeCleanupCommand> {
             args: os_args(&["cache", "clear"]),
             environment: vec![(OsString::from("CYPRESS_CACHE_FOLDER"), target)],
         },
-        "Hugging Face models" => NativeCleanupCommand {
+        "huggingface" => NativeCleanupCommand {
             display: "hf cache prune --yes",
             program: resolve_executable(&["hf", "/opt/homebrew/bin/hf", "/usr/local/bin/hf"])?,
             args: os_args(&["cache", "prune", "--yes", "--cache-dir"])
                 .into_iter()
                 .chain([target])
                 .collect(),
-            environment: vec![],
-        },
-        "Simulator devices" => NativeCleanupCommand {
-            display: "xcrun simctl delete all",
-            program: resolve_executable(&["/usr/bin/xcrun"])?,
-            args: os_args(&["simctl", "delete", "all"]),
-            environment: vec![],
-        },
-        "OrbStack data" => NativeCleanupCommand {
-            display: "orbctl reset --yes",
-            program: resolve_executable(&[
-                "orbctl",
-                "orb",
-                "/usr/local/bin/orbctl",
-                "/usr/local/bin/orb",
-            ])?,
-            args: os_args(&["reset", "--yes"]),
             environment: vec![],
         },
         _ => return None,
@@ -965,14 +645,29 @@ fn clear_with_native_first(
     spec: &CacheSpec,
     allowlist: &[PathBuf],
     expected: Option<&PathIdentity>,
+    whitelist: &Whitelist,
 ) -> io::Result<CleanupMethod> {
+    let swept = |kept: usize| {
+        if kept == 0 {
+            CleanupMethod::ExactPath
+        } else {
+            CleanupMethod::ExactPathKeeping { kept }
+        }
+    };
     if spec.target == CacheTarget::ExactPath {
-        remove_exact_path(&spec.path, allowlist, &spec.home, expected)?;
+        remove_exact_path(&spec.path, allowlist, &spec.home, expected, whitelist)?;
         return Ok(CleanupMethod::ExactPath);
     }
     if let CacheTarget::AgedContents { min_age_days } = spec.target {
-        clear_aged_contents(&spec.path, allowlist, &spec.home, min_age_days, expected)?;
-        return Ok(CleanupMethod::ExactPath);
+        let kept = clear_aged_contents(
+            &spec.path,
+            allowlist,
+            &spec.home,
+            min_age_days,
+            expected,
+            whitelist,
+        )?;
+        return Ok(swept(kept));
     }
 
     validate_cleanup_target(
@@ -982,12 +677,23 @@ fn clear_with_native_first(
         CacheTarget::DirectoryContents,
         expected,
     )?;
-    let Some(command_name) = native_command_name(spec.label) else {
-        clear_directory_contents(&spec.path, allowlist, &spec.home, expected)?;
-        return Ok(CleanupMethod::ExactPath);
+    let Some(command_name) = native_command_name(spec) else {
+        let kept =
+            clear_directory_contents(&spec.path, allowlist, &spec.home, expected, whitelist)?;
+        return Ok(swept(kept));
     };
+    // A vendor command cannot be told to spare one protected subfolder, so it
+    // never runs when the whitelist names something inside the cache.
+    if whitelist.covers_descendant(&spec.path) {
+        let kept =
+            clear_directory_contents(&spec.path, allowlist, &spec.home, expected, whitelist)?;
+        return Ok(CleanupMethod::NativeSkippedForWhitelist {
+            command: command_name,
+            kept,
+        });
+    }
     let Some(command) = native_cleanup_command(spec) else {
-        clear_directory_contents(&spec.path, allowlist, &spec.home, expected)?;
+        clear_directory_contents(&spec.path, allowlist, &spec.home, expected, whitelist)?;
         return Ok(CleanupMethod::NativeUnavailableThenExactPath {
             command: command_name,
         });
@@ -995,46 +701,18 @@ fn clear_with_native_first(
 
     match run_native_cleanup(&command, &spec.home) {
         NativeCommandResult::Succeeded => {
-            let fallback_used = match fs::symlink_metadata(&spec.path) {
-                Ok(_) => {
-                    // A vendor command can legitimately remove and recreate
-                    // the cache directory. Its fresh contents are new data,
-                    // so the identity check ends the sweep instead of failing.
-                    if expected.is_some_and(|identity| !identity.still_matches(&spec.path)) {
-                        return Ok(CleanupMethod::Native {
-                            command: command.display,
-                            fallback_used: false,
-                        });
-                    }
-                    validate_cleanup_target(
-                        &spec.path,
-                        allowlist,
-                        &spec.home,
-                        CacheTarget::DirectoryContents,
-                        expected,
-                    )?;
-                    if fs::read_dir(&spec.path)?.next().is_some() {
-                        clear_directory_contents(&spec.path, allowlist, &spec.home, expected)?;
-                        true
-                    } else {
-                        false
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-                Err(error) => return Err(error),
-            };
             Ok(CleanupMethod::Native {
                 command: command.display,
-                fallback_used,
+                // A successful vendor command is the complete operation. It
+                // may intentionally leave protected, newer, or otherwise
+                // ineligible data behind; sweeping those leftovers would
+                // silently broaden the command's scope.
             })
         }
-        NativeCommandResult::Failed(error) => {
-            clear_directory_contents(&spec.path, allowlist, &spec.home, expected)?;
-            Ok(CleanupMethod::NativeFailedThenExactPath {
-                command: command.display,
-                error,
-            })
-        }
+        NativeCommandResult::Failed(error) => Err(io::Error::other(format!(
+            "native cleanup command `{}` failed; no filesystem fallback was attempted: {error}",
+            command.display
+        ))),
     }
 }
 
@@ -1101,6 +779,13 @@ pub fn clean_cache(
     }
 
     if entry.spec.target == CacheTarget::ExactPath {
+        if whitelist.covers_descendant(&entry.spec.path) {
+            let outcome =
+                CleanupOutcome::SafetySkipped("a whitelisted path is inside this entry".into());
+            entry.status = CacheStatus::Whitelisted;
+            entry.outcome = Some(outcome.clone());
+            return outcome;
+        }
         if let Err(error) = verify_current_user_ownership(&entry.spec.path) {
             let outcome = CleanupOutcome::SafetySkipped(format!(
                 "the temporary path ownership could not be revalidated: {error}"
@@ -1130,6 +815,27 @@ pub fn clean_cache(
         }
     }
 
+    if needs_open_check(&entry.spec) {
+        match path_is_open(&entry.spec.path) {
+            Ok(false) => {}
+            Ok(true) => {
+                let outcome =
+                    CleanupOutcome::SafetySkipped("a process has files open in this folder".into());
+                entry.status = CacheStatus::InUse;
+                entry.outcome = Some(outcome.clone());
+                return outcome;
+            }
+            Err(error) => {
+                let outcome = CleanupOutcome::SafetySkipped(format!(
+                    "could not verify whether files here are open: {error}"
+                ));
+                entry.status = CacheStatus::ScanError;
+                entry.outcome = Some(outcome.clone());
+                return outcome;
+            }
+        }
+    }
+
     match related_process_state(entry.spec.process_pattern) {
         ProcessState::Running => {
             let outcome = CleanupOutcome::SafetySkipped("a related process just started".into());
@@ -1148,25 +854,26 @@ pub fn clean_cache(
         ProcessState::NotRunning => {}
     }
 
-    let outcome = match clear_with_native_first(&entry.spec, allowlist, entry.identity.as_ref()) {
-        Ok(method) => {
-            let size_after = target_kb(&entry.spec.path, entry.spec.target);
-            let removed = size_before.saturating_sub(size_after);
-            entry.size_kb = size_after;
-            CleanupOutcome::Cleared {
-                removed_kb: removed,
-                method,
+    let outcome =
+        match clear_with_native_first(&entry.spec, allowlist, entry.identity.as_ref(), whitelist) {
+            Ok(method) => {
+                let size_after = target_kb(&entry.spec.path, entry.spec.target);
+                let removed = size_before.saturating_sub(size_after);
+                entry.size_kb = size_after;
+                CleanupOutcome::Cleared {
+                    removed_kb: removed,
+                    method,
+                }
             }
-        }
-        Err(error) => {
-            let size_after = target_kb(&entry.spec.path, entry.spec.target);
-            entry.size_kb = size_after;
-            CleanupOutcome::Failed {
-                error: error.to_string(),
-                removed_kb: size_before.saturating_sub(size_after),
+            Err(error) => {
+                let size_after = target_kb(&entry.spec.path, entry.spec.target);
+                entry.size_kb = size_after;
+                CleanupOutcome::Failed {
+                    error: error.to_string(),
+                    removed_kb: size_before.saturating_sub(size_after),
+                }
             }
-        }
-    };
+        };
     entry.outcome = Some(outcome.clone());
     outcome
 }
@@ -1250,34 +957,38 @@ pub fn clean_review_data(
         return outcome;
     }
 
-    let outcome = match clear_with_native_first(&entry.spec, allowlist, entry.identity.as_ref()) {
-        Ok(method) => {
-            let size_after = target_kb(&entry.spec.path, entry.spec.target);
-            entry.size_kb = size_after;
-            CleanupOutcome::Cleared {
-                removed_kb: size_before.saturating_sub(size_after),
-                method,
+    let outcome =
+        match clear_with_native_first(&entry.spec, allowlist, entry.identity.as_ref(), whitelist) {
+            Ok(method) => {
+                let size_after = target_kb(&entry.spec.path, entry.spec.target);
+                entry.size_kb = size_after;
+                CleanupOutcome::Cleared {
+                    removed_kb: size_before.saturating_sub(size_after),
+                    method,
+                }
             }
-        }
-        Err(error) => {
-            let size_after = target_kb(&entry.spec.path, entry.spec.target);
-            entry.size_kb = size_after;
-            CleanupOutcome::Failed {
-                error: error.to_string(),
-                removed_kb: size_before.saturating_sub(size_after),
+            Err(error) => {
+                let size_after = target_kb(&entry.spec.path, entry.spec.target);
+                entry.size_kb = size_after;
+                CleanupOutcome::Failed {
+                    error: error.to_string(),
+                    removed_kb: size_before.saturating_sub(size_after),
+                }
             }
-        }
-    };
+        };
     entry.outcome = Some(outcome.clone());
     outcome
 }
 
+/// Remove every direct entry of `target` except whitelisted ones (or ones with
+/// a whitelisted descendant). Returns how many entries were kept.
 pub fn clear_directory_contents(
     target: &Path,
     allowlist: &[PathBuf],
     root: &Path,
     expected: Option<&PathIdentity>,
-) -> io::Result<()> {
+    whitelist: &Whitelist,
+) -> io::Result<usize> {
     validate_cleanup_target(
         target,
         allowlist,
@@ -1286,10 +997,16 @@ pub fn clear_directory_contents(
         expected,
     )?;
 
-    for (completely_removed, item) in fs::read_dir(target)?.enumerate() {
+    let mut kept = 0;
+    let mut completely_removed = 0;
+    for item in fs::read_dir(target)? {
         let path = item
             .map_err(|error| cleanup_progress_error(error, completely_removed))?
             .path();
+        if whitelist.keeps(&path) {
+            kept += 1;
+            continue;
+        }
         let item_metadata = fs::symlink_metadata(&path)
             .map_err(|error| cleanup_progress_error(error, completely_removed))?;
         let result = if item_metadata.is_dir() && !item_metadata.file_type().is_symlink() {
@@ -1298,20 +1015,24 @@ pub fn clear_directory_contents(
             fs::remove_file(path)
         };
         result.map_err(|error| cleanup_progress_error(error, completely_removed))?;
+        completely_removed += 1;
     }
-    Ok(())
+    Ok(kept)
 }
 
-/// Clear only the direct entries of an aged directory that have been
-/// untouched past the retention window. Symlinks are never followed or
-/// removed here, and the directory itself always stays.
+/// Clear only the direct entries of an aged directory whose whole subtree has
+/// been untouched past the retention window and that no process holds open.
+/// Symlinks are never followed or removed here, whitelisted entries stay, and
+/// the directory itself always stays. Returns how many stale entries were kept
+/// because they are whitelisted or open.
 fn clear_aged_contents(
     target: &Path,
     allowlist: &[PathBuf],
     root: &Path,
     min_age_days: u64,
     expected: Option<&PathIdentity>,
-) -> io::Result<()> {
+    whitelist: &Whitelist,
+) -> io::Result<usize> {
     validate_cleanup_target(
         target,
         allowlist,
@@ -1320,8 +1041,18 @@ fn clear_aged_contents(
         expected,
     )?;
     let cutoff = age_cutoff(min_age_days);
+    // Logs and saved state are written by running apps. Nothing is removed
+    // unless the open-file check itself succeeds.
+    let open = open_paths_under(target).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("could not verify which old entries are open; nothing was removed: {error}"),
+        )
+    })?;
 
-    for (completely_removed, item) in fs::read_dir(target)?.enumerate() {
+    let mut kept = 0;
+    let mut completely_removed = 0;
+    for item in fs::read_dir(target)? {
         let path = item
             .map_err(|error| cleanup_progress_error(error, completely_removed))?
             .path();
@@ -1329,7 +1060,13 @@ fn clear_aged_contents(
             // A vanished or unreadable entry is left alone.
             continue;
         };
-        if item_metadata.file_type().is_symlink() || !is_stale(&item_metadata, cutoff) {
+        if item_metadata.file_type().is_symlink()
+            || !subtree_is_stale(&path, &item_metadata, cutoff)
+        {
+            continue;
+        }
+        if whitelist.keeps(&path) || holds_open_path(&path, &open) {
+            kept += 1;
             continue;
         }
         let result = if item_metadata.is_dir() {
@@ -1338,8 +1075,20 @@ fn clear_aged_contents(
             fs::remove_file(&path)
         };
         result.map_err(|error| cleanup_progress_error(error, completely_removed))?;
+        completely_removed += 1;
     }
-    Ok(())
+    Ok(kept)
+}
+
+/// Whether any open path reported by lsof is `path` or inside it.
+fn holds_open_path(path: &Path, open: &HashSet<PathBuf>) -> bool {
+    let resolved = path.canonicalize().ok();
+    open.iter().any(|open_path| {
+        open_path.starts_with(path)
+            || resolved
+                .as_ref()
+                .is_some_and(|resolved| open_path.starts_with(resolved))
+    })
 }
 
 fn remove_exact_path(
@@ -1347,8 +1096,15 @@ fn remove_exact_path(
     allowlist: &[PathBuf],
     root: &Path,
     expected: Option<&PathIdentity>,
+    whitelist: &Whitelist,
 ) -> io::Result<()> {
     validate_cleanup_target(target, allowlist, root, CacheTarget::ExactPath, expected)?;
+    if whitelist.keeps(target) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("a whitelisted path is at or inside {}", target.display()),
+        ));
+    }
     let metadata = fs::symlink_metadata(target)?;
     if metadata.is_dir() {
         fs::remove_dir_all(target)
@@ -1446,6 +1202,49 @@ fn is_stale(metadata: &fs::Metadata, cutoff: SystemTime) -> bool {
     metadata.modified().is_ok_and(|modified| modified <= cutoff)
 }
 
+/// Whether an entry and everything inside it predate `cutoff`. A folder's own
+/// timestamp does not change when a file inside it is rewritten, so every
+/// descendant is checked. The walk fails closed: an unreadable, cross-device,
+/// or unfinished walk reports "not stale".
+fn subtree_is_stale(path: &Path, metadata: &fs::Metadata, cutoff: SystemTime) -> bool {
+    const MAX_ENTRIES: usize = 10_000;
+    const TIME_LIMIT: Duration = Duration::from_secs(2);
+    if !is_stale(metadata, cutoff) {
+        return false;
+    }
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return true;
+    }
+    let device = metadata.dev();
+    let started = std::time::Instant::now();
+    let mut seen = 0;
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(reader) = fs::read_dir(&directory) else {
+            return false;
+        };
+        for item in reader {
+            seen += 1;
+            if seen > MAX_ENTRIES || started.elapsed() > TIME_LIMIT {
+                return false;
+            }
+            let Ok(item) = item else {
+                return false;
+            };
+            let Ok(item_metadata) = fs::symlink_metadata(item.path()) else {
+                return false;
+            };
+            if item_metadata.dev() != device || !is_stale(&item_metadata, cutoff) {
+                return false;
+            }
+            if item_metadata.is_dir() && !item_metadata.file_type().is_symlink() {
+                pending.push(item.path());
+            }
+        }
+    }
+    true
+}
+
 pub fn directory_kb(path: &Path) -> u64 {
     try_directory_kb(path).unwrap_or(0)
 }
@@ -1495,7 +1294,9 @@ fn aged_contents_kb(path: &Path, min_age_days: u64) -> io::Result<u64> {
         let Ok(item_metadata) = fs::symlink_metadata(entry.path()) else {
             continue;
         };
-        if item_metadata.file_type().is_symlink() || !is_stale(&item_metadata, cutoff) {
+        if item_metadata.file_type().is_symlink()
+            || !subtree_is_stale(&entry.path(), &item_metadata, cutoff)
+        {
             continue;
         }
         total_kb += measure_with_du(&entry.path()).unwrap_or(0);
@@ -1561,9 +1362,9 @@ pub(crate) fn path_is_open(path: &Path) -> io::Result<bool> {
         )));
     }
     let open_paths = parse_open_paths(&String::from_utf8_lossy(&output.stdout));
-    Ok(open_paths
-        .iter()
-        .any(|open_path| open_path == path || open_path.starts_with(path)))
+    // lsof reports canonical paths (for example `/private/var/...`), so a
+    // symlinked spelling of the same location must be compared resolved.
+    Ok(holds_open_path(path, &open_paths))
 }
 
 fn parse_open_paths(output: &str) -> HashSet<PathBuf> {
@@ -1633,6 +1434,49 @@ enum ProcessState {
     NotRunning,
     Running,
     CheckFailed,
+}
+
+/// Running processes that match a rule's process pattern, as `name (PID n)`,
+/// so the interface can say what blocks an in-use cache. At most three.
+pub fn blocking_processes(pattern: &str) -> Vec<String> {
+    if pattern.is_empty() {
+        return Vec::new();
+    }
+    let Ok(output) = Command::new(PGREP_COMMAND)
+        .args(["-lf", pattern])
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (pid, command) = line.trim().split_once(' ')?;
+            let pid: u32 = pid.parse().ok()?;
+            (pid != std::process::id()).then(|| {
+                let mut words = command.split_whitespace();
+                let program = words
+                    .next()
+                    .map(|program| program.rsplit('/').next().unwrap_or(program))
+                    .unwrap_or_default();
+                let rest: Vec<&str> = words.take(2).collect();
+                let name = if rest.is_empty() {
+                    program.to_string()
+                } else {
+                    format!("{program} {}", rest.join(" "))
+                };
+                format!(
+                    "{} (PID {pid})",
+                    crate::ai::display_text(&name)
+                        .chars()
+                        .take(48)
+                        .collect::<String>()
+                )
+            })
+        })
+        .take(3)
+        .collect()
 }
 
 fn related_process_state(pattern: &str) -> ProcessState {
@@ -1792,20 +1636,28 @@ fn mounted_filesystem(path: &Path) -> Option<String> {
     mounted_filesystem_from_output(&mounts, path)
 }
 
+/// The filesystem type of the mount that contains `path`: the longest mount
+/// point that is a whole-component prefix of it. A folder inside a network
+/// share is therefore recognized as network storage too.
 fn mounted_filesystem_from_output(output: &str, path: &Path) -> Option<String> {
-    let expected_mount = path.to_string_lossy();
-    output.lines().find_map(|line| {
-        let (mount_description, options) = line.rsplit_once(" (")?;
-        let (_, mount_point) = mount_description.rsplit_once(" on ")?;
-        if mount_point != expected_mount {
-            return None;
-        }
-        options
-            .strip_suffix(')')?
-            .split(',')
-            .next()
-            .map(|filesystem| filesystem.trim().to_string())
-    })
+    output
+        .lines()
+        .filter_map(|line| {
+            let (mount_description, options) = line.rsplit_once(" (")?;
+            let (_, mount_point) = mount_description.rsplit_once(" on ")?;
+            if !path.starts_with(Path::new(mount_point)) {
+                return None;
+            }
+            let filesystem = options
+                .strip_suffix(')')?
+                .split(',')
+                .next()?
+                .trim()
+                .to_string();
+            Some((Path::new(mount_point).components().count(), filesystem))
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, filesystem)| filesystem)
 }
 
 fn plist_string<'a>(plist: &'a str, key: &str) -> Option<&'a str> {
@@ -1869,7 +1721,7 @@ pub(crate) fn effective_user_id() -> Option<u32> {
         .and_then(|value| value.trim().parse().ok())
 }
 
-fn account_home() -> Option<PathBuf> {
+pub(crate) fn account_home() -> Option<PathBuf> {
     let user = Command::new(ID_COMMAND)
         .arg("-un")
         .output()
@@ -1906,6 +1758,16 @@ mod tests {
         Whitelist::empty()
     }
 
+    fn native_command_name_for(spec: &CacheSpec) -> Option<&'static str> {
+        super::native_command_name(spec)
+    }
+
+    fn native_command_name(label: &str) -> Option<&'static str> {
+        crate::rules::for_label(label)
+            .and_then(|rule| rule.native)
+            .map(|native| native.display)
+    }
+
     #[test]
     fn formats_sizes() {
         assert_eq!(format_kb(12), "12 KiB");
@@ -1916,7 +1778,8 @@ mod tests {
     #[test]
     fn refuses_paths_outside_allowlist() {
         let temp = tempfile::tempdir().unwrap();
-        let error = clear_directory_contents(temp.path(), &[], temp.path(), None).unwrap_err();
+        let error = clear_directory_contents(temp.path(), &[], temp.path(), None, &no_whitelist())
+            .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 
@@ -1930,6 +1793,7 @@ mod tests {
             std::slice::from_ref(&temp.path().to_path_buf()),
             temp.path(),
             None,
+            &no_whitelist(),
         )
         .unwrap_err();
 
@@ -1952,6 +1816,7 @@ mod tests {
             std::slice::from_ref(&escaping_path),
             &root,
             None,
+            &no_whitelist(),
         )
         .unwrap_err();
 
@@ -1974,7 +1839,14 @@ mod tests {
             .write_all(b"data")
             .unwrap();
 
-        clear_directory_contents(&cache, std::slice::from_ref(&cache), temp.path(), None).unwrap();
+        clear_directory_contents(
+            &cache,
+            std::slice::from_ref(&cache),
+            temp.path(),
+            None,
+            &no_whitelist(),
+        )
+        .unwrap();
 
         assert!(cache.is_dir());
         assert_eq!(fs::read_dir(cache).unwrap().count(), 0);
@@ -2024,9 +1896,14 @@ mod tests {
         fs::create_dir(&actual).unwrap();
         symlink(&actual, &linked).unwrap();
 
-        let error =
-            clear_directory_contents(&linked, std::slice::from_ref(&linked), temp.path(), None)
-                .unwrap_err();
+        let error = clear_directory_contents(
+            &linked,
+            std::slice::from_ref(&linked),
+            temp.path(),
+            None,
+            &no_whitelist(),
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(actual.is_dir());
     }
@@ -2051,6 +1928,7 @@ mod tests {
             std::slice::from_ref(&linked_cache),
             temp.path(),
             None,
+            &no_whitelist(),
         )
         .unwrap_err();
 
@@ -2071,7 +1949,14 @@ mod tests {
         fs::File::create(outside.join("keep-me")).unwrap();
         symlink(&outside, cache.join("linked-child")).unwrap();
 
-        clear_directory_contents(&cache, std::slice::from_ref(&cache), temp.path(), None).unwrap();
+        clear_directory_contents(
+            &cache,
+            std::slice::from_ref(&cache),
+            temp.path(),
+            None,
+            &no_whitelist(),
+        )
+        .unwrap();
 
         assert!(outside.join("keep-me").exists());
         assert_eq!(fs::read_dir(cache).unwrap().count(), 0);
@@ -2094,6 +1979,7 @@ mod tests {
             std::slice::from_ref(&cache),
             temp.path(),
             Some(&identity),
+            &no_whitelist(),
         )
         .unwrap_err();
 
@@ -2163,38 +2049,63 @@ mod tests {
         assert!(cache.join("keep-me").exists());
     }
 
+    fn backdate(path: &Path, days: u64) {
+        fs::File::open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(days * 24 * 60 * 60))
+            .unwrap();
+    }
+
+    fn test_spec(home: &Path, path: &Path, target: CacheTarget) -> CacheSpec {
+        CacheSpec {
+            home: home.to_path_buf(),
+            path: path.to_path_buf(),
+            label: "Test cache",
+            tier: CacheTier::Routine,
+            process_pattern: "",
+            note: "test data",
+            target,
+        }
+    }
+
     #[test]
-    fn aged_cleanup_removes_only_stale_entries_and_keeps_the_directory() {
+    fn aged_cleanup_removes_only_fully_stale_entries_and_keeps_the_directory() {
         let temp = tempfile::tempdir().unwrap();
         let logs = temp.path().join("logs");
         fs::create_dir(&logs).unwrap();
         fs::write(logs.join("old.log"), [1_u8; 8_192]).unwrap();
         fs::write(logs.join("recent.log"), [2_u8; 4_096]).unwrap();
+        // A folder whose own timestamp is old but which holds a fresh file is
+        // still in use and must be kept.
+        fs::create_dir(logs.join("active-dir")).unwrap();
+        fs::write(logs.join("active-dir/current.log"), [3_u8; 4_096]).unwrap();
+        // A folder that is old all the way down is removable.
         fs::create_dir(logs.join("old-dir")).unwrap();
-        fs::write(logs.join("old-dir/data"), [3_u8; 4_096]).unwrap();
-        for name in ["old.log", "old-dir"] {
-            let file = fs::File::open(logs.join(name)).unwrap();
-            file.set_modified(SystemTime::now() - Duration::from_secs(14 * 24 * 60 * 60))
-                .unwrap();
+        fs::write(logs.join("old-dir/data"), [4_u8; 4_096]).unwrap();
+        backdate(&logs.join("old-dir/data"), 14);
+        for name in ["old.log", "old-dir", "active-dir"] {
+            backdate(&logs.join(name), 14);
         }
         #[cfg(unix)]
         std::os::unix::fs::symlink(logs.join("recent.log"), logs.join("link.log")).unwrap();
 
         let spec = CacheSpec {
-            home: temp.path().to_path_buf(),
-            path: logs.clone(),
             label: "User logs",
-            tier: CacheTier::Routine,
-            process_pattern: "",
-            note: "aged test data",
-            target: CacheTarget::AgedContents { min_age_days: 7 },
+            ..test_spec(
+                temp.path(),
+                &logs,
+                CacheTarget::AgedContents { min_age_days: 7 },
+            )
         };
         let measured = scan_cache(&spec, false).size_kb;
         assert!(
             measured >= 12,
             "stale entries should be measured, got {measured}"
         );
-        assert!(measured < 20, "recent entries must not be measured");
+        assert!(
+            measured < 16,
+            "active entries must not be measured, got {measured}"
+        );
 
         let mut entry = scan_cache(&spec, false);
         let outcome = clean_cache(
@@ -2211,8 +2122,170 @@ mod tests {
         assert!(logs.is_dir());
         assert!(!logs.join("old.log").exists());
         assert!(!logs.join("old-dir").exists());
+        assert!(logs.join("active-dir/current.log").exists());
         assert!(logs.join("recent.log").exists());
         assert!(logs.join("link.log").exists());
+    }
+
+    #[test]
+    fn aged_cleanup_keeps_old_files_that_a_process_holds_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let logs = temp.path().join("logs");
+        fs::create_dir(&logs).unwrap();
+        fs::write(logs.join("held.log"), [1_u8; 4_096]).unwrap();
+        fs::write(logs.join("free.log"), [2_u8; 4_096]).unwrap();
+        backdate(&logs.join("held.log"), 30);
+        backdate(&logs.join("free.log"), 30);
+        let held = fs::File::open(logs.join("held.log")).unwrap();
+
+        let kept = clear_aged_contents(
+            &logs,
+            std::slice::from_ref(&logs),
+            temp.path(),
+            7,
+            None,
+            &no_whitelist(),
+        )
+        .unwrap();
+        drop(held);
+
+        assert_eq!(kept, 1);
+        assert!(
+            logs.join("held.log").exists(),
+            "an open log is never removed"
+        );
+        assert!(!logs.join("free.log").exists());
+    }
+
+    #[test]
+    fn whitelisted_child_survives_contents_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        fs::create_dir_all(cache.join("keep/inner")).unwrap();
+        fs::write(cache.join("keep/inner/important"), [1_u8; 4_096]).unwrap();
+        fs::create_dir(cache.join("parent")).unwrap();
+        fs::write(cache.join("parent/protected"), [2_u8; 4_096]).unwrap();
+        fs::write(cache.join("parent/junk"), [3_u8; 4_096]).unwrap();
+        fs::write(cache.join("junk.bin"), [4_u8; 8_192]).unwrap();
+        let whitelist = Whitelist::parse("cache/keep\ncache/parent/protected\n", temp.path());
+        let mut entry = scan_cache(
+            &test_spec(temp.path(), &cache, CacheTarget::DirectoryContents),
+            false,
+        );
+
+        let outcome = clean_cache(&mut entry, std::slice::from_ref(&cache), false, &whitelist);
+
+        assert!(matches!(
+            outcome,
+            CleanupOutcome::Cleared {
+                method: CleanupMethod::ExactPathKeeping { kept: 2 },
+                ..
+            }
+        ));
+        assert!(cache.join("keep/inner/important").exists());
+        assert!(cache.join("parent/protected").exists());
+        assert!(!cache.join("junk.bin").exists());
+    }
+
+    #[test]
+    fn whitelisted_file_in_an_aged_directory_survives() {
+        let temp = tempfile::tempdir().unwrap();
+        let logs = temp.path().join("logs");
+        fs::create_dir(&logs).unwrap();
+        fs::write(logs.join("keep.log"), [1_u8; 4_096]).unwrap();
+        fs::write(logs.join("old.log"), [2_u8; 4_096]).unwrap();
+        backdate(&logs.join("keep.log"), 30);
+        backdate(&logs.join("old.log"), 30);
+        let whitelist = Whitelist::parse("logs/keep.log\n", temp.path());
+
+        let kept = clear_aged_contents(
+            &logs,
+            std::slice::from_ref(&logs),
+            temp.path(),
+            7,
+            None,
+            &whitelist,
+        )
+        .unwrap();
+
+        assert_eq!(kept, 1);
+        assert!(logs.join("keep.log").exists());
+        assert!(!logs.join("old.log").exists());
+    }
+
+    #[test]
+    fn native_commands_never_run_when_the_whitelist_names_something_inside() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("Library/Caches/pip");
+        fs::create_dir_all(cache.join("wheels")).unwrap();
+        fs::write(cache.join("wheels/pinned.whl"), [1_u8; 64]).unwrap();
+        fs::write(cache.join("http.bin"), [2_u8; 64]).unwrap();
+        let spec = CacheSpec {
+            label: "pip cache",
+            ..test_spec(temp.path(), &cache, CacheTarget::DirectoryContents)
+        };
+        let whitelist = Whitelist::parse("Library/Caches/pip/wheels\n", temp.path());
+        let method =
+            clear_with_native_first(&spec, std::slice::from_ref(&cache), None, &whitelist).unwrap();
+        assert!(matches!(
+            method,
+            CleanupMethod::NativeSkippedForWhitelist { kept: 1, .. }
+        ));
+        assert!(cache.join("wheels/pinned.whl").exists());
+        assert!(!cache.join("http.bin").exists());
+    }
+
+    #[test]
+    fn safety_doc_native_table_matches_the_commands_that_run() {
+        let doc = include_str!("../docs/SAFETY.md");
+        let section = doc
+            .split("### Native-command cleanup")
+            .nth(1)
+            .expect("docs/SAFETY.md documents native commands");
+        let documented: HashSet<&str> = section
+            .lines()
+            .skip_while(|line| !line.starts_with("| ---"))
+            .skip(1)
+            .take_while(|line| line.starts_with('|'))
+            .filter_map(|line| line.split('`').nth(1))
+            .collect();
+        let labels = [
+            "pip cache",
+            "Go build cache",
+            "uv package cache",
+            "Yarn package cache",
+            "Playwright browsers",
+            "Cypress runtimes",
+            "Hugging Face models",
+        ];
+        let actual: HashSet<&str> = labels
+            .iter()
+            .filter_map(|label| native_command_name(label))
+            .collect();
+        assert_eq!(actual.len(), labels.len());
+        assert_eq!(
+            documented, actual,
+            "docs/SAFETY.md table must list exactly the commands that run"
+        );
+    }
+
+    #[test]
+    fn exact_paths_with_a_whitelisted_descendant_are_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let stale = temp.path().join("stale");
+        fs::create_dir(&stale).unwrap();
+        fs::write(stale.join("keep"), [1_u8; 64]).unwrap();
+        let whitelist = Whitelist::parse("stale/keep\n", temp.path());
+        let error = remove_exact_path(
+            &stale,
+            std::slice::from_ref(&stale),
+            temp.path(),
+            None,
+            &whitelist,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(stale.join("keep").exists());
     }
 
     #[test]
@@ -2321,18 +2394,12 @@ mod tests {
     fn documents_every_supported_native_first_strategy() {
         let expected = [
             ("pip cache", "python3 -m pip cache purge"),
-            ("npm package cache", "npm cache clean --force"),
             ("Go build cache", "go clean -cache -testcache -fuzzcache"),
             ("uv package cache", "uv cache clean"),
             ("Yarn package cache", "yarn cache clean"),
-            ("SwiftPM cache", "swift package purge-cache"),
             ("Playwright browsers", "playwright uninstall --all"),
-            ("npm npx packages", "npm cache npx rm"),
-            ("CocoaPods cache", "pod cache clean --all"),
             ("Cypress runtimes", "cypress cache clear"),
             ("Hugging Face models", "hf cache prune --yes"),
-            ("Simulator devices", "xcrun simctl delete all"),
-            ("OrbStack data", "orbctl reset --yes"),
         ];
 
         for (label, command) in expected {
@@ -2340,13 +2407,19 @@ mod tests {
         }
         assert_eq!(native_command_name("Homebrew cache"), None);
         assert_eq!(native_command_name("Codex runtimes"), None);
+        assert_eq!(native_command_name("npm package cache"), None);
+        assert_eq!(native_command_name("npm npx packages"), None);
+        assert_eq!(native_command_name("SwiftPM cache"), None);
+        assert_eq!(native_command_name("CocoaPods cache"), None);
+        assert_eq!(native_command_name("Simulator devices"), None);
+        assert_eq!(native_command_name("OrbStack data"), None);
     }
 
     #[test]
     fn unavailable_native_tool_falls_back_to_the_exact_allowlisted_path() {
         let temp = tempfile::tempdir().unwrap();
-        let cache = temp.path().join("hub");
-        fs::create_dir(&cache).unwrap();
+        let cache = temp.path().join(".cache/huggingface/hub");
+        fs::create_dir_all(&cache).unwrap();
         fs::write(cache.join("model.bin"), [1_u8; 8_192]).unwrap();
         let spec = CacheSpec {
             home: temp.path().to_path_buf(),
@@ -2358,7 +2431,9 @@ mod tests {
             target: CacheTarget::DirectoryContents,
         };
 
-        let method = clear_with_native_first(&spec, std::slice::from_ref(&cache), None).unwrap();
+        let method =
+            clear_with_native_first(&spec, std::slice::from_ref(&cache), None, &no_whitelist())
+                .unwrap();
 
         assert_eq!(
             method,
@@ -2367,7 +2442,16 @@ mod tests {
             }
         );
         assert!(cache.is_dir());
-        assert_eq!(fs::read_dir(cache).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&cache).unwrap().count(), 0);
+
+        // The same label at a different path never gets the vendor command.
+        let elsewhere = temp.path().join("hub");
+        fs::create_dir(&elsewhere).unwrap();
+        let moved = CacheSpec {
+            path: elsewhere.clone(),
+            ..spec
+        };
+        assert_eq!(native_command_name_for(&moved), None);
     }
 
     #[test]
@@ -2418,7 +2502,7 @@ mod tests {
     }
 
     #[test]
-    fn recycle_bin_is_reported_as_removable_data() {
+    fn nas_recycle_bin_is_review_only() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("Users/tester");
         let volume = temp.path().join("DATA");
@@ -2437,8 +2521,8 @@ mod tests {
         let entry = scan_cache(&spec, false);
 
         assert_eq!(entry.spec.label, "NAS recycle bin");
-        assert!(entry.spec.note.contains("separate from Finder Trash"));
-        assert_eq!(entry.status, CacheStatus::Ready);
+        assert!(entry.spec.note.contains("other users"));
+        assert_eq!(entry.status, CacheStatus::Review, "never routine cleanup");
         assert!(entry.size_kb > 0);
     }
 
@@ -2651,6 +2735,35 @@ mod tests {
             mounted_filesystem_from_output(mounts, Path::new("/Volumes/Team Share")),
             Some("smbfs".into())
         );
+        assert_eq!(
+            mounted_filesystem_from_output(mounts, Path::new("/Volumes/Team Share/Projects/x")),
+            Some("smbfs".into()),
+            "a folder inside a share is network storage"
+        );
+        assert_eq!(
+            mounted_filesystem_from_output(mounts, Path::new("/Volumes/Team Shared")),
+            Some("apfs".into()),
+            "a sibling with a longer name is not inside the share"
+        );
+    }
+
+    #[test]
+    fn network_volumes_make_every_volume_rule_review_only() {
+        let temp = tempfile::tempdir().unwrap();
+        for spec in volume_specs_for(temp.path(), ScanLocationKind::Network) {
+            assert_eq!(spec.tier, CacheTier::ReviewOnly, "{}", spec.label);
+        }
+        let local = volume_specs_for(temp.path(), ScanLocationKind::Local);
+        let tier = |name: &str| {
+            local
+                .iter()
+                .find(|spec| spec.path.ends_with(name))
+                .map(|spec| spec.tier)
+        };
+        assert_eq!(tier(".Trash"), Some(CacheTier::Routine));
+        assert_eq!(tier(".TemporaryItems"), Some(CacheTier::Routine));
+        assert_eq!(tier("#recycle"), Some(CacheTier::ReviewOnly));
+        assert_eq!(tier("$RECYCLE.BIN"), Some(CacheTier::ReviewOnly));
     }
 
     #[cfg(unix)]

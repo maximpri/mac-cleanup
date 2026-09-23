@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Incomplete-download candidates in the account's Downloads folder.
 //!
 //! Browsers leave `*.crdownload`, `*.part`, and `*.download` entries behind

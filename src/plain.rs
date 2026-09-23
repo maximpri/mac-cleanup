@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 use std::{
     cmp::Reverse,
     path::{Path, PathBuf},
@@ -240,7 +241,7 @@ fn run_relocation(
 }
 
 fn print_relocation_report(report: &RelocationReport) {
-    println!("Mac Cleanup — relocation");
+    println!("Diskray — relocation");
     println!("Source:      {}", report.source.display());
     println!("Destination: {}", report.destination.display());
     println!(
@@ -269,7 +270,7 @@ fn print_report(
     entries: &[CacheEntry],
     process_review: &Result<Vec<ProcessEntry>, String>,
 ) {
-    println!("Mac Cleanup");
+    println!("Diskray");
     println!(
         "Mode: {}",
         match cli.mode() {
@@ -867,6 +868,7 @@ mod tests {
             json: true,
             no_color: true,
             no_tui: false,
+            command: None,
         };
         let entries = vec![CacheEntry {
             spec: CacheSpec {

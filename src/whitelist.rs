@@ -1,6 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! User-editable protection list for cleanup targets.
 //!
-//! A whitelist file at `~/.config/mac-cleanup/whitelist` protects locations
+//! A whitelist file at `~/.config/diskray/whitelist` protects locations
 //! from every cleanup path, including ordinary cleanup and confirmed review
 //! deletion. Each non-empty, non-comment line is one path pattern:
 //!
@@ -13,7 +14,7 @@
 
 use std::{fs, path::Path, path::PathBuf};
 
-const WHITELIST_SUBPATH: &str = ".config/mac-cleanup/whitelist";
+use crate::paths::WHITELIST_SUBPATH;
 
 pub fn whitelist_path(account_home: &Path) -> PathBuf {
     account_home.join(WHITELIST_SUBPATH)
@@ -111,17 +112,40 @@ impl Whitelist {
         false
     }
 
+    /// Whether a pattern names something strictly inside `path`. Clearing the
+    /// contents of `path` must then keep that protected descendant.
+    pub fn covers_descendant(&self, path: &Path) -> bool {
+        if self.patterns.is_empty() {
+            return false;
+        }
+        let covers = |path: &Path| {
+            let components = lowercase_components(path);
+            !components.is_empty()
+                && self.patterns.iter().any(|pattern| {
+                    pattern.segments.len() > components.len()
+                        && components
+                            .iter()
+                            .zip(&pattern.segments)
+                            .all(|(text, segment)| segment_matches(segment, text))
+                })
+        };
+        if covers(path) {
+            return true;
+        }
+        path.canonicalize()
+            .ok()
+            .filter(|resolved| resolved != path)
+            .is_some_and(|resolved| covers(&resolved))
+    }
+
+    /// Whether cleanup must leave this entry in place: it is protected, or
+    /// something inside it is.
+    pub fn keeps(&self, path: &Path) -> bool {
+        self.protects(path) || self.covers_descendant(path)
+    }
+
     fn matches_path_or_ancestor(&self, path: &Path) -> bool {
-        let components: Vec<String> = path
-            .components()
-            .filter_map(|component| match component {
-                std::path::Component::Normal(part) => {
-                    let text = part.to_string_lossy().to_lowercase();
-                    (!text.is_empty()).then_some(text)
-                }
-                _ => None,
-            })
-            .collect();
+        let components = lowercase_components(path);
         if components.is_empty() {
             return false;
         }
@@ -156,6 +180,18 @@ impl PathPattern {
                 .zip(&self.segments)
                 .all(|(text, pattern)| segment_matches(pattern, text))
     }
+}
+
+fn lowercase_components(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => {
+                let text = part.to_string_lossy().to_lowercase();
+                (!text.is_empty()).then_some(text)
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn expand_home(line: &str, account_home: &Path) -> PathBuf {
@@ -277,6 +313,22 @@ mod tests {
         assert!(whitelist.protects(&canonical_candidate));
         assert!(whitelist.protects(&canonical_candidate.join("deep/file")));
         assert!(!whitelist.protects(&resolved.join("other/nested")));
+    }
+
+    #[test]
+    fn descendant_patterns_are_detected_for_their_ancestors() {
+        let whitelist = Whitelist::parse(
+            "Library/Caches/Google/Chrome\nLibrary/Caches/com.*/keep",
+            &home(),
+        );
+        let caches = home().join("Library/Caches");
+        assert!(whitelist.covers_descendant(&caches));
+        assert!(whitelist.covers_descendant(&caches.join("Google")));
+        assert!(!whitelist.covers_descendant(&caches.join("Google/Chrome")));
+        assert!(whitelist.keeps(&caches.join("Google/Chrome")));
+        assert!(whitelist.covers_descendant(&caches.join("COM.example")));
+        assert!(!whitelist.covers_descendant(&caches.join("pip")));
+        assert!(!Whitelist::empty().covers_descendant(&caches));
     }
 
     #[test]

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Conservative retention policy for user-owned temporary entries.
 //!
 //! The system `/private/tmp` directory is shared by macOS services and user

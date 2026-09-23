@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Exercise the built macOS TUI. All deletion is confined to our disposable fixture."""
 
 import codecs
@@ -164,8 +165,8 @@ class Session:
 
 
 def main():
-    binary = Path(sys.argv[1] if len(sys.argv) > 1 else "target/release/mac-cleanup").resolve()
-    with tempfile.TemporaryDirectory(prefix="mac-cleanup-smoke-") as temporary:
+    binary = Path(sys.argv[1] if len(sys.argv) > 1 else "target/release/diskray").resolve()
+    with tempfile.TemporaryDirectory(prefix="diskray-smoke-") as temporary:
         root = Path(temporary).resolve()
         trash = root / ".Trash"
         trash.mkdir()
@@ -179,51 +180,109 @@ def main():
         print("PASS: read-only JSON schema 5")
         session = Session(binary, "--analyze", "--volume", str(root))
         try:
-            session.wait_for("Findings")
-            session.send(b"\t\x1b[C\r")
-            session.wait_for("Storage")
+            session.wait_for("WHERE")
+            session.send(b":")
+            session.wait_for("COMMANDS")
+            session.send(b"history\r")
+            session.wait_for("HISTORY")
+            session.send(b"1")
+            session.wait_for("WHERE")
+            session.send(b"\t")
+            session.wait_for("EXPLORE")
             session.send(b"P")
             session.wait_for("LIVE PROCESSES")
             session.send(b"\x1b")
-            session.wait_for("Findings")
+            session.wait_for("Overview")
+            session.resize(60, 16)
+            session.wait_for("Overview")
+            session.send(b"?")
+            session.wait_for("HELP")
+            session.send(b" ")
+            session.pump(0.15)
+            assert candidate.exists(), "help must capture action keys"
+            session.send(b"\x1b")
+            session.wait_for("EXPLORE")
+            session.send(b"\t")
+            session.wait_for("HISTORY")
+            session.send(b"\r")
+            session.wait_for("RESULTS")
+            session.send(b"\x1b")
+            session.wait_for("HISTORY")
             session.resize(45,12)
             session.wait_for("Expand the terminal")
             session.send(b"CLEAN\r")
             session.pump(0.8)  # Keep the window small until queued keys have been handled.
             assert candidate.exists()
             session.resize(120,30)
-            session.wait_for("Findings")
+            session.wait_for("Overview")
             time.sleep(0.25)
             session.send(b"q")
             assert session.wait_exit()==0
         finally:
             session.close()
-        print("PASS: unified menu, process inspection, read-only resize, and exit")
+        print("PASS: Overview home, command palette, tabs, process inspection, read-only resize, and exit")
+        session = Session(binary, "--analyze", "--volume", str(root))
+        try:
+            session.wait_for("✓ Scan", timeout=45)
+            session.send(b"/")
+            session.pump(0.4)
+            if "ASK ABOUT THIS MAC" in session.screen.text():
+                session.send(b"q")
+                session.pump(0.3)
+                assert session.process.poll() is None, "q is text inside the Ask box"
+                session.send(b"\x1b")
+                session.wait_for("WHERE")
+            else:
+                session.wait_for("Ask needs Apple Intelligence")
+            session.pump(3.0)  # Let measured triage settle so the selection is stable.
+            session.send(b"i")
+            session.pump(0.3)
+            session.send(b"\r")
+            session.wait_for("Investigation finished", timeout=90)
+            seen = session.screen.text()
+            for _ in range(12):  # PgDn: measurements come before interpretation.
+                session.send(b"\x1b[6~")
+                session.pump(0.15)
+                seen += session.screen.text()
+            assert any(label in seen for label in ("WHAT THE CHECKS FOUND", "LOCAL AI")), seen
+            assert "tool calls" in seen and "HOW THIS WAS CHECKED" in seen, seen
+            assert candidate.exists(), "investigations are read-only"
+            session.send(b"\x1b")
+            session.pump(0.2)
+            session.send(b"q")
+            assert session.wait_exit() == 0
+        finally:
+            session.close()
+        print("PASS: ask box, read-only tool investigation timeline, and exit")
         session = Session(binary, "--volume", str(root))
         try:
-            session.wait_for("Assessment complete",timeout=45)
+            session.wait_for("✓ Scan",timeout=45)
             session.send(b"f")
-            session.wait_for("ALL FINDINGS")
+            session.wait_for("f fewer")
             # Inspect each plan without executing until the exact fixture is selected.
             for _ in range(40):
                 session.send(b" ")
                 session.send(b"p")
-                session.wait_for("REVIEW EXACT ACTIONS")
-                if str(trash) in session.screen.text():
+                session.wait_for("Reviewing your plan")
+                review_text = session.screen.text()
+                if str(trash) in review_text:
                     break
-                session.send(b"\x1b[3~")  # Delete clears this unexecuted plan.
-                session.wait_for("ALL FINDINGS")
+                if "YOUR PLAN IS EMPTY" in review_text:
+                    session.send(b"\x1b")
+                else:
+                    session.send(b"\x1b[3~")  # Delete clears this unexecuted plan.
+                session.wait_for("f fewer")
                 session.send(b"\x1b[B")
             else:
                 raise AssertionError("fixture Trash was not selectable")
-            assert "1 actions" in session.screen.text()
+            assert "1 action(s)" in session.screen.text()
             session.send(b"\x1b")
-            session.wait_for("ALL FINDINGS")
+            session.wait_for("f fewer")
             assert candidate.exists(), "cancel must preserve data"
             session.send(b"p")
             session.wait_for("Type CLEAN")
             session.send(b"CLEAN\r")
-            session.wait_for("RESULTS",timeout=45)
+            session.wait_for("Plan finished",timeout=45)
             assert trash.is_dir()
             assert not candidate.exists()
             assert protected.read_text()=="outside the cleanup allowlist"

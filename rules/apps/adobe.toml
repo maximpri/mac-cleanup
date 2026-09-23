@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+schema = 1
+pack = "adobe"
+description = "Adobe application caches."
+
+# Adobe background services run constantly, so only the apps themselves mark
+# the cache as in use.
+[[rule]]
+id = "cache"
+label = "Adobe app cache"
+path = "Library/Caches/Adobe"
+tier = "routine"
+processes = ["/Adobe [^/]+\\.app/", "[P]hotoshop", "[I]llustrator", "[P]remiere", "[A]fter Effects", "[L]ightroom"]
+note = "Adobe applications regenerate cached files"

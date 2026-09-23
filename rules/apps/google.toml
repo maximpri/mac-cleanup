@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+schema = 1
+pack = "google"
+description = "Google Chrome and Google Drive caches."
+
+# The Keystone updater runs almost permanently, so it is not treated as an
+# owner; the cache is in use only while Chrome or Drive itself runs.
+[[rule]]
+id = "cache"
+label = "Google app cache"
+path = "Library/Caches/Google"
+tier = "routine"
+processes = ["/Google Chrome.app/", "/Google Drive.app/"]
+note = "browser and app cache data reloads"

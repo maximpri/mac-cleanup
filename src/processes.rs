@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Conservative review and signalling of current-account processes, with
 //! read-only observations for unusually large system-owned daemons.
 //!
@@ -68,6 +69,17 @@ pub enum ProcessOutcome {
     SignalSent { signal: ProcessSignal },
     SafetySkipped(String),
     Failed(String),
+}
+
+impl ProcessEntry {
+    /// Diskray itself or one of the processes that launched it.
+    pub fn is_diskray_or_ancestor(&self) -> bool {
+        self.pid == std::process::id()
+            || self
+                .signal_block_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("Diskray never signals itself"))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -142,11 +154,11 @@ pub fn review_processes() -> Result<Vec<ProcessEntry>, String> {
         let health = health_from_state(&row.state).unwrap_or(ProcessHealth::Running);
         let start_time = row.start_time.clone();
         let signal_block_reason = if system_owned {
-            Some("system-owned macOS process is read-only; Mac Cleanup never signals it".into())
+            Some("system-owned macOS process is read-only; Diskray never signals it".into())
         } else if health == ProcessHealth::Zombie {
             Some("zombies are already dead and must be reaped by their parent".into())
         } else if row.pid <= 1 || row.pid == current_pid || protected.contains(&row.pid) {
-            Some("Mac Cleanup never signals itself or one of its ancestor processes".into())
+            Some("Diskray never signals itself or one of its ancestor processes".into())
         } else if start_time.is_empty() {
             Some("the process identity could not be captured safely".into())
         } else {

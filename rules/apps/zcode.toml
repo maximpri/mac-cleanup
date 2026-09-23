@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+schema = 1
+pack = "zcode"
+description = "ZCode desktop updater downloads."
+
+[[rule]]
+id = "updater"
+label = "ZCode updater"
+path = "Library/Caches/@zcodedesktop-updater"
+tier = "routine"
+processes = ["/[Zz][Cc]ode.app/", "@[z]codedesktop-updater"]
+note = "obsolete updater downloads"

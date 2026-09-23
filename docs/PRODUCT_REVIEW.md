@@ -375,4 +375,4 @@ The unified workspace, bounded local AI helper, shared plans, and local outcome
 history are now implemented in source. See the dated checkpoint in
 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for completed capabilities and
 outstanding release evaluation. Earlier UX proposals in this review are design
-context; [README.md](../README.md) describes the current controls.
+context; [USAGE.md](USAGE.md) describes the current controls.

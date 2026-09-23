@@ -1,21 +1,27 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Bounded local inference. Structured suggestions never execute actions.
-use crate::investigation::{AgentDecision, AvailableCheck, CasePhase, InvestigationCase};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
-    io::{Read, Write},
-    process::{Command, Stdio},
+    io::{BufRead, BufReader, Read, Write},
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
     },
     thread,
     time::{Duration, Instant},
 };
 
-/// Bump when the helper instructions or response interpretation changes.
-pub const PROMPT_VERSION: &str = "care-agent-v4";
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
+/// Longest helper line accepted in either direction.
+pub const MAX_LINE_BYTES: usize = 32_768;
+const HELPER_NAME: &str = "diskray-ai";
+const MISSING_HELPER: &str =
+    "Apple AI helper missing. Install the release bundle or build with scripts/build-release.sh.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameworkStatus {
@@ -64,9 +70,7 @@ pub struct Subject {
 #[derive(Debug, Clone, Serialize)]
 pub struct Request {
     pub revision: u64,
-    pub checks: std::collections::HashMap<String, Vec<String>>,
     pub subjects: Vec<Subject>,
-    pub investigation: bool,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Insight {
@@ -81,22 +85,16 @@ pub struct Triage {
     pub quick_win_ids: Vec<String>,
     pub reasons: Vec<String>,
 }
-pub fn cache_key(request: &Request) -> String {
-    format!(
-        "{}:{}",
-        PROMPT_VERSION,
-        serde_json::to_string(request).unwrap_or_default()
-    )
-}
 #[derive(Deserialize)]
 struct Response {
     protocol: u32,
     request_id: Option<String>,
     available: bool,
     error: Option<String>,
+    #[serde(default)]
+    error_code: Option<String>,
     insight: Option<Insight>,
     triage: Option<Triage>,
-    decision: Option<AgentDecision>,
     capabilities: Option<Capabilities>,
 }
 
@@ -109,149 +107,278 @@ struct Capabilities {
     dynamic_schemas: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    static HELPER_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Point this test thread at a fake helper executable.
+#[cfg(test)]
+pub(crate) fn set_test_helper(path: Option<PathBuf>) {
+    HELPER_OVERRIDE.with(|helper| *helper.borrow_mut() = path);
+}
+
+/// The helper ships beside the main executable. Only tests may substitute it.
+pub fn helper_path() -> Result<PathBuf, String> {
+    #[cfg(test)]
+    if let Some(path) = HELPER_OVERRIDE.with(|helper| helper.borrow().clone()) {
+        return Ok(path);
+    }
+    let executable = std::env::current_exe().map_err(|error| display_text(&error.to_string()))?;
+    // Homebrew links `bin/diskray` into the Cellar; resolve the link so the
+    // helper is found next to the real binary or in the formula's libexec.
+    let executable = executable.canonicalize().unwrap_or(executable);
+    let candidates = [
+        executable.with_file_name(HELPER_NAME),
+        executable
+            .parent()
+            .and_then(Path::parent)
+            .map(|prefix| prefix.join("libexec").join(HELPER_NAME))
+            .unwrap_or_default(),
+    ];
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| MISSING_HELPER.into())
+}
+
+/// Plain-language text for helper error codes. Raw framework enum names are
+/// kept out of the interface.
+pub fn friendly_error(code: Option<&str>, message: &str) -> String {
+    match code {
+        Some("not_eligible") => "This Mac does not support Apple Intelligence.".into(),
+        Some("not_enabled") => {
+            "Apple Intelligence is turned off. Press A to open System Settings.".into()
+        }
+        Some("model_not_ready") => {
+            "Apple Intelligence is still preparing its model. Try again once the download finishes."
+                .into()
+        }
+        Some("context") => "The evidence was too large for the on-device model.".into(),
+        Some("guardrail") => "Apple's on-device safety guardrails declined this request.".into(),
+        Some("rate_limited") | Some("concurrent_requests") => {
+            "The on-device model is busy. Try again shortly.".into()
+        }
+        Some("assets_unavailable") => {
+            "Apple Intelligence model assets are unavailable right now.".into()
+        }
+        Some("unsupported_locale") => {
+            "The on-device model does not support the current language or region.".into()
+        }
+        Some("refusal") => "The on-device model declined to answer.".into(),
+        Some("decoding") => "The on-device model returned an unreadable answer.".into(),
+        Some("tool_budget") => "The model kept requesting tools after its budget.".into(),
+        _ => display_text(message),
+    }
+}
+
+/// One helper process with non-blocking line I/O. The child is killed and
+/// reaped when this value is dropped, so cancellation is `drop`.
+pub struct HelperProcess {
+    child: Child,
+    lines: Receiver<Result<Value, String>>,
+    writer: Option<Sender<String>>,
+}
+
+impl HelperProcess {
+    pub fn spawn() -> Result<Self, String> {
+        let helper = helper_path()?;
+        let mut child = Command::new(helper)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| display_text(&error.to_string()))?;
+        let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Apple AI helper pipes unavailable".into());
+        };
+        let (line_sender, lines) = mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut buffer = Vec::new();
+                let read = (&mut reader)
+                    .take(MAX_LINE_BYTES as u64 + 1)
+                    .read_until(b'\n', &mut buffer);
+                match read {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) if buffer.len() > MAX_LINE_BYTES => {
+                        let _ = line_sender.send(Err("Apple AI helper line too large".into()));
+                        break;
+                    }
+                    Ok(_) => {
+                        let text = String::from_utf8_lossy(&buffer);
+                        if text.trim().is_empty() {
+                            continue;
+                        }
+                        let parsed = serde_json::from_str::<Value>(text.trim())
+                            .map_err(|_| "Invalid Apple AI response".to_string());
+                        if line_sender.send(parsed).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let (writer, outgoing) = mpsc::channel::<String>();
+        thread::spawn(move || {
+            for line in outgoing {
+                if stdin.write_all(line.as_bytes()).is_err() || stdin.flush().is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Self {
+            child,
+            lines,
+            writer: Some(writer),
+        })
+    }
+
+    pub fn send(&self, value: &Value) -> Result<(), String> {
+        let mut line = serde_json::to_string(value).map_err(|error| error.to_string())?;
+        if line.len() > MAX_LINE_BYTES {
+            return Err("Apple AI request too large".into());
+        }
+        line.push('\n');
+        self.writer
+            .as_ref()
+            .ok_or("Apple AI helper input closed")?
+            .send(line)
+            .map_err(|_| "Apple AI helper input closed".into())
+    }
+
+    /// Signal end of input. One-shot helpers answer and exit; long-lived
+    /// sessions treat this as cancellation.
+    pub fn close_input(&mut self) {
+        self.writer = None;
+    }
+
+    /// Non-blocking read. `None` means no line is ready yet.
+    pub fn try_recv(&self) -> Option<Result<Value, String>> {
+        match self.lines.try_recv() {
+            Ok(line) => Some(line),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err("Apple AI helper stopped".into())),
+        }
+    }
+
+    fn recv_timeout(&self, timeout: Duration) -> Option<Result<Value, String>> {
+        match self.lines.recv_timeout(timeout) {
+            Ok(line) => Some(line),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => Some(Err("Apple AI helper stopped".into())),
+        }
+    }
+}
+
+impl Drop for HelperProcess {
+    fn drop(&mut self) {
+        self.writer = None;
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Send one request and wait for its single response line. `stopped` is the
+/// message returned for cancellation or timeout.
+fn request_once(
+    payload: &Value,
+    request_id: &str,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+    stopped: &str,
+) -> Result<Response, String> {
+    let mut helper = HelperProcess::spawn()?;
+    helper.send(payload)?;
+    helper.close_input();
+    let started = Instant::now();
+    loop {
+        if cancelled.load(Ordering::Relaxed) || started.elapsed() > timeout {
+            return Err(stopped.into());
+        }
+        let Some(line) = helper.recv_timeout(Duration::from_millis(25)) else {
+            continue;
+        };
+        let response: Response =
+            serde_json::from_value(line?).map_err(|_| "Invalid Apple AI response")?;
+        if response.protocol != PROTOCOL_VERSION
+            || response.request_id.as_deref() != Some(request_id)
+        {
+            return Err("Apple AI helper version or request mismatch.".into());
+        }
+        if !response.available {
+            return Err(response.error.map_or_else(
+                || "Enable Apple Intelligence and allow its model to download.".into(),
+                |error| friendly_error(response.error_code.as_deref(), &error),
+            ));
+        }
+        if let Some(error) = &response.error {
+            return Err(friendly_error(response.error_code.as_deref(), error));
+        }
+        return Ok(response);
+    }
+}
+
 /// Detect the framework used by the bundled local model helper without starting
 /// an inference request. This runs on a worker because model availability may
 /// involve checking downloaded Apple Intelligence assets.
 pub fn framework_status() -> FrameworkStatus {
-    let helper = match std::env::current_exe() {
-        Ok(path) => path.with_file_name("mac-cleanup-ai"),
-        Err(error) => {
-            return FrameworkStatus::Missing {
-                detail: display_text(&error.to_string()),
-            };
-        }
-    };
-    if !helper.is_file() {
+    if let Err(detail) = helper_path() {
         return FrameworkStatus::Missing {
-            detail: "build or install the release bundle".into(),
+            detail: if detail == MISSING_HELPER {
+                "build or install the release bundle".into()
+            } else {
+                detail
+            },
         };
     }
-    let mut child = match Command::new(helper)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => {
-            return FrameworkStatus::Unavailable {
-                detail: display_text(&error.to_string()),
-            };
-        }
-    };
-    let Some(mut stdin) = child.stdin.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return FrameworkStatus::Unavailable {
-            detail: "helper input unavailable".into(),
-        };
-    };
-    if writeln!(stdin, "{{\"protocol\":{PROTOCOL_VERSION},\"request_id\":\"availability\",\"operation\":\"capabilities\"}}").is_err() {
-        let _ = child.kill();
-        let _ = child.wait();
-        return FrameworkStatus::Unavailable {
-            detail: "helper request failed".into(),
-        };
-    }
-    drop(stdin);
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return FrameworkStatus::Unavailable {
-            detail: "helper output unavailable".into(),
-        };
-    };
-    let reader = thread::spawn(move || {
-        let mut output = String::new();
-        stdout
-            .take(8_193)
-            .read_to_string(&mut output)
-            .map(|_| output)
+    let payload = serde_json::json!({
+        "protocol": PROTOCOL_VERSION,
+        "request_id": "availability",
+        "operation": "capabilities",
     });
-    let started = Instant::now();
-    loop {
-        if started.elapsed() > Duration::from_secs(5) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = reader.join();
-            return FrameworkStatus::Unavailable {
-                detail: "availability check timed out".into(),
-            };
+    let never = AtomicBool::new(false);
+    match request_once(
+        &payload,
+        "availability",
+        Duration::from_secs(5),
+        &never,
+        "availability check timed out",
+    ) {
+        Ok(response) => {
+            let detail = response
+                .capabilities
+                .map(|capabilities| {
+                    format!(
+                        " · {} · {} · context {} · {} · {}",
+                        display_text(&capabilities.provider),
+                        display_text(&capabilities.helper_version),
+                        capabilities
+                            .context_size
+                            .map(|size| size.to_string())
+                            .unwrap_or_else(|| "unknown".into()),
+                        if capabilities.dynamic_schemas {
+                            "constrained decisions"
+                        } else {
+                            "basic schemas"
+                        },
+                        if capabilities.token_counting {
+                            "token preflight"
+                        } else {
+                            "byte preflight"
+                        }
+                    )
+                })
+                .unwrap_or_default();
+            FrameworkStatus::Available { detail }
         }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let output = match reader.join() {
-                    Ok(Ok(output)) => output,
-                    _ => {
-                        return FrameworkStatus::Unavailable {
-                            detail: "helper response could not be read".into(),
-                        };
-                    }
-                };
-                if !status.success() {
-                    return FrameworkStatus::Unavailable {
-                        detail: "availability helper failed".into(),
-                    };
-                }
-                let response: Response = match serde_json::from_str(output.trim()) {
-                    Ok(response) => response,
-                    Err(_) => {
-                        return FrameworkStatus::Unavailable {
-                            detail: "invalid availability response".into(),
-                        };
-                    }
-                };
-                if response.protocol != PROTOCOL_VERSION
-                    || response.request_id.as_deref() != Some("availability")
-                {
-                    return FrameworkStatus::Unavailable {
-                        detail: "helper protocol mismatch".into(),
-                    };
-                }
-                return if response.available {
-                    let detail = response
-                        .capabilities
-                        .map(|capabilities| {
-                            format!(
-                                " · {} · {} · context {} · {} · {}",
-                                display_text(&capabilities.provider),
-                                display_text(&capabilities.helper_version),
-                                capabilities
-                                    .context_size
-                                    .map(|size| size.to_string())
-                                    .unwrap_or_else(|| "unknown".into()),
-                                if capabilities.dynamic_schemas {
-                                    "constrained decisions"
-                                } else {
-                                    "basic schemas"
-                                },
-                                if capabilities.token_counting {
-                                    "token preflight"
-                                } else {
-                                    "byte preflight"
-                                }
-                            )
-                        })
-                        .unwrap_or_default();
-                    FrameworkStatus::Available { detail }
-                } else {
-                    FrameworkStatus::Unavailable {
-                        detail: display_text(&response.error.unwrap_or_else(|| {
-                            "enable Apple Intelligence in System Settings".into()
-                        })),
-                    }
-                };
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(20)),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                return FrameworkStatus::Unavailable {
-                    detail: display_text(&error.to_string()),
-                };
-            }
-        }
+        Err(detail) => FrameworkStatus::Unavailable {
+            detail: display_text(&detail),
+        },
     }
 }
 
@@ -288,22 +415,7 @@ pub fn validate(request: &Request, insight: &Insight) -> Result<(), String> {
     {
         return Err("AI returned unsupported evidence or actions.".into());
     }
-    let checks = [
-        "inspect_children",
-        "refresh_processes",
-        "check_open_handles",
-        "compare_history",
-        "fs_usage",
-        "volume_context",
-        "research_sources",
-    ];
-    if insight.next_checks.len() > 3
-        || (!request.investigation && !insight.next_checks.is_empty())
-        || insight
-            .next_checks
-            .iter()
-            .any(|check| !checks.contains(&check.as_str()))
-    {
+    if !insight.next_checks.is_empty() {
         return Err("AI requested an unsupported investigation.".into());
     }
     Ok(())
@@ -380,29 +492,7 @@ pub fn deterministic_triage(request: &Request) -> Triage {
         reasons: vec![],
     }
 }
-pub fn explain(request: &Request, cancelled: &Arc<AtomicBool>) -> Result<Insight, String> {
-    match explain_once(request, cancelled) {
-        Err(error)
-            if error.to_lowercase().contains("context")
-                && request.subjects.len() > 1
-                && !cancelled.load(Ordering::Relaxed) =>
-        {
-            let mut smaller = request.clone();
-            smaller
-                .subjects
-                .truncate((request.subjects.len() / 2).max(1));
-            explain_once(&smaller, cancelled)
-        }
-        result => result,
-    }
-}
 pub fn triage(request: &Request, cancelled: &Arc<AtomicBool>) -> Result<Triage, String> {
-    let helper = std::env::current_exe()
-        .map_err(|e| e.to_string())?
-        .with_file_name("mac-cleanup-ai");
-    if !helper.is_file() {
-        return Err("Apple AI helper missing. Install the release bundle or build with scripts/build-release.sh.".into());
-    }
     let prompt = serde_json::to_string(request).map_err(|e| e.to_string())?;
     if prompt.len() > 10_000 {
         return Err("Select fewer findings for local triage.".into());
@@ -421,210 +511,20 @@ pub fn triage(request: &Request, cancelled: &Arc<AtomicBool>) -> Result<Triage, 
         .map(|subject| subject.id.clone())
         .collect::<Vec<_>>();
     let payload = serde_json::json!({"protocol":PROTOCOL_VERSION,"request_id":request_id,"operation":"triage","prompt":prompt,"allowed_key_areas":key_areas,"allowed_quick_wins":quick_wins});
-    let mut child = Command::new(helper)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    let mut stdin = child.stdin.take().ok_or("Missing helper input")?;
-    if let Err(e) = writeln!(stdin, "{payload}") {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(e.to_string());
-    }
-    drop(stdin);
-    let stdout = child.stdout.take().ok_or("Missing helper output")?;
-    let reader = thread::spawn(move || {
-        let mut output = String::new();
-        stdout
-            .take(32_769)
-            .read_to_string(&mut output)
-            .map(|_| output)
-    });
-    let started = Instant::now();
-    loop {
-        if cancelled.load(Ordering::Relaxed) || started.elapsed() > Duration::from_secs(20) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = reader.join();
-            return Err("Local triage stopped. Measured findings remain available.".into());
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let output = reader
-                    .join()
-                    .map_err(|_| "AI reader stopped")?
-                    .map_err(|e| e.to_string())?;
-                if !status.success() || output.len() > 32_768 {
-                    return Err("Apple AI helper failed.".into());
-                }
-                let response: Response =
-                    serde_json::from_str(output.trim()).map_err(|_| "Invalid Apple AI response")?;
-                if response.protocol != PROTOCOL_VERSION
-                    || response.request_id.as_deref() != Some(request_id.as_str())
-                {
-                    return Err("Apple AI helper version mismatch.".into());
-                }
-                if !response.available {
-                    return Err(response.error.unwrap_or_else(|| {
-                        "Enable Apple Intelligence and allow its model to download.".into()
-                    }));
-                }
-                if let Some(error) = response.error {
-                    return Err(display_text(&error));
-                }
-                let triage = response.triage.ok_or("No triage returned")?;
-                validate_triage(request, &triage)?;
-                return Ok(triage);
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(25)),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                return Err(error.to_string());
-            }
-        }
-    }
+    let response = request_once(
+        &payload,
+        &request_id,
+        Duration::from_secs(20),
+        cancelled,
+        "Local triage stopped. Measured findings remain available.",
+    )?;
+    let triage = response.triage.ok_or("No triage returned")?;
+    validate_triage(request, &triage)?;
+    Ok(triage)
 }
 
-/// Ask the on-device model for exactly one next diagnostic step. Rust supplies
-/// the complete allowed set and validates the returned references before the
-/// caller may execute anything.
-pub fn decide(
-    case: &InvestigationCase,
-    available: &[AvailableCheck],
-    cancelled: &Arc<AtomicBool>,
-) -> Result<AgentDecision, String> {
-    if available.is_empty() {
-        return Ok(AgentDecision::Finish {
-            conclusion: case.conclusion_text(),
-            phase: CasePhase::Inconclusive,
-            evidence_ids: case
-                .evidence
-                .iter()
-                .filter(|evidence| evidence.status.can_support_hypothesis())
-                .map(|evidence| evidence.id.clone())
-                .take(4)
-                .collect(),
-        });
-    }
-    let helper = std::env::current_exe()
-        .map_err(|error| error.to_string())?
-        .with_file_name("mac-cleanup-ai");
-    if !helper.is_file() {
-        return Err("Apple AI helper missing. Install the release bundle or build with scripts/build-release.sh.".into());
-    }
-    let packet = serde_json::json!({
-        "case_id": case.id,
-        "revision": case.revision,
-        "target": case.target,
-        "phase": case.phase,
-        "decision_count": case.decision_count,
-        "decision_budget": case.decision_budget,
-        "hypotheses": case.hypotheses,
-        "evidence": case.evidence,
-        "available_checks": available,
-    });
-    let prompt = serde_json::to_string(&packet).map_err(|error| error.to_string())?;
-    if prompt.len() > 14_000 {
-        return Err("Investigation evidence exceeds the local decision context.".into());
-    }
-    let request_id = format!("decision:{}:{}", case.id, case.decision_count);
-    let payload = serde_json::json!({
-        "protocol": PROTOCOL_VERSION,
-        "request_id": request_id,
-        "operation": "decide",
-        "prompt": prompt,
-        "allowed_checks": available.iter().map(|check| check.id.clone()).collect::<Vec<_>>(),
-        "allowed_evidence": case.evidence.iter().map(|evidence| evidence.id.clone()).collect::<Vec<_>>(),
-        "allowed_hypotheses": case.hypotheses.iter().map(|hypothesis| hypothesis.id.clone()).collect::<Vec<_>>(),
-    });
-    let mut child = Command::new(helper)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| error.to_string())?;
-    let mut stdin = child.stdin.take().ok_or("Missing helper input")?;
-    if let Err(error) = writeln!(stdin, "{payload}") {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error.to_string());
-    }
-    drop(stdin);
-    let stdout = child.stdout.take().ok_or("Missing helper output")?;
-    let reader = thread::spawn(move || {
-        let mut output = String::new();
-        stdout
-            .take(32_769)
-            .read_to_string(&mut output)
-            .map(|_| output)
-    });
-    let started = Instant::now();
-    loop {
-        if cancelled.load(Ordering::Relaxed) || started.elapsed() > Duration::from_secs(20) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = reader.join();
-            return Err("Local investigation decision stopped.".into());
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let output = reader
-                    .join()
-                    .map_err(|_| "AI reader stopped")?
-                    .map_err(|error| error.to_string())?;
-                if !status.success() || output.len() > 32_768 {
-                    return Err("Apple AI helper failed.".into());
-                }
-                let response: Response =
-                    serde_json::from_str(output.trim()).map_err(|_| "Invalid Apple AI response")?;
-                if response.protocol != PROTOCOL_VERSION
-                    || response.request_id.as_deref() != Some(request_id.as_str())
-                {
-                    return Err("Apple AI helper version or request mismatch.".into());
-                }
-                if !response.available {
-                    return Err(response.error.unwrap_or_else(|| {
-                        "Enable Apple Intelligence and allow its model to download.".into()
-                    }));
-                }
-                if let Some(error) = response.error {
-                    return Err(display_text(&error));
-                }
-                let mut decision = response
-                    .decision
-                    .ok_or("No investigation decision returned")?;
-                match &mut decision {
-                    AgentDecision::Check { reason, .. } => *reason = display_text(reason),
-                    AgentDecision::Finish { conclusion, .. } => {
-                        *conclusion = display_text(conclusion)
-                    }
-                    AgentDecision::Research { .. } | AgentDecision::AwaitApproval { .. } => {}
-                }
-                case.validate_decision(&decision, available)?;
-                return Ok(decision);
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(25)),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                return Err(error.to_string());
-            }
-        }
-    }
-}
 /// Summarize already-completed outcomes. The request contains no executable targets.
 pub fn summarize(request: &Request, cancelled: &Arc<AtomicBool>) -> Result<Insight, String> {
-    let helper = std::env::current_exe()
-        .map_err(|e| e.to_string())?
-        .with_file_name("mac-cleanup-ai");
-    if !helper.is_file() {
-        return Err("Apple AI helper missing. Install the release bundle or build with scripts/build-release.sh.".into());
-    }
     let prompt = serde_json::to_string(request).map_err(|e| e.to_string())?;
     if prompt.len() > 10_000 {
         return Err("Action results are too large for a local summary.".into());
@@ -636,179 +536,155 @@ pub fn summarize(request: &Request, cancelled: &Arc<AtomicBool>) -> Result<Insig
         "operation":"result",
         "prompt":prompt,
         "allowed_evidence":request.subjects.iter().map(|subject| subject.id.clone()).collect::<Vec<_>>(),
-        "allowed_actions":[],
-        "allowed_checks":[],
     });
-    let mut child = Command::new(helper)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    let mut stdin = child.stdin.take().ok_or("Missing helper input")?;
-    if let Err(e) = writeln!(stdin, "{payload}") {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(e.to_string());
-    }
-    drop(stdin);
-    let stdout = child.stdout.take().ok_or("Missing helper output")?;
-    let reader = thread::spawn(move || {
-        let mut output = String::new();
-        stdout
-            .take(32_769)
-            .read_to_string(&mut output)
-            .map(|_| output)
-    });
-    let started = Instant::now();
-    loop {
-        if cancelled.load(Ordering::Relaxed) || started.elapsed() > Duration::from_secs(20) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = reader.join();
-            return Err("Local result summary stopped. Measurements remain available.".into());
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let output = reader
-                    .join()
-                    .map_err(|_| "AI reader stopped")?
-                    .map_err(|e| e.to_string())?;
-                if !status.success() || output.len() > 32_768 {
-                    return Err("Apple AI helper failed.".into());
-                }
-                let response: Response =
-                    serde_json::from_str(output.trim()).map_err(|_| "Invalid Apple AI response")?;
-                if response.protocol != PROTOCOL_VERSION
-                    || response.request_id.as_deref() != Some(request_id.as_str())
-                {
-                    return Err("Apple AI helper version mismatch.".into());
-                }
-                if !response.available {
-                    return Err(response.error.unwrap_or_else(|| {
-                        "Enable Apple Intelligence and allow its model to download.".into()
-                    }));
-                }
-                if let Some(error) = response.error {
-                    return Err(display_text(&error));
-                }
-                let insight = response.insight.ok_or("No result summary returned")?;
-                validate(request, &insight)?;
-                return Ok(Insight {
-                    summary: display_text(&insight.summary),
-                    evidence_ids: insight.evidence_ids,
-                    action_ids: vec![],
-                    next_checks: vec![],
-                });
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(25)),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                return Err(error.to_string());
-            }
-        }
-    }
-}
-fn explain_once(request: &Request, cancelled: &Arc<AtomicBool>) -> Result<Insight, String> {
-    let helper = std::env::current_exe()
-        .map_err(|e| e.to_string())?
-        .with_file_name("mac-cleanup-ai");
-    if !helper.is_file() {
-        return Err("Apple AI helper missing. Install the release bundle or build with scripts/build-release.sh.".into());
-    }
-    let prompt = serde_json::to_string(request).map_err(|e| e.to_string())?;
-    if prompt.len() > 10_000 {
-        return Err("Select fewer findings for a local insight.".into());
-    }
-    let request_id = format!("explain:{}", request.revision);
-    let payload = serde_json::json!({
-        "protocol":PROTOCOL_VERSION,
-        "request_id":request_id,
-        "operation":"explain",
-        "prompt":prompt,
-        "allowed_evidence":request.subjects.iter().map(|subject| subject.id.clone()).collect::<Vec<_>>(),
-        "allowed_actions":request.subjects.iter().flat_map(|subject| subject.action_ids.clone()).collect::<Vec<_>>(),
-        "allowed_checks":if request.investigation { vec!["inspect_children","refresh_processes","check_open_handles","compare_history","fs_usage","volume_context","research_sources"] } else { vec![] },
-    });
-    let mut child = Command::new(helper)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    let mut stdin = child.stdin.take().ok_or("Missing helper input")?;
-    if let Err(e) = writeln!(stdin, "{payload}") {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(e.to_string());
-    }
-    drop(stdin);
-    let stdout = child.stdout.take().ok_or("Missing helper output")?;
-    let reader = thread::spawn(move || {
-        let mut output = String::new();
-        stdout
-            .take(32_769)
-            .read_to_string(&mut output)
-            .map(|_| output)
-    });
-    let started = Instant::now();
-    loop {
-        if cancelled.load(Ordering::Relaxed) || started.elapsed() > Duration::from_secs(20) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = reader.join();
-            return Err("Local insight stopped. Measured findings remain available.".into());
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let output = reader
-                    .join()
-                    .map_err(|_| "AI reader stopped")?
-                    .map_err(|e| e.to_string())?;
-                if !status.success() || output.len() > 32_768 {
-                    return Err("Apple AI helper failed.".into());
-                }
-                let response: Response =
-                    serde_json::from_str(output.trim()).map_err(|_| "Invalid Apple AI response")?;
-                if response.protocol != PROTOCOL_VERSION
-                    || response.request_id.as_deref() != Some(request_id.as_str())
-                {
-                    return Err("Apple AI helper version mismatch.".into());
-                }
-                if !response.available {
-                    return Err(response.error.unwrap_or_else(|| {
-                        "Enable Apple Intelligence and allow its model to download.".into()
-                    }));
-                }
-                if let Some(error) = response.error {
-                    return Err(display_text(&error));
-                }
-                let mut insight = response.insight.ok_or("No insight returned")?;
-                validate(request, &insight)?;
-                insight.summary = display_text(&insight.summary);
-                return Ok(insight);
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(25)),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                return Err(error.to_string());
-            }
-        }
-    }
+    let response = request_once(
+        &payload,
+        &request_id,
+        Duration::from_secs(20),
+        cancelled,
+        "Local result summary stopped. Measurements remain available.",
+    )?;
+    let insight = response.insight.ok_or("No result summary returned")?;
+    validate(request, &insight)?;
+    Ok(Insight {
+        summary: display_text(&insight.summary),
+        evidence_ids: insight.evidence_ids,
+        action_ids: vec![],
+        next_checks: vec![],
+    })
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Write an executable shell script that stands in for the Swift helper.
+    pub(crate) fn fake_helper(dir: &std::path::Path, body: &str) -> PathBuf {
+        let path = dir.join("fake-helper");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn one_subject_request() -> Request {
+        Request {
+            revision: 7,
+            subjects: vec![Subject {
+                id: "item1".into(),
+                title: "cache".into(),
+                observation: "measured".into(),
+                consequence: "rebuild".into(),
+                action_ids: vec![],
+                quick_win: true,
+                priority: 1,
+                disruption: "routine".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn helper_transport_returns_a_correlated_response() {
+        let dir = tempfile::tempdir().unwrap();
+        set_test_helper(Some(fake_helper(
+            dir.path(),
+            r#"read line
+echo '{"protocol":3,"request_id":"triage:7","available":true,"triage":{"key_area_ids":[],"quick_win_ids":["item1"],"reasons":[]}}'"#,
+        )));
+        let triage = triage(&one_subject_request(), &Arc::new(AtomicBool::new(false)));
+        set_test_helper(None);
+        assert_eq!(triage.unwrap().quick_win_ids, vec!["item1"]);
+    }
+
+    #[test]
+    fn helper_transport_rejects_mismatch_timeout_oversize_and_maps_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        set_test_helper(Some(fake_helper(
+            dir.path(),
+            r#"read line
+echo '{"protocol":3,"request_id":"triage:8","available":true}'"#,
+        )));
+        assert!(
+            triage(&one_subject_request(), &cancelled)
+                .unwrap_err()
+                .contains("mismatch")
+        );
+        set_test_helper(Some(fake_helper(
+            dir.path(),
+            r#"read line
+head -c 40000 /dev/zero | tr '\0' a
+echo"#,
+        )));
+        assert!(
+            triage(&one_subject_request(), &cancelled)
+                .unwrap_err()
+                .contains("too large")
+        );
+        set_test_helper(Some(fake_helper(
+            dir.path(),
+            r#"read line
+echo '{"protocol":3,"request_id":"triage:7","available":false,"error_code":"model_not_ready","error":"unavailable(FoundationModels.SystemLanguageModel.Availability.UnavailableReason.modelNotReady)"}'"#,
+        )));
+        let error = triage(&one_subject_request(), &cancelled).unwrap_err();
+        assert!(error.contains("preparing its model"), "{error}");
+        assert!(!error.contains("FoundationModels"));
+        set_test_helper(Some(fake_helper(dir.path(), "read line\nexec sleep 30")));
+        cancelled.store(true, Ordering::Relaxed);
+        let started = Instant::now();
+        assert!(
+            triage(&one_subject_request(), &cancelled)
+                .unwrap_err()
+                .contains("stopped")
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cancellation must kill the helper promptly"
+        );
+        set_test_helper(None);
+    }
+
+    #[test]
+    fn helper_process_streams_lines_both_ways_and_drop_kills_the_child() {
+        let dir = tempfile::tempdir().unwrap();
+        set_test_helper(Some(fake_helper(
+            dir.path(),
+            r#"while read line; do echo "{\"echo\":$line}"; done"#,
+        )));
+        let helper = HelperProcess::spawn().unwrap();
+        set_test_helper(None);
+        helper.send(&serde_json::json!({"n": 1})).unwrap();
+        helper.send(&serde_json::json!({"n": 2})).unwrap();
+        let mut seen = Vec::new();
+        let started = Instant::now();
+        while seen.len() < 2 && started.elapsed() < Duration::from_secs(5) {
+            if let Some(line) = helper.recv_timeout(Duration::from_millis(50)) {
+                seen.push(line.unwrap()["echo"]["n"].as_u64().unwrap());
+            }
+        }
+        assert_eq!(seen, vec![1, 2]);
+        assert!(helper.try_recv().is_none());
+        drop(helper);
+    }
+
+    #[test]
+    fn friendly_errors_hide_framework_internals() {
+        for code in [
+            "not_eligible",
+            "not_enabled",
+            "model_not_ready",
+            "context",
+            "guardrail",
+            "rate_limited",
+        ] {
+            let text = friendly_error(Some(code), "FoundationModels.Internal");
+            assert!(!text.contains("FoundationModels"), "{code}");
+        }
+        assert_eq!(friendly_error(None, "plain\u{1b}text"), "plaintext");
+    }
     #[test]
     fn rejects_invented_actions_and_investigations() {
         let request = Request {
             revision: 1,
-            checks: Default::default(),
-            investigation: false,
             subjects: vec![Subject {
                 id: "a".into(),
                 title: "cache".into(),
@@ -835,21 +711,16 @@ mod tests {
         insight.evidence_ids = vec!["a".into()];
         insight.next_checks = vec!["shell".into()];
         assert!(validate(&request, &insight).is_err());
-        let investigation_request = Request {
-            investigation: true,
-            ..request
-        };
         insight.next_checks = vec!["fs_usage".into()];
-        assert!(validate(&investigation_request, &insight).is_ok());
-        insight.next_checks = vec!["volume_context".into(), "research_sources".into()];
-        assert!(validate(&investigation_request, &insight).is_ok());
+        assert!(
+            validate(&request, &insight).is_err(),
+            "one-shot summaries never request checks"
+        );
     }
     #[test]
     fn triage_cannot_change_policy_or_refer_to_unknown_subjects() {
         let request = Request {
             revision: 1,
-            checks: Default::default(),
-            investigation: false,
             subjects: vec![
                 Subject {
                     id: "quick".into(),

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 use crate::storage::{StorageCategory, StorageItemKind, StorageRoot, VolumeStats};
 
@@ -17,6 +18,7 @@ fn storage_review_shows_volume_usage_and_largest_consumer() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
     let mut app = App::new(&cli, temp.path()).unwrap();
     app.inventory = Some(StorageInventory {
@@ -170,6 +172,7 @@ fn relocation_ui_selects_an_inventory_directory_and_opens_destination_input() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
     let mut app = App::new(&cli, temp.path()).unwrap();
     app.inventory = Some(StorageInventory {
@@ -224,7 +227,7 @@ fn relocation_ui_selects_an_inventory_directory_and_opens_destination_input() {
         canonical_source
     );
 
-    app.relocation_destination = "/Volumes/EXT_DISK/MacCleanup".into();
+    app.relocation_destination = "/Volumes/EXT_DISK/Diskray".into();
     terminal.draw(|frame| render(frame, &app)).unwrap();
     let rendered =
         terminal
@@ -237,7 +240,7 @@ fn relocation_ui_selects_an_inventory_directory_and_opens_destination_input() {
                 text
             });
     assert!(rendered.contains("EXTERNAL DESTINATION"));
-    assert!(rendered.contains("/Volumes/EXT_DISK/MacCleanup"));
+    assert!(rendered.contains("/Volumes/EXT_DISK/Diskray"));
 }
 
 #[test]
@@ -256,6 +259,7 @@ fn selection_only_includes_ready_nonempty_entries() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
     let mut app = App::new(&cli, temp.path()).unwrap();
     app.entries = vec![CacheEntry {
@@ -291,6 +295,7 @@ fn location_picker_defaults_to_the_local_startup_volume() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
 
     let app = App::new(&cli, temp.path()).unwrap();
@@ -317,6 +322,7 @@ fn default_tui_starts_storage_audit_and_keeps_process_scan_explicit() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
     let mut app = App::new(&cli, temp.path()).unwrap();
     assert_eq!(app.phase, Phase::Scanning);
@@ -369,6 +375,7 @@ fn navigate_menu_is_the_single_cross_section_navigation_model() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
     let mut app = App::new(&cli, temp.path()).unwrap();
     app.phase = Phase::Location;
@@ -409,6 +416,7 @@ fn mouse_operates_menus_and_home_task_choices() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
     let mut app = App::new(&cli, temp.path()).unwrap();
     app.phase = Phase::Location;
@@ -451,6 +459,7 @@ fn storage_navigation_marks_the_focused_window() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
     let mut app = App::new(&cli, temp.path()).unwrap();
     app.phase = Phase::Location;
@@ -491,6 +500,7 @@ fn storage_audit_prioritizes_disk_usage_and_adapts_to_terminal_width() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
     let mut app = App::new(&cli, temp.path()).unwrap();
     app.inventory = Some(StorageInventory {
@@ -565,6 +575,7 @@ fn process_review_is_reachable_and_rendered_from_storage_review() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
     let mut app = App::new(&cli, temp.path()).unwrap();
     app.phase = Phase::Review;
@@ -609,6 +620,7 @@ fn completed_scan_hides_missing_candidates() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
     let mut app = App::new(&cli, temp.path()).unwrap();
     app.choose_location();
@@ -641,6 +653,7 @@ fn completed_summary_closes_after_the_grace_period() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
     let mut app = App::new(&cli, temp.path()).unwrap();
     app.phase = Phase::Summary;
@@ -672,6 +685,7 @@ fn completed_summary_can_be_closed_immediately() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
     let mut app = App::new(&cli, temp.path()).unwrap();
     app.phase = Phase::Summary;
@@ -794,6 +808,7 @@ fn escape_cancels_scan_and_returns_to_location_picker() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
     let mut app = App::new(&cli, temp.path()).unwrap();
     app.entries.push(CacheEntry {
@@ -828,6 +843,7 @@ fn enter_opens_and_closes_details_without_quitting_analyze_mode() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
     let mut app = App::new(&cli, temp.path()).unwrap();
     app.entries = vec![CacheEntry {
@@ -867,6 +883,7 @@ fn enter_still_opens_confirmation_when_cleanup_items_are_selected() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
     let mut app = App::new(&cli, temp.path()).unwrap();
     app.entries = vec![CacheEntry {
@@ -902,6 +919,7 @@ fn default_tui_can_prepare_all_safe_items_without_a_restart() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
     let mut app = App::new(&cli, temp.path()).unwrap();
     app.entries = vec![
@@ -952,6 +970,7 @@ fn default_tui_can_prepare_the_highlighted_safe_item_from_review() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
     let mut app = App::new(&cli, temp.path()).unwrap();
     app.entries = vec![
@@ -998,6 +1017,7 @@ fn direct_deletion_can_opt_in_one_optional_item() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
     let mut app = App::new(&cli, temp.path()).unwrap();
     app.entries = vec![CacheEntry {
@@ -1048,6 +1068,7 @@ fn direct_deletion_ignores_items_blocked_by_safety_checks() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
     let mut app = App::new(&cli, temp.path()).unwrap();
     app.entries = vec![CacheEntry {
@@ -1082,6 +1103,7 @@ fn stop_request_keeps_the_ui_open_until_the_active_worker_finishes() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
     let mut app = App::new(&cli, temp.path()).unwrap();
     let (_sender, receiver) = mpsc::channel();
@@ -1115,6 +1137,7 @@ fn explicit_analyze_mode_keeps_safe_cleanup_locked() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
     let mut app = App::new(&cli, temp.path()).unwrap();
     app.entries = vec![CacheEntry {
@@ -1150,6 +1173,7 @@ fn default_tui_shows_and_accepts_review_deletion_shortcut() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
     let mut app = App::new(&cli, temp.path()).unwrap();
     let review_spec = app
@@ -1207,6 +1231,7 @@ fn review_details_explain_the_orbstack_deletion_decision() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
     let mut app = App::new(&cli, temp.path()).unwrap();
     let review_spec = app
@@ -1262,6 +1287,7 @@ fn review_deletion_requires_clean_mode_and_typed_confirmation() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
     let mut app = App::new(&cli, temp.path()).unwrap();
     let review_spec = app
@@ -1310,6 +1336,7 @@ fn review_confirmation_prompt_is_visible_in_a_standard_terminal() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
     let mut app = App::new(&cli, temp.path()).unwrap();
     let review_spec = app
@@ -1365,6 +1392,7 @@ fn review_deletion_is_unavailable_in_analyze_mode() {
         json: false,
         no_color: true,
         no_tui: false,
+        command: None,
     };
     let mut app = App::new(&cli, temp.path()).unwrap();
     let review_spec = app
@@ -1391,7 +1419,7 @@ fn review_deletion_is_unavailable_in_analyze_mode() {
 
 fn design_fixture() -> App {
     use clap::Parser;
-    let cli = Cli::parse_from(["mac-cleanup"]);
+    let cli = Cli::parse_from(["diskray"]);
     let mut app = App::new(&cli, Path::new("/Users/demo")).unwrap();
     app.no_color = false;
     app.sidebar_focus = false;
@@ -1822,7 +1850,7 @@ fn storage_tabs_mouse_and_coverage_work_at_supported_sizes() {
             app.switch_storage_tab(tab);
             let buffer = draw_fixture(&mut app, width, height);
             let text = buffer_text(&buffer);
-            assert!(text.contains("MAC CLEANUP"));
+            assert!(text.contains("DISKRAY"));
             assert!(text.contains("e Explore"));
             assert!(text.contains("h Heatmap") || text.contains("h Storage heatmap"));
             assert!(text.contains("f Cleanup"));
