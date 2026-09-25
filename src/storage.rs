@@ -200,6 +200,19 @@ pub struct ScanProgress {
 }
 
 impl StorageInventory {
+    /// Use the device recorded during the walk, never a fresh filesystem probe.
+    /// A nested scan root takes precedence over its containing root.
+    pub fn on_accounted_volume(&self, path: &Path) -> bool {
+        let Some(volume) = &self.volume else {
+            return true;
+        };
+        self.roots
+            .iter()
+            .filter(|root| path.starts_with(&root.path))
+            .max_by_key(|root| root.path.components().count())
+            .is_some_and(|root| root.device == volume.device)
+    }
+
     /// Run a complete inventory without a cancellation request.
     pub fn scan(scan_root: &Path, account_home: &Path) -> Self {
         let never_cancel = AtomicBool::new(false);
@@ -577,6 +590,11 @@ const CONTAINER_NAMES: [&str; 16] = [
 
 /// macOS-managed locations, reported together as one row.
 fn is_macos_system(path: &Path) -> bool {
+    let data_alias = path
+        .strip_prefix("/System/Volumes/Data")
+        .ok()
+        .map(|suffix| Path::new("/").join(suffix));
+    let path = data_alias.as_deref().unwrap_or(path);
     [
         "/System",
         "/usr",
@@ -599,6 +617,8 @@ fn is_macos_system(path: &Path) -> bool {
 pub struct Breakdown {
     pub items: Vec<StorageItem>,
     pub macos_kb: u64,
+    /// Real paths behind the aggregate, for inspection and its contents map.
+    pub macos_items: Vec<StorageItem>,
 }
 
 pub fn breakdown(inventory: &StorageInventory, targets: &[PathBuf], min_kb: u64) -> Breakdown {
@@ -606,11 +626,13 @@ pub fn breakdown(inventory: &StorageInventory, targets: &[PathBuf], min_kb: u64)
     let mut pending: Vec<(StorageItem, usize)> = inventory
         .top_level
         .iter()
+        .filter(|item| inventory.on_accounted_volume(&item.path))
         .map(|item| (item.clone(), 0))
         .collect();
     while let Some((item, depth)) = pending.pop() {
         if is_macos_system(&item.path) {
             result.macos_kb += item.size_kb;
+            result.macos_items.push(item);
             continue;
         }
         if item.size_kb < min_kb {
@@ -621,8 +643,10 @@ pub fn breakdown(inventory: &StorageInventory, targets: &[PathBuf], min_kb: u64)
             .get(&item.path)
             .filter(|children| !children.is_empty());
         let is_target = targets.iter().any(|target| target == &item.path);
+        let holds_target = targets
+            .iter()
+            .any(|target| target != &item.path && target.starts_with(&item.path));
         let open = !is_target
-            && depth < 10
             && item.kind == StorageItemKind::Directory
             && children.is_some_and(|children| {
                 let generic = item
@@ -636,10 +660,7 @@ pub fn breakdown(inventory: &StorageInventory, targets: &[PathBuf], min_kb: u64)
                     .map(|child| child.size_kb)
                     .max()
                     .is_some_and(|largest| largest * 10 >= item.size_kb * 6);
-                let holds_target = targets
-                    .iter()
-                    .any(|target| target != &item.path && target.starts_with(&item.path));
-                generic || dominant || holds_target
+                (depth < 10 && (generic || dominant)) || holds_target
             });
         match children.filter(|_| open) {
             Some(children) => {
@@ -1120,6 +1141,74 @@ mod tests {
         assert_eq!(result.macos_kb, 20 * gib);
     }
     use std::io::Write;
+
+    #[test]
+    fn breakdown_excludes_other_devices_and_keeps_nested_cleanup_targets_disjoint() {
+        assert!(!is_macos_system(Path::new("/System/Volumes/Data/Users/me")));
+        assert!(is_macos_system(Path::new(
+            "/System/Volumes/Data/System/Library"
+        )));
+        let gib = 1_048_576;
+        let root = Path::new("/");
+        let mut inventory = StorageInventory::unavailable(root, "synthetic");
+        inventory.volume = Some(VolumeStats {
+            accounting_path: root.into(),
+            filesystem: "test".into(),
+            capacity_kb: 100 * gib,
+            used_kb: 80 * gib,
+            free_kb: 20 * gib,
+            container_free_kb: None,
+            device: 1,
+        });
+        inventory.roots = vec![
+            StorageRoot {
+                path: root.into(),
+                size_kb: 80 * gib,
+                device: 1,
+                scan_errors: 0,
+            },
+            StorageRoot {
+                path: "/System/Volumes/VM".into(),
+                size_kb: 8 * gib,
+                device: 2,
+                scan_errors: 0,
+            },
+        ];
+        inventory.top_level = vec![
+            StorageItem::new(
+                Path::new("/System/Library"),
+                10 * gib,
+                StorageItemKind::Directory,
+            ),
+            StorageItem::new(
+                Path::new("/System/Volumes/VM/swapfile0"),
+                8 * gib,
+                StorageItemKind::File,
+            ),
+            StorageItem::new(Path::new("/cache"), 4 * gib, StorageItemKind::Directory),
+        ];
+        inventory.children.insert(
+            "/cache".into(),
+            vec![StorageItem::new(
+                Path::new("/cache/nested"),
+                3 * gib,
+                StorageItemKind::Directory,
+            )],
+        );
+        let result = breakdown(&inventory, &["/cache".into(), "/cache/nested".into()], 1);
+        assert_eq!(
+            result.macos_kb,
+            10 * gib,
+            "VM is already in the other-volume balance"
+        );
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].path, Path::new("/cache"));
+        assert_eq!(
+            result.items[0].size_kb,
+            4 * gib,
+            "a nested cleanup target must not be added twice"
+        );
+    }
 
     #[test]
     fn folder_age_buckets_allocated_space_by_modification_time() {

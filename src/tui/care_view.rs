@@ -14,12 +14,23 @@ pub(super) use presentation::render;
 
 /// A process report is retired once live readings are this much newer.
 const REPORT_LIFETIME_SECS: u64 = 120;
+const AI_AVAILABILITY_RETRY: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Overview,
     Explore,
     History,
+}
+/// Browser back history is separate from the filesystem parent. A missing path
+/// is the browser's root list, never a sentinel for the storage findings screen.
+enum BrowserVisit {
+    Finding(Option<String>),
+    Folder {
+        path: Option<PathBuf>,
+        selected: Option<PathBuf>,
+        cursor: usize,
+    },
 }
 fn supports_subject(finding: &Finding, subject: &ai::Subject) -> bool {
     finding.id == subject.id
@@ -59,6 +70,7 @@ enum Action {
     ReviewClean(CacheEntry),
     Signal(ProcessEntry, ProcessSignal),
     Move(RelocationPlan),
+    Trash(crate::file_actions::TrashPlan),
 }
 impl Action {
     fn id(&self) -> String {
@@ -67,12 +79,14 @@ impl Action {
             Self::ReviewClean(e) => format!("review:{}", e.spec.path.display()),
             Self::Signal(p, s) => format!("signal:{}:{}:{}", p.pid, p.start_time, s.label()),
             Self::Move(p) => format!("move:{}", p.source.display()),
+            Self::Trash(p) => format!("trash:{}", p.path.display()),
         }
     }
     fn path(&self) -> Option<&Path> {
         match self {
             Self::Clean(e) | Self::ReviewClean(e) => Some(&e.spec.path),
             Self::Move(p) => Some(&p.source),
+            Self::Trash(p) => Some(&p.path),
             Self::Signal(..) => None,
         }
     }
@@ -104,6 +118,11 @@ impl Action {
                 "Move {}\nto {}\nOriginal becomes a symlink. Keep the destination mounted.",
                 p.source.display().to_string().escape_debug(),
                 p.destination.display().to_string().escape_debug()
+            ),
+            Self::Trash(p) => format!(
+                "Move to Trash · {} observed\nFrees no space until Trash is emptied.\n{}\nThe entire selected item, including its contents, leaves its current location. Apps using it may stop working.\nRestore by dragging it out of Trash in Finder; Put Back may be unavailable.",
+                format_kb(p.size_kb),
+                p.path.display().to_string().escape_debug()
             ),
         }
     }
@@ -177,8 +196,14 @@ struct ReportView {
     by_model: bool,
 }
 struct MeasureWork {
-    receiver: Receiver<StorageInventory>,
+    receiver: Receiver<MeasureMessage>,
     stop: Arc<AtomicBool>,
+    path: PathBuf,
+    progress: crate::storage::ScanProgress,
+}
+enum MeasureMessage {
+    Progress(crate::storage::ScanProgress),
+    Finished(Box<StorageInventory>),
 }
 impl Drop for MeasureWork {
     fn drop(&mut self) {
@@ -247,14 +272,22 @@ fn resolve_triage_ids(
 pub(super) struct Workspace {
     assessment: Option<care::Assessment>,
     findings: Vec<Finding>,
+    /// Non-overlapping areas from one inventory, on its accounted device only.
+    /// Cleanup estimates remain available to plans but never inflate this list.
+    accounted_rows: Option<HashMap<String, u64>>,
+    macos_items: Vec<StorageItem>,
     screen: Screen,
     cursor: usize,
-    nav: usize,
-    focus: usize,
+    /// Keyboard focus is in the right panel; the left list stays visible.
     detail: bool,
     help: bool,
     coverage: bool,
     detail_scroll: u16,
+    detail_max_scroll: std::cell::Cell<u16>,
+    review_max_scroll: std::cell::Cell<u16>,
+    browser_history: Vec<BrowserVisit>,
+    /// Selection to restore once a missing directory index arrives.
+    browser_pending_selection: Option<PathBuf>,
     show_all: bool,
     kept: HashSet<String>,
     /// The finding kept visible after re-ranking because it is selected.
@@ -283,6 +316,8 @@ pub(super) struct Workspace {
     ai_error: Option<String>,
     ai_framework: ai::FrameworkStatus,
     ai_framework_work: Option<Receiver<ai::FrameworkStatus>>,
+    ai_framework_retry_at: Option<Instant>,
+    ai_status_open: bool,
     auto_requested: bool,
     /// The one automatic investigation per assessment has started.
     auto_agent_started: bool,
@@ -293,11 +328,14 @@ pub(super) struct Workspace {
     /// The finding the current investigation explains, as measured when it started.
     agent_subject: Option<ai::Subject>,
     report: Option<ReportView>,
-    /// Text typed into the Ask box while it is open.
+    /// The question being edited while the persistent Ask box has focus.
     asking: Option<String>,
+    /// An unsent question retained when focus returns to browsing.
+    ask_draft: String,
     /// The Ask answer page is open.
     answer_open: bool,
     measure: Option<MeasureWork>,
+    measured_folders: HashMap<PathBuf, bool>,
     online_research: bool,
     note: Option<String>,
     plan: Vec<Action>,
@@ -331,23 +369,21 @@ pub(super) struct Workspace {
 }
 /// How many rows the Overview lists before `f` shows everything.
 const OVERVIEW_ROWS: usize = 15;
-/// Terminals at least this wide show details beside the list.
-const SPLIT_WIDTH: u16 = 110;
-
 /// Every command in the `:` palette: key, what it does, and the key it sends.
-const PALETTE: [(&str, &str, KeyCode); 22] = [
+const PALETTE: [(&str, &str, KeyCode); 24] = [
     (
-        "1",
-        "Go to Overview: where the space went",
-        KeyCode::Char('1'),
+        "F3",
+        "Show detected Apple model and AI blockers",
+        KeyCode::F(3),
     ),
+    ("g", "Show storage findings", KeyCode::Char('g')),
+    ("b", "Browse folders by size", KeyCode::Char('b')),
+    ("h", "Open saved scan history", KeyCode::Char('h')),
     (
-        "2",
-        "Go to Explore: browse folders by size",
-        KeyCode::Char('2'),
+        "Enter",
+        "Open selected folder or show details",
+        KeyCode::Enter,
     ),
-    ("3", "Go to History", KeyCode::Char('3')),
-    ("Enter", "Explain the selected item", KeyCode::Enter),
     (
         "Space",
         "Add or remove the selected item from your plan",
@@ -355,6 +391,11 @@ const PALETTE: [(&str, &str, KeyCode); 22] = [
     ),
     ("a", "Add all quick wins to your plan", KeyCode::Char('a')),
     ("p", "Review your plan", KeyCode::Char('p')),
+    (
+        "t",
+        "Queue selected personal item for Trash review",
+        KeyCode::Char('t'),
+    ),
     ("i", "Investigate the selected item", KeyCode::Char('i')),
     ("/", "Ask a question about this Mac", KeyCode::Char('/')),
     ("e", "Browse the selected item's folder", KeyCode::Char('e')),
@@ -423,9 +464,11 @@ fn follow_ups(question: &str) -> Vec<&'static str> {
 
 #[derive(Clone, Copy)]
 enum Control {
-    Nav(usize),
     Row(usize),
+    PaletteRow(usize),
     Key(KeyCode),
+    Pane(bool),
+    Ask,
 }
 
 impl Workspace {
@@ -433,11 +476,7 @@ impl Workspace {
         let mut result = Self::empty();
         result.history = care::sessions(&app.account_home);
         result.online_research = care::online_research_enabled(&app.account_home);
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let _ = sender.send(ai::framework_status());
-        });
-        result.ai_framework_work = Some(receiver);
+        result.refresh_ai_availability();
         result.assessment = Some(care::assess(
             app.scan_root.clone(),
             app.account_home.clone(),
@@ -450,14 +489,18 @@ impl Workspace {
         Self {
             assessment: None,
             findings: vec![],
+            accounted_rows: None,
+            macos_items: Vec::new(),
             screen: Screen::Overview,
             cursor: 0,
-            nav: 0,
-            focus: 1,
             detail: false,
             help: false,
             coverage: false,
             detail_scroll: 0,
+            detail_max_scroll: std::cell::Cell::new(u16::MAX),
+            review_max_scroll: std::cell::Cell::new(u16::MAX),
+            browser_history: Vec::new(),
+            browser_pending_selection: None,
             show_all: false,
             kept: HashSet::new(),
             pinned: None,
@@ -483,6 +526,8 @@ impl Workspace {
             ai_error: None,
             ai_framework: ai::FrameworkStatus::Detecting,
             ai_framework_work: None,
+            ai_framework_retry_at: None,
+            ai_status_open: false,
             auto_requested: false,
             auto_agent_started: false,
             auto_agent_resume: false,
@@ -491,8 +536,10 @@ impl Workspace {
             agent_subject: None,
             report: None,
             asking: None,
+            ask_draft: String::new(),
             answer_open: false,
             measure: None,
+            measured_folders: HashMap::new(),
             online_research: false,
             note: None,
             plan: vec![],
@@ -537,6 +584,12 @@ impl Workspace {
             .iter()
             .filter(|f| !self.kept.contains(&f.id))
             .filter(|f| {
+                self.accounted_rows.as_ref().is_none_or(|rows| {
+                    !matches!(f.target, Target::Cache(_) | Target::Folder(_))
+                        || rows.contains_key(&f.id)
+                })
+            })
+            .filter(|f| {
                 // The selected finding always stays listed, so re-ranking can
                 // never silently move the cursor onto a different finding.
                 self.show_all
@@ -570,6 +623,15 @@ impl Workspace {
     }
     fn selected(&self) -> Option<&Finding> {
         self.visible().get(self.cursor).copied()
+    }
+    fn listed_storage(&self) -> (usize, u64) {
+        let Some(rows) = &self.accounted_rows else {
+            return (0, 0);
+        };
+        self.visible()
+            .iter()
+            .filter_map(|f| rows.get(&f.id))
+            .fold((0, 0), |(count, total), size| (count + 1, total + size))
     }
     /// "What grew" findings for the three largest increases. Growth alone
     /// never makes data removable; these lead to an investigation.
@@ -654,6 +716,56 @@ impl Workspace {
             &self.metrics,
             app.inventory.as_ref(),
         );
+        // Keep accounting sizes from the completed inventory even when a
+        // later folder drill-down refreshes the explorer's child index.
+        if self.accounted_rows.is_none() {
+            self.accounted_rows =
+                app.inventory
+                    .as_ref()
+                    .filter(|i| i.volume.is_some())
+                    .map(|inventory| {
+                        let targets = app
+                            .entries
+                            .iter()
+                            .map(|e| e.spec.path.clone())
+                            .collect::<Vec<_>>();
+                        let min_kb =
+                            care::BREAKDOWN_MIN_KB.min((inventory.scanned_kb / 100).max(1));
+                        let breakdown = crate::storage::breakdown(inventory, &targets, min_kb);
+                        self.macos_items = breakdown.macos_items.clone();
+                        let mut rows: HashMap<String, u64> = breakdown
+                            .items
+                            .iter()
+                            .map(|item| (format!("path:{}", item.path.display()), item.size_kb))
+                            .collect();
+                        if breakdown.macos_kb >= min_kb {
+                            rows.insert(care::MACOS_FINDING_ID.into(), breakdown.macos_kb);
+                        }
+                        rows
+                    });
+        }
+        if let Some(rows) = &self.accounted_rows {
+            for previous in &self.findings {
+                if matches!(previous.target, Target::Folder(_))
+                    && rows.contains_key(&previous.id)
+                    && !incoming.iter().any(|finding| finding.id == previous.id)
+                {
+                    incoming.push(previous.clone());
+                }
+            }
+            for finding in &mut incoming {
+                if let Some(size) = rows.get(&finding.id) {
+                    if finding.size_kb != *size {
+                        finding.observation = format!(
+                            "{} in the accounting scan. Separate check: {}",
+                            format_kb(*size),
+                            finding.observation,
+                        );
+                    }
+                    finding.size_kb = *size;
+                }
+            }
+        }
         if let Some(finding) = self.volume.as_ref().and_then(care::disk_finding) {
             incoming.insert(0, finding);
         }
@@ -743,14 +855,13 @@ impl Workspace {
         }
     }
     pub(super) fn tick(&mut self, app: &mut App) {
-        if let Some(status) = self
-            .ai_framework_work
-            .as_ref()
-            .and_then(|receiver| receiver.try_recv().ok())
-        {
-            self.ai_framework = status;
-            self.ai_framework_work = None;
-        }
+        let browser_path = app.explorer_path.clone();
+        let browser_selected = self.browser_pending_selection.clone().or_else(|| {
+            app.explorer_items()
+                .get(app.explorer_cursor)
+                .map(|i| i.path.clone())
+        });
+        self.poll_ai_availability();
         let mut events = Vec::new();
         if let Some(assessment) = &self.assessment {
             while let Ok(event) = assessment.receiver.try_recv() {
@@ -815,6 +926,10 @@ impl Workspace {
                     changed = true;
                 }
                 care::Event::Inventory(inventory) => {
+                    self.accounted_rows = None;
+                    if let Some(volume) = &inventory.volume {
+                        self.volume = Some(volume.clone());
+                    }
                     app.inventory = Some(inventory);
                     self.revision += 1;
                     changed = true;
@@ -941,28 +1056,19 @@ impl Workspace {
                 Err(error) => self.ai_error = Some(error),
             }
         }
-        if let Some(inventory) = self
-            .measure
-            .as_ref()
-            .and_then(|work| work.receiver.try_recv().ok())
-        {
-            self.measure = None;
-            let complete = inventory.complete;
-            if let Some(existing) = &mut app.inventory {
-                existing.children.extend(inventory.children);
-            } else {
-                app.inventory = Some(inventory);
-            }
-            self.note = Some(if complete {
-                "Selected folder measured. Explore shows its children."
-            } else {
-                "Selected folder scan is partial. Unreadable or cancelled entries are not empty."
-            }
-            .into());
-            self.revision += 1;
-            self.flash = Some(Instant::now());
-        }
+        self.pump_measure(app);
         self.pump_agent(app);
+        if self.screen == Screen::Explore
+            && app.explorer_path == browser_path
+            && let Some(path) = browser_selected
+            && let Some(index) = app.explorer_items().iter().position(|i| i.path == path)
+        {
+            app.explorer_cursor = index;
+        }
+        self.restore_browser_selection(app);
+        if self.awaiting_approval() {
+            self.blur_ask();
+        }
         let work_message = self
             .work
             .as_ref()
@@ -983,7 +1089,7 @@ impl Workspace {
                     self.session = session;
                     self.work = None;
                     self.plan.clear();
-                    self.navigate(3);
+                    self.navigate(Screen::History);
                     self.detail = true;
                     self.history = care::sessions(&app.account_home);
                     self.history.insert(0, self.session.clone());
@@ -1095,6 +1201,7 @@ impl Workspace {
             && self.agent.is_none()
             && self.work.is_none()
             && self.asking.is_none()
+            && !self.ai_status_open
             && !self.reviewing
             && !self.legacy;
         if !ready || (self.auto_agent_started && !self.auto_agent_resume) {
@@ -1328,6 +1435,72 @@ impl Workspace {
     fn model_ready(&self) -> bool {
         matches!(self.ai_framework, ai::FrameworkStatus::Available { .. })
     }
+    fn refresh_ai_availability(&mut self) {
+        if self.ai_framework_work.is_some() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(ai::framework_status());
+        });
+        self.ai_framework_work = Some(receiver);
+        self.ai_framework_retry_at = None;
+    }
+    fn poll_ai_availability(&mut self) {
+        let status =
+            self.ai_framework_work
+                .as_ref()
+                .and_then(|receiver| match receiver.try_recv() {
+                    Ok(status) => Some(status),
+                    Err(mpsc::TryRecvError::Empty) => None,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        Some(ai::FrameworkStatus::Unavailable {
+                            detail: "The availability check stopped. Diskray will try again."
+                                .into(),
+                            diagnostics: None,
+                        })
+                    }
+                });
+        if let Some(status) = status {
+            self.ai_framework = status;
+            self.ai_framework_work = None;
+            self.ai_framework_retry_at =
+                (!self.model_ready()).then(|| Instant::now() + AI_AVAILABILITY_RETRY);
+        }
+        if self
+            .ai_framework_retry_at
+            .is_some_and(|at| Instant::now() >= at)
+        {
+            self.refresh_ai_availability();
+        }
+    }
+    fn focus_ask(&mut self) {
+        self.ai_status_open = false;
+        if self.asking.is_none() {
+            self.asking = Some(std::mem::take(&mut self.ask_draft));
+        }
+        if !self.model_ready() {
+            self.refresh_ai_availability();
+        }
+    }
+    fn blur_ask(&mut self) {
+        if let Some(draft) = self.asking.take() {
+            self.ask_draft = draft;
+        }
+    }
+    fn show_ai_status(&mut self) {
+        self.blur_ask();
+        self.ai_status_open = true;
+        self.detail_scroll = 0;
+        self.refresh_ai_availability();
+    }
+    fn open_ai_settings() {
+        thread::spawn(|| {
+            let _ = Command::new("/usr/bin/open")
+                .args(["-b", "com.apple.systempreferences"])
+                .status();
+        });
+    }
     fn start_investigation(&mut self, app: &App, finding: &Finding, automatic: bool) {
         if automatic && self.metrics.pressure.is_some_and(|level| level >= 2) {
             self.ai_error =
@@ -1363,7 +1536,7 @@ impl Workspace {
         self.investigation_case = Some(case);
         self.report = None;
         self.answer_open = true;
-        self.detail = false;
+        self.detail = true;
         self.detail_scroll = 0;
         self.ai_error = None;
         self.persist(app);
@@ -1477,18 +1650,309 @@ impl Workspace {
             .into());
         }
     }
+    fn pump_measure(&mut self, app: &mut App) {
+        loop {
+            let Some(work) = self.measure.as_mut() else {
+                return;
+            };
+            match work.receiver.try_recv() {
+                Ok(MeasureMessage::Progress(progress)) => work.progress = progress,
+                Ok(MeasureMessage::Finished(inventory)) => {
+                    let inventory = *inventory;
+                    let path = work.path.clone();
+                    let selected = app
+                        .explorer_items()
+                        .get(app.explorer_cursor)
+                        .map(|i| i.path.clone());
+                    self.measure = None;
+                    let complete = inventory.complete;
+                    for folder in inventory.children.keys() {
+                        self.measured_folders.insert(folder.clone(), complete);
+                    }
+                    let size = inventory
+                        .roots
+                        .iter()
+                        .find(|root| root.path == path)
+                        .map(|r| r.size_kb);
+                    if let Some(existing) = &mut app.inventory {
+                        existing
+                            .children
+                            .retain(|folder, _| !folder.starts_with(&path));
+                        existing.children.extend(inventory.children);
+                        // Update browser sizes, keeping the original overview accounting snapshot.
+                        if let Some(size) = size
+                            && let Some(children) =
+                                path.parent().and_then(|p| existing.children.get_mut(p))
+                        {
+                            if let Some(item) = children.iter_mut().find(|item| item.path == path) {
+                                item.size_kb = size;
+                            }
+                            children.sort_by(|a, b| {
+                                b.size_kb.cmp(&a.size_kb).then_with(|| a.path.cmp(&b.path))
+                            });
+                        }
+                    } else {
+                        app.inventory = Some(inventory);
+                    }
+                    app.explorer_cursor = selected
+                        .and_then(|path| app.explorer_items().iter().position(|i| i.path == path))
+                        .unwrap_or_else(|| {
+                            app.explorer_cursor
+                                .min(app.explorer_items().len().saturating_sub(1))
+                        });
+                    self.restore_browser_selection(app);
+                    self.note = Some(if complete {
+                        "Folder measured. Enter opens a child; Space selects cleanup; t selects Trash."
+                    } else {
+                        "Folder measured with unreadable entries. Sizes are partial; unavailable entries are not empty."
+                    }.into());
+                    self.revision += 1;
+                    self.flash = Some(Instant::now());
+                    return;
+                }
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    self.measure = None;
+                    self.note = Some(
+                        "Folder measurement stopped. Press i to retry the current folder.".into(),
+                    );
+                    return;
+                }
+            }
+        }
+    }
     fn start_measure(&mut self, app: &App, path: PathBuf) {
+        self.measure = None; // cancel the previous walk before starting another
         let (sender, receiver) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let home = app.account_home.clone();
+        let root = path.clone();
         thread::spawn(move || {
-            let inventory = StorageInventory::scan_with_cancel(&path, &home, &flag);
+            let inventory =
+                StorageInventory::scan_with_progress(&root, &home, &flag, &mut |progress| {
+                    let _ = sender.send(MeasureMessage::Progress(progress));
+                });
             if !flag.load(Ordering::Relaxed) {
-                let _ = sender.send(inventory);
+                let _ = sender.send(MeasureMessage::Finished(Box::new(inventory)));
             }
         });
-        self.measure = Some(MeasureWork { receiver, stop });
+        self.measure = Some(MeasureWork {
+            receiver,
+            stop,
+            path,
+            progress: Default::default(),
+        });
+    }
+    fn ensure_folder_measured(&mut self, app: &App) {
+        if let Some(path) = &app.explorer_path
+            && !app
+                .inventory
+                .as_ref()
+                .is_some_and(|i| i.children.contains_key(path))
+            && !self
+                .measure
+                .as_ref()
+                .is_some_and(|work| path.starts_with(&work.path))
+        {
+            self.start_measure(app, path.clone());
+        }
+    }
+    fn remember_browser(&mut self, app: &App) {
+        let visit = if self.screen == Screen::Explore {
+            BrowserVisit::Folder {
+                path: app.explorer_path.clone(),
+                selected: app
+                    .explorer_items()
+                    .get(app.explorer_cursor)
+                    .map(|i| i.path.clone()),
+                cursor: app.explorer_cursor,
+            }
+        } else {
+            // Opening a finding or its heatmap starts a new route; an older
+            // browser session must not become its Back destination.
+            self.browser_history.clear();
+            BrowserVisit::Finding(self.selected().map(|f| f.id.clone()))
+        };
+        self.browser_history.push(visit);
+    }
+    fn select_browser_path(
+        &mut self,
+        app: &mut App,
+        path: Option<PathBuf>,
+        selected: Option<PathBuf>,
+        fallback: usize,
+    ) {
+        app.explorer_path = path;
+        app.explorer_cursor = selected
+            .as_ref()
+            .and_then(|path| app.explorer_items().iter().position(|i| &i.path == path))
+            .unwrap_or_else(|| fallback.min(app.explorer_items().len().saturating_sub(1)));
+        self.browser_pending_selection =
+            selected.filter(|path| !app.explorer_items().iter().any(|i| &i.path == path));
+        self.navigate(Screen::Explore);
+        self.ensure_folder_measured(app);
+    }
+    fn restore_browser_selection(&mut self, app: &mut App) {
+        if let Some(path) = &self.browser_pending_selection
+            && (app.explorer_path.is_none() || path.parent() == app.explorer_path.as_deref())
+            && let Some(index) = app.explorer_items().iter().position(|i| &i.path == path)
+        {
+            app.explorer_cursor = index;
+            self.browser_pending_selection = None;
+        }
+    }
+    fn open_browser_path(&mut self, app: &mut App, path: PathBuf, directory: bool) {
+        // Clicking the already selected file should only focus its details.
+        if self.screen == Screen::Explore
+            && !directory
+            && path.parent() == app.explorer_path.as_deref()
+        {
+            app.explorer_cursor = app
+                .explorer_items()
+                .iter()
+                .position(|i| i.path == path)
+                .unwrap_or(app.explorer_cursor);
+            self.browser_pending_selection = None;
+            self.detail = true;
+            self.detail_scroll = 0;
+            return;
+        }
+        self.remember_browser(app);
+        if directory {
+            self.select_browser_path(app, Some(path), None, 0);
+        } else {
+            self.select_browser_path(app, path.parent().map(Path::to_path_buf), Some(path), 0);
+            self.detail = true;
+        }
+        self.user_moved = true;
+    }
+    fn browser_back(&mut self, app: &mut App) {
+        match self.browser_history.pop() {
+            Some(BrowserVisit::Folder {
+                path,
+                selected,
+                cursor,
+            }) => self.select_browser_path(app, path, selected, cursor),
+            Some(BrowserVisit::Finding(id)) => {
+                self.navigate(Screen::Overview);
+                if let Some(id) = id {
+                    self.pinned = Some(id.clone());
+                    self.cursor = self.visible().iter().position(|f| f.id == id).unwrap_or(0);
+                }
+            }
+            None => self.navigate(Screen::Overview),
+        }
+    }
+    fn browser_parent(&mut self, app: &mut App) {
+        let Some(current) = app.explorer_path.clone() else {
+            self.navigate(Screen::Overview);
+            return;
+        };
+        let boundary = app
+            .scan_root
+            .canonicalize()
+            .unwrap_or_else(|_| app.scan_root.clone());
+        if let Some(parent) = current
+            .parent()
+            .filter(|parent| parent.starts_with(&boundary))
+        {
+            self.remember_browser(app);
+            self.select_browser_path(app, Some(parent.to_path_buf()), Some(current), 0);
+        } else {
+            self.navigate(Screen::Overview);
+        }
+    }
+    fn open_selected(&mut self, app: &mut App) {
+        if self.screen == Screen::Explore {
+            if let Some(item) = app.explorer_items().get(app.explorer_cursor).copied() {
+                self.open_browser_path(
+                    app,
+                    item.path.clone(),
+                    item.kind == StorageItemKind::Directory,
+                );
+            }
+        } else if self.screen == Screen::Overview
+            && self
+                .selected()
+                .is_some_and(|f| matches!(f.target, Target::Folder(_) | Target::Cache(_)))
+        {
+            self.inspect(app);
+        } else {
+            self.detail = true;
+            self.detail_scroll = 0;
+        }
+    }
+    fn move_list(&mut self, app: &mut App, code: KeyCode) {
+        let capacity = self
+            .hits
+            .borrow()
+            .iter()
+            .filter(|(_, c)| matches!(c, Control::Row(_)))
+            .count()
+            .max(1);
+        let (current, count) = match self.screen {
+            Screen::Overview => (self.cursor, self.visible().len()),
+            Screen::Explore => (app.explorer_cursor, app.explorer_items().len()),
+            Screen::History => (self.history_cursor, self.history.len()),
+        };
+        let last = count.saturating_sub(1);
+        let next = match code {
+            KeyCode::Home => 0,
+            KeyCode::End => last,
+            KeyCode::PageDown => current.saturating_add(capacity).min(last),
+            KeyCode::PageUp => current.saturating_sub(capacity),
+            KeyCode::Down | KeyCode::Char('j') => current.saturating_add(1).min(last),
+            _ => current.saturating_sub(1),
+        };
+        match self.screen {
+            Screen::Overview => self.cursor = next,
+            Screen::Explore => {
+                app.explorer_cursor = next;
+                self.browser_pending_selection = None;
+            }
+            Screen::History => self.history_cursor = next,
+        }
+        self.user_moved = true;
+        self.detail_scroll = 0;
+    }
+    fn add_browser_cleanup(&mut self, app: &App) {
+        if app.analysis_only {
+            self.note = Some("This session is locked read-only.".into());
+            return;
+        }
+        let Some(item) = app.explorer_items().get(app.explorer_cursor).copied() else {
+            return;
+        };
+        match action_for_finding(app, &Target::Cache(item.path.clone()), false) {
+            Ok(Some(action)) => self.add_action(action),
+            Ok(None) => self.note = Some("No cleanup rule for this exact item. Enter browses children; t queues a personal item for Trash; o reveals it in Finder.".into()),
+            Err(reason) => self.note = reason,
+        }
+    }
+    fn add_trash(&mut self, app: &App) {
+        if app.analysis_only {
+            self.note = Some("This session is locked read-only.".into());
+            return;
+        }
+        let selected = if self.screen == Screen::Explore {
+            app.explorer_items()
+                .get(app.explorer_cursor)
+                .map(|i| (i.path.clone(), i.size_kb))
+        } else if self.screen == Screen::Overview {
+            self.selected().and_then(|f| match &f.target {
+                Target::Folder(path) => Some((path.clone(), f.size_kb)),
+                _ => None,
+            })
+        } else {
+            None
+        };
+        if let Some((path, size)) = selected {
+            match crate::file_actions::TrashPlan::prepare(&path, &app.account_home, size) {
+                Ok(plan) => self.add_action(Action::Trash(plan)),
+                Err(reason) => self.note = Some(reason),
+            }
+        }
     }
     fn start_triage(&mut self) {
         if self.metrics.pressure == Some(4) {
@@ -1583,6 +2047,15 @@ impl Workspace {
             self.moves_ack = false;
             return;
         }
+        if !self.plan.is_empty()
+            && self
+                .plan
+                .iter()
+                .any(|a| matches!(a, Action::Trash(_)) != matches!(action, Action::Trash(_)))
+        {
+            self.note = Some("Review Trash moves in a separate plan from cleanup. This keeps a cleanup action from emptying newly trashed items.".into());
+            return;
+        }
         if (!self.plan.is_empty() && matches!(action, Action::ReviewClean(_)))
             || self
                 .plan
@@ -1629,7 +2102,9 @@ impl Workspace {
         if app.analysis_only || self.plan.is_empty() {
             return;
         }
-        let needed = if self
+        let needed = if self.plan.iter().any(|a| matches!(a, Action::Trash(_))) {
+            "TRASH"
+        } else if self
             .plan
             .iter()
             .any(|a| matches!(a, Action::ReviewClean(_)))
@@ -1790,19 +2265,19 @@ impl Workspace {
             _ => {}
         }
     }
-    fn navigate(&mut self, index: usize) {
-        self.nav = index.min(2);
-        self.screen = [Screen::Overview, Screen::Explore, Screen::History][self.nav];
+    fn navigate(&mut self, screen: Screen) {
+        self.screen = screen;
         self.detail_scroll = 0;
+        self.detail_max_scroll.set(u16::MAX);
         self.detail = false;
         self.coverage = false;
         self.help = false;
+        self.answer_open = false;
     }
-    /// Switch tabs from a key or click. Explore opens at the home folder
-    /// when the whole startup volume was scanned.
-    fn go_to(&mut self, app: &mut App, index: usize) {
-        self.navigate(index);
-        self.focus = 1;
+    /// Change the contents of the left panel. Browsing starts at the home
+    /// folder when the whole startup volume was scanned.
+    fn go_to(&mut self, app: &mut App, screen: Screen) {
+        self.navigate(screen);
         if self.screen == Screen::Explore
             && app.explorer_path.is_none()
             && app.scan_root == Path::new("/")
@@ -1813,6 +2288,9 @@ impl Workspace {
         {
             app.explorer_path = Some(app.account_home.clone());
             app.explorer_cursor = 0;
+        }
+        if screen == Screen::Explore {
+            self.ensure_folder_measured(app);
         }
     }
     /// Add every ready quick win to the plan.
@@ -1834,9 +2312,18 @@ impl Workspace {
             if let Ok(Some(action)) = action_for_finding(app, &target, false)
                 && !self.plan.iter().any(|queued| queued.id() == action.id())
             {
+                let before = self.plan.len();
                 self.add_action(action);
-                added += 1;
+                added += usize::from(self.plan.len() > before);
             }
+        }
+        if added == 0
+            && self
+                .plan
+                .iter()
+                .any(|a| matches!(a, Action::Trash(_) | Action::ReviewClean(_)))
+        {
+            return;
         }
         self.note = Some(if added == 0 {
             "All quick wins are already in your plan.".into()
@@ -1848,16 +2335,14 @@ impl Workspace {
         if let Some(finding) = self.selected().cloned() {
             match finding.target {
                 Target::Folder(path) | Target::Cache(path) => {
-                    app.explorer_path = Some(path.clone());
-                    app.explorer_cursor = 0;
-                    self.navigate(2);
-                    if !app
+                    let directory = app
                         .inventory
                         .as_ref()
-                        .is_some_and(|i| i.children.contains_key(&path))
-                    {
-                        self.start_measure(app, path);
-                    }
+                        .and_then(|i| path.parent().and_then(|p| i.children.get(p)))
+                        .and_then(|items| items.iter().find(|i| i.path == path))
+                        .map(|i| i.kind == StorageItemKind::Directory)
+                        .unwrap_or_else(|| !path.is_file());
+                    self.open_browser_path(app, path, directory);
                 }
                 Target::Process(pid, _) => {
                     app.process_cursor = app
@@ -1885,12 +2370,20 @@ impl Workspace {
         self.triage_work = None;
         self.result_work = None;
         self.measure = None;
+        self.measured_folders.clear();
+        self.browser_history.clear();
+        self.browser_pending_selection = None;
+        app.explorer_history.clear();
+        app.explorer_path = None;
+        app.explorer_cursor = 0;
         self.findings.clear();
         self.growth.clear();
         self.growth_since = None;
         app.entries.clear();
         app.inventory = None;
         self.volume = None;
+        self.accounted_rows = None;
+        self.macos_items.clear();
         self.metrics = Metrics::default();
         self.trend.clear();
         self.kept.clear();
@@ -1907,7 +2400,7 @@ impl Workspace {
         self.complete = false;
         self.auto_requested = false;
         self.stage = "Rechecking storage and activity".into();
-        self.navigate(0);
+        self.navigate(Screen::Overview);
         self.cursor = 0;
         self.user_moved = false;
         self.assessment = Some(care::assess(
@@ -1924,16 +2417,45 @@ impl Workspace {
         {
             return true;
         }
-        if key.kind != KeyEventKind::Press {
+        let list_motion = matches!(
+            key.code,
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::Char('j' | 'k')
+        );
+        if key.kind != KeyEventKind::Press && !(key.kind == KeyEventKind::Repeat && list_motion) {
             return true;
         }
+        if (app.terminal_width < MIN_WIDTH || app.terminal_height < MIN_HEIGHT)
+            && key.code == KeyCode::Char('q')
+        {
+            if let Some(work) = &self.work {
+                work.cancel.store(true, Ordering::Relaxed);
+            } else {
+                app.quit = true;
+            }
+            return true;
+        }
+        // Start from the last visible offset, not a value beyond the end of a
+        // shorter/resized explanation. One Up must move the text immediately.
+        self.detail_scroll = self.detail_scroll.min(self.detail_max_scroll.get());
+        self.review_scroll = self.review_scroll.min(self.review_max_scroll.get());
         // Any choice about the list keeps the selection from moving on its own.
         if matches!(
             key.code,
             KeyCode::Down
                 | KeyCode::Up
                 | KeyCode::Enter
-                | KeyCode::Char('j' | 'k' | ' ' | 'i' | 'x' | 'e' | 'K' | 'd')
+                | KeyCode::Right
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Char('j' | 'k' | ' ' | 'i' | 'x' | 'e' | 'K' | 'd' | 't')
         ) {
             self.user_moved = true;
         }
@@ -1971,6 +2493,24 @@ impl Workspace {
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
                         app.process_cursor = app.process_cursor.saturating_sub(1)
+                    }
+                    KeyCode::Home => app.process_cursor = 0,
+                    KeyCode::End => app.process_cursor = app.processes.len().saturating_sub(1),
+                    KeyCode::PageUp | KeyCode::PageDown => {
+                        let page = app
+                            .hit_regions
+                            .borrow()
+                            .iter()
+                            .filter(|(_, hit)| matches!(hit, HitTarget::Process(_)))
+                            .count()
+                            .max(1);
+                        app.process_cursor = if key.code == KeyCode::PageUp {
+                            app.process_cursor.saturating_sub(page)
+                        } else {
+                            app.process_cursor
+                                .saturating_add(page)
+                                .min(app.processes.len().saturating_sub(1))
+                        };
                     }
                     KeyCode::Char(' ') | KeyCode::Char('d') | KeyCode::Char('x')
                         if !app.analysis_only =>
@@ -2024,6 +2564,8 @@ impl Workspace {
                 }
                 KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(5),
                 KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(5),
+                KeyCode::Home => self.detail_scroll = 0,
+                KeyCode::End => self.detail_scroll = self.detail_max_scroll.get(),
                 _ => {}
             }
             return true;
@@ -2032,16 +2574,48 @@ impl Workspace {
             self.palette_key(app, key);
             return true;
         }
+        if self.ai_status_open {
+            match key.code {
+                KeyCode::Esc | KeyCode::F(3) => {
+                    self.ai_status_open = false;
+                    self.detail_scroll = 0;
+                }
+                KeyCode::Char('r') | KeyCode::Enter => self.refresh_ai_availability(),
+                KeyCode::F(2) => Self::open_ai_settings(),
+                KeyCode::Char('/') => self.focus_ask(),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.detail_scroll = self.detail_scroll.saturating_add(1)
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(1)
+                }
+                KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(5),
+                KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(5),
+                KeyCode::Char('q') => app.quit = true,
+                KeyCode::Home => self.detail_scroll = 0,
+                KeyCode::End => self.detail_scroll = self.detail_max_scroll.get(),
+                _ => {}
+            }
+            return true;
+        }
         if let Some(text) = &mut self.asking {
             match key.code {
-                KeyCode::Esc => self.asking = None,
+                KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab => {
+                    self.blur_ask();
+                    self.detail = false;
+                }
+                KeyCode::F(2) => Self::open_ai_settings(),
+                KeyCode::F(3) => self.show_ai_status(),
                 KeyCode::Backspace => {
                     text.pop();
                 }
                 KeyCode::Enter => {
                     let question = text.trim().to_string();
-                    if !question.is_empty() {
+                    if !self.model_ready() {
+                        self.refresh_ai_availability();
+                    } else if !question.is_empty() {
                         self.asking = None;
+                        self.ask_draft.clear();
                         self.start_ask(app, &question);
                     }
                 }
@@ -2142,16 +2716,8 @@ impl Workspace {
                 KeyCode::Up | KeyCode::PageUp => {
                     self.review_scroll = self.review_scroll.saturating_sub(1)
                 }
-                _ => {}
-            }
-            return true;
-        }
-        if self.focus == 0 {
-            match key.code {
-                KeyCode::Left | KeyCode::Up => self.navigate(self.nav.saturating_sub(1)),
-                KeyCode::Right | KeyCode::Down => self.navigate((self.nav + 1).min(3)),
-                KeyCode::Tab | KeyCode::BackTab | KeyCode::Enter | KeyCode::Esc => self.focus = 1,
-                KeyCode::Char('q') => app.quit = true,
+                KeyCode::Home => self.review_scroll = 0,
+                KeyCode::End => self.review_scroll = self.review_max_scroll.get(),
                 _ => {}
             }
             return true;
@@ -2219,63 +2785,74 @@ impl Workspace {
             }
             return true;
         }
-        if self.answer_open && matches!(key.code, KeyCode::Esc | KeyCode::Backspace | KeyCode::Left)
-        {
-            self.answer_open = false;
-            self.detail_scroll = 0;
+        // A displayed answer or coverage report owns the right panel. Closing
+        // it never drills into a folder or acts on an obscured finding.
+        if self.answer_open || self.coverage {
+            match key.code {
+                KeyCode::Esc
+                | KeyCode::Backspace
+                | KeyCode::Left
+                | KeyCode::Tab
+                | KeyCode::BackTab => {
+                    self.answer_open = false;
+                    self.coverage = false;
+                    self.detail = false;
+                    self.detail_scroll = 0;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.detail_scroll = self.detail_scroll.saturating_add(1)
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(1)
+                }
+                KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(5),
+                KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(5),
+                KeyCode::Home => self.detail_scroll = 0,
+                KeyCode::End => self.detail_scroll = self.detail_max_scroll.get(),
+                KeyCode::Char('v') if self.coverage => {
+                    self.coverage = false;
+                    self.detail_scroll = 0;
+                }
+                KeyCode::Char('/') => self.focus_ask(),
+                KeyCode::Char('g') => self.go_to(app, Screen::Overview),
+                KeyCode::Char('b') => self.go_to(app, Screen::Explore),
+                KeyCode::Char('h') => self.go_to(app, Screen::History),
+                KeyCode::Char('?') => {
+                    self.help = true;
+                    self.detail_scroll = 0;
+                }
+                KeyCode::Char('A') | KeyCode::F(2) => Self::open_ai_settings(),
+                KeyCode::F(3) => self.show_ai_status(),
+                KeyCode::Char('q') => app.quit = true,
+                _ => {}
+            }
             return true;
         }
-        if self.answer_open
-            && matches!(
-                key.code,
-                KeyCode::Down | KeyCode::Up | KeyCode::Char('j') | KeyCode::Char('k')
-            )
-        {
-            self.detail_scroll = if matches!(key.code, KeyCode::Down | KeyCode::Char('j')) {
-                self.detail_scroll.saturating_add(1)
-            } else {
-                self.detail_scroll.saturating_sub(1)
-            };
-            return true;
-        }
-        if (self.detail || self.coverage)
+        if self.detail
+            && (key.code == KeyCode::Esc || self.screen != Screen::Explore)
             && matches!(key.code, KeyCode::Esc | KeyCode::Backspace | KeyCode::Left)
         {
-            if self.coverage {
-                self.coverage = false;
-            } else {
-                self.detail = false;
-            }
+            self.detail = false;
             self.detail_scroll = 0;
             return true;
         }
-        if (self.detail || self.coverage)
-            && matches!(
-                key.code,
-                KeyCode::Down | KeyCode::Up | KeyCode::Char('j') | KeyCode::Char('k')
-            )
-        {
-            self.detail_scroll = if matches!(key.code, KeyCode::Down | KeyCode::Char('j')) {
-                self.detail_scroll.saturating_add(1)
+        if list_motion {
+            if self.detail {
+                self.detail_scroll = match key.code {
+                    KeyCode::Home => 0,
+                    KeyCode::End => self.detail_max_scroll.get(),
+                    KeyCode::PageDown => self.detail_scroll.saturating_add(5),
+                    KeyCode::PageUp => self.detail_scroll.saturating_sub(5),
+                    KeyCode::Down | KeyCode::Char('j') => self.detail_scroll.saturating_add(1),
+                    _ => self.detail_scroll.saturating_sub(1),
+                };
             } else {
-                self.detail_scroll.saturating_sub(1)
-            };
-            return true;
-        }
-        if self.coverage
-            && !matches!(
-                key.code,
-                KeyCode::Char('v' | '?' | 'A')
-                    | KeyCode::PageDown
-                    | KeyCode::PageUp
-                    | KeyCode::Tab
-                    | KeyCode::BackTab
-            )
-        {
+                self.move_list(app, key.code);
+            }
             return true;
         }
         if key.code == KeyCode::Char('v') {
-            self.coverage = !self.coverage;
+            self.coverage = true;
             self.detail_scroll = 0;
             return true;
         }
@@ -2292,7 +2869,7 @@ impl Workspace {
             {
                 self.kept.remove(&id);
                 self.show_all = true;
-                self.navigate(1);
+                self.navigate(Screen::Overview);
                 self.cursor = self
                     .visible()
                     .iter()
@@ -2303,26 +2880,24 @@ impl Workspace {
             }
             return true;
         }
-        if self.coverage && key.code == KeyCode::Esc {
-            self.coverage = false;
-            return true;
-        }
         if key.code == KeyCode::Char('i') && self.screen == Screen::Explore {
-            if let Some(path) = app
-                .explorer_items()
-                .get(app.explorer_cursor)
-                .map(|item| item.path.clone())
-            {
+            if let Some(path) = app.explorer_path.clone() {
                 self.start_measure(app, path);
             }
             return true;
         }
         match key.code {
             KeyCode::Char('q') => app.quit = true,
-            KeyCode::Char(digit @ '1'..='3') => self.go_to(app, digit as usize - '1' as usize),
+            KeyCode::Char('g') => self.go_to(app, Screen::Overview),
+            KeyCode::Char('b') => self.go_to(app, Screen::Explore),
+            KeyCode::Char('h') => self.go_to(app, Screen::History),
             KeyCode::Char(':') => self.palette = Some((String::new(), 0)),
-            KeyCode::Tab => self.go_to(app, (self.nav + 1) % 3),
-            KeyCode::BackTab => self.go_to(app, (self.nav + 2) % 3),
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.detail = !self.detail;
+                self.coverage = false;
+                self.detail_scroll = 0;
+            }
+            KeyCode::Right => self.open_selected(app),
             KeyCode::Char('a') if self.screen == Screen::Overview => self.add_quick_wins(app),
             KeyCode::Char('p') => {
                 if self.agent.as_ref().is_some_and(|run| run.automatic) {
@@ -2350,13 +2925,10 @@ impl Workspace {
                     }
                 }
             }
-            KeyCode::Char('A') => {
-                thread::spawn(|| {
-                    let _ = Command::new("/usr/bin/open")
-                        .args(["-b", "com.apple.systempreferences"])
-                        .status();
-                });
+            KeyCode::Char('A') | KeyCode::F(2) => {
+                Self::open_ai_settings();
             }
+            KeyCode::F(3) => self.show_ai_status(),
             KeyCode::Char('d') => {
                 self.detail = !self.detail;
                 self.detail_scroll = 0;
@@ -2379,12 +2951,8 @@ impl Workspace {
             KeyCode::Char('i') => {
                 if let Some(finding) = self.selected().cloned() {
                     self.start_investigation(app, &finding, false);
-                    // Narrow screens have no side pane, so show the
-                    // investigation as it runs instead of finishing unseen.
-                    if app.terminal_width < SPLIT_WIDTH {
-                        self.detail = true;
-                        self.detail_scroll = 0;
-                    }
+                    self.detail = true;
+                    self.detail_scroll = 0;
                     if self.agent.as_ref().is_some_and(agent::AgentRun::by_model) {
                         self.note = Some(
                             "Local AI is investigating with read-only tools. The timeline appears in details.".into(),
@@ -2393,22 +2961,15 @@ impl Workspace {
                 }
             }
             KeyCode::Char('/') => {
-                if self.model_ready() {
-                    self.asking = Some(String::new());
-                    self.help = false;
-                } else {
-                    self.note = Some(format!(
-                        "Ask needs Apple Intelligence on this Mac. {}",
-                        self.ai_framework.description()
-                    ));
-                }
+                self.focus_ask();
+                self.help = false;
             }
-            KeyCode::Char('f') => {
+            KeyCode::Char('f') if self.screen == Screen::Overview => {
                 self.show_all = !self.show_all;
                 self.pinned = None;
                 self.cursor = 0;
             }
-            KeyCode::Char('K') => {
+            KeyCode::Char('K') if self.screen == Screen::Overview => {
                 if let Some(f) = self.selected() {
                     if matches!(f.target, Target::System) {
                         self.note =
@@ -2420,11 +2981,9 @@ impl Workspace {
                 self.cursor = self.cursor.min(self.visible().len().saturating_sub(1));
             }
             KeyCode::Char('e') if self.screen == Screen::Overview => self.inspect(app),
-            KeyCode::Char('e') if self.screen == Screen::Explore => {
-                self.detail = false;
-                self.detail_scroll = 0;
-                app.open_consumer();
-            }
+            KeyCode::Char('e') if self.screen == Screen::Explore => self.open_selected(app),
+            KeyCode::Char(' ') if self.screen == Screen::Explore => self.add_browser_cleanup(app),
+            KeyCode::Char('t') => self.add_trash(app),
             KeyCode::Char(' ') if self.screen == Screen::Overview => self.add_selected(app, false),
             KeyCode::Char('x') if self.screen == Screen::Overview => self.add_selected(app, true),
             KeyCode::Char('m') => {
@@ -2433,7 +2992,7 @@ impl Workspace {
                     self.legacy = true;
                 }
             }
-            KeyCode::Char('o') => {
+            KeyCode::Char('o') if self.screen != Screen::History => {
                 let path = if self.screen == Screen::Explore {
                     app.explorer_items()
                         .get(app.explorer_cursor)
@@ -2450,44 +3009,16 @@ impl Workspace {
                     });
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => match self.screen {
-                Screen::Overview => {
-                    self.cursor = (self.cursor + 1).min(self.visible().len().saturating_sub(1))
-                }
-                Screen::Explore => {
-                    app.explorer_cursor =
-                        (app.explorer_cursor + 1).min(app.explorer_items().len().saturating_sub(1))
-                }
-                Screen::History => {
-                    self.history_cursor =
-                        (self.history_cursor + 1).min(self.history.len().saturating_sub(1))
-                }
-            },
-            KeyCode::Up | KeyCode::Char('k') => match self.screen {
-                Screen::Overview => self.cursor = self.cursor.saturating_sub(1),
-                Screen::Explore => app.explorer_cursor = app.explorer_cursor.saturating_sub(1),
-                Screen::History => self.history_cursor = self.history_cursor.saturating_sub(1),
-            },
-            KeyCode::Enter => {
-                if self.screen == Screen::Explore && !self.detail {
-                    if app
-                        .explorer_items()
-                        .get(app.explorer_cursor)
-                        .is_some_and(|item| item.kind != StorageItemKind::Directory)
-                    {
-                        self.detail = true;
-                    } else {
-                        app.open_consumer();
-                    }
-                    self.detail_scroll = 0;
-                } else {
-                    self.detail = true;
-                    self.detail_scroll = 0;
-                }
-            }
+            KeyCode::Enter => self.open_selected(app),
             KeyCode::Esc | KeyCode::Backspace | KeyCode::Left => {
                 if self.screen == Screen::Explore {
-                    app.explorer_back();
+                    if key.code == KeyCode::Esc {
+                        self.browser_back(app);
+                    } else {
+                        self.browser_parent(app);
+                    }
+                } else if self.screen == Screen::History {
+                    self.navigate(Screen::Overview);
                 } else if key.code == KeyCode::Esc && self.agent.is_some() {
                     self.cancel_agent(
                         app,
@@ -2498,15 +3029,7 @@ impl Workspace {
                     self.detail = false;
                 }
             }
-            KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(5),
-            KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(5),
             _ => {}
-        }
-        if matches!(
-            key.code,
-            KeyCode::Down | KeyCode::Up | KeyCode::Char('j') | KeyCode::Char('k')
-        ) {
-            self.detail_scroll = 0;
         }
         true
     }
@@ -2518,16 +3041,62 @@ impl Workspace {
             return true;
         }
         if self.legacy && app.phase == Phase::Processes {
+            if let MouseEventKind::ScrollUp | MouseEventKind::ScrollDown = event.kind {
+                let over_list = self.hits.borrow().iter().any(|(rect, control)| {
+                    matches!(control, Control::Pane(false))
+                        && rect_contains(*rect, event.column, event.row)
+                });
+                if over_list {
+                    let code = if event.kind == MouseEventKind::ScrollUp {
+                        KeyCode::Up
+                    } else {
+                        KeyCode::Down
+                    };
+                    self.key(app, KeyEvent::new(code, KeyModifiers::NONE));
+                }
+            } else if event.kind == MouseEventKind::Down(MouseButton::Left) {
+                let row = app
+                    .hit_regions
+                    .borrow()
+                    .iter()
+                    .find_map(|(rect, hit)| match hit {
+                        HitTarget::Process(index)
+                            if rect_contains(*rect, event.column, event.row) =>
+                        {
+                            Some(*index)
+                        }
+                        _ => None,
+                    });
+                if let Some(index) = row {
+                    app.process_cursor = index;
+                } else {
+                    let code =
+                        self.hits
+                            .borrow()
+                            .iter()
+                            .find_map(|(rect, control)| match control {
+                                Control::Key(code)
+                                    if rect_contains(*rect, event.column, event.row) =>
+                                {
+                                    Some(*code)
+                                }
+                                _ => None,
+                            });
+                    if let Some(code) = code {
+                        self.key(app, KeyEvent::new(code, KeyModifiers::NONE));
+                    }
+                }
+            }
             return true;
         }
         if self.legacy {
             return false;
         }
         let modal = self.reviewing
+            || self.ai_status_open
             || self.clearing_history
             || self.work.is_some()
             || self.help
-            || self.asking.is_some()
             || self.palette.is_some()
             || self.awaiting_approval();
         let key = match event.kind {
@@ -2536,6 +3105,27 @@ impl Workspace {
             _ => None,
         };
         if let Some(key) = key {
+            let pane = self
+                .hits
+                .borrow()
+                .iter()
+                .find_map(|(rect, control)| match control {
+                    Control::Pane(details) if rect_contains(*rect, event.column, event.row) => {
+                        Some(*details)
+                    }
+                    _ => None,
+                });
+            if !modal && pane.is_none() {
+                return true;
+            }
+            if !modal && let Some(details) = pane {
+                self.blur_ask();
+                self.detail = details;
+                if !details {
+                    self.coverage = false;
+                    self.answer_open = false;
+                }
+            }
             return self.key(app, KeyEvent::new(key, KeyModifiers::NONE));
         }
         if event.kind != MouseEventKind::Down(MouseButton::Left) {
@@ -2552,10 +3142,28 @@ impl Workspace {
                     && event.row < r.bottom()
             })
             .map(|(_, c)| *c);
-        if modal && !matches!(control, Some(Control::Key(_))) {
+        if let Some((_, cursor)) = self.palette.as_mut() {
+            match control {
+                Some(Control::PaletteRow(index)) => *cursor = index,
+                Some(Control::Key(KeyCode::Enter | KeyCode::Esc | KeyCode::Up | KeyCode::Down)) => {
+                    if let Some(Control::Key(code)) = control {
+                        self.key(app, KeyEvent::new(code, KeyModifiers::NONE));
+                    }
+                }
+                _ => {}
+            }
             return true;
         }
-        if control.is_none() {
+        if modal
+            && !matches!(control, Some(Control::Key(_)))
+            && !(self.ai_status_open && matches!(control, Some(Control::Ask)))
+        {
+            return true;
+        }
+        if matches!(control, Some(Control::Pane(_) | Control::Row(_))) {
+            self.blur_ask();
+        }
+        if control.is_none() || matches!(control, Some(Control::Pane(_))) {
             let path = app.hit_regions.borrow().iter().find_map(|(rect, hit)| {
                 if rect_contains(*rect, event.column, event.row) {
                     if let HitTarget::MapNode(index) = hit {
@@ -2568,25 +3176,54 @@ impl Workspace {
                 }
             });
             if let Some(path) = path {
-                app.open_map_path(&path);
-                self.navigate(2);
+                let kind = app
+                    .inventory
+                    .as_ref()
+                    .and_then(|i| path.parent().and_then(|p| i.children.get(p)))
+                    .and_then(|items| items.iter().find(|i| i.path == path))
+                    .map(|i| i.kind)
+                    .or_else(|| {
+                        app.inventory
+                            .as_ref()
+                            .and_then(|i| i.top_level.iter().find(|i| i.path == path))
+                            .map(|i| i.kind)
+                    });
+                if let Some(kind) = kind {
+                    self.open_browser_path(app, path, kind == StorageItemKind::Directory);
+                }
                 return true;
             }
         }
         match control {
-            Some(Control::Nav(index)) => self.go_to(app, index),
+            Some(Control::Pane(details)) => {
+                self.detail = details;
+                if !details {
+                    self.coverage = false;
+                    self.answer_open = false;
+                }
+            }
             Some(Control::Row(index)) => {
+                self.detail = false;
+                self.answer_open = false;
+                self.coverage = false;
                 self.user_moved = true;
                 self.detail_scroll = 0;
                 match self.screen {
                     Screen::Overview => self.cursor = index,
-                    Screen::Explore => app.explorer_cursor = index,
+                    Screen::Explore => {
+                        app.explorer_cursor = index;
+                        self.browser_pending_selection = None;
+                    }
                     Screen::History => self.history_cursor = index,
                 }
             }
             Some(Control::Key(code)) => {
+                if !matches!(code, KeyCode::Enter | KeyCode::Esc | KeyCode::F(2)) {
+                    self.blur_ask();
+                }
                 self.key(app, KeyEvent::new(code, KeyModifiers::NONE));
             }
+            Some(Control::Ask) => self.focus_ask(),
             _ => {}
         }
         true
@@ -2600,7 +3237,7 @@ fn text_panel(
     title: &str,
     text: String,
     scroll: u16,
-) {
+) -> u16 {
     let text = Paragraph::new(text)
         .style(Style::default().fg(app.color(INK)))
         .wrap(Wrap { trim: false });
@@ -2618,6 +3255,7 @@ fn text_panel(
         )));
     }
     frame.render_widget(text.block(block).scroll((scroll, 0)), area);
+    max_scroll
 }
 fn button(
     frame: &mut Frame<'_>,
@@ -2790,6 +3428,13 @@ fn execute_actions(
                     }
                 }
             }
+            Action::Trash(plan) => {
+                let target = plan.path.display().to_string();
+                match plan.execute() {
+                    Ok(()) => (target, "Moved to Trash. Space is not freed until Trash is emptied; restore by dragging the item out in Finder.".into(), 0),
+                    Err(error) => (target, format!("Failed to move to Trash: {error}"), 0),
+                }
+            }
             Action::Signal(mut process, signal) => {
                 signalled.push((session.actions.len(), process.clone()));
                 let outcome = signal_process(&mut process, signal);
@@ -2942,7 +3587,7 @@ mod tests {
         w.complete = true;
         w.stage = "Assessment complete · synthetic preview".into();
         w.rebuild(&app);
-        w.navigate(0);
+        w.navigate(Screen::Overview);
         (home, app, w)
     }
     fn press(w: &mut Workspace, app: &mut App, key: KeyCode) {
@@ -2999,7 +3644,7 @@ mod tests {
         for width in [60, 80, 120, 160] {
             let (_home, mut app, mut w) = fixture();
             app.terminal_width = width;
-            press(&mut w, &mut app, KeyCode::Enter);
+            press(&mut w, &mut app, KeyCode::Tab);
             assert!(w.detail);
             assert!(w.screen == Screen::Overview);
             let cursor = w.cursor;
@@ -3014,7 +3659,7 @@ mod tests {
             assert_eq!(w.detail_scroll, 0);
             w.detail = true;
             w.coverage = true;
-            w.navigate(1);
+            w.navigate(Screen::Explore);
             assert!(!w.detail && !w.coverage);
         }
     }
@@ -3038,7 +3683,7 @@ mod tests {
             "UNRELATED CACHE EXPLANATION",
             vec![],
         ));
-        w.navigate(1);
+        w.navigate(Screen::Explore);
         press(&mut w, &mut app, KeyCode::Char('d'));
         let text = screen_text(&app, &w, 60, 24, "explore-details");
         assert!(text.contains("Unique documents"));
@@ -3066,7 +3711,7 @@ mod tests {
             state: "Completed fixture actions".into(),
             ..Default::default()
         });
-        w.navigate(2);
+        w.navigate(Screen::History);
         press(&mut w, &mut app, KeyCode::Enter);
         assert!(w.detail);
         let text = screen_text(&app, &w, 60, 16, "history-results");
@@ -3137,7 +3782,8 @@ mod tests {
         app.analysis_only = true;
         let text = screen_text(&app, &w, 60, 16, "empty");
         assert!(text.contains("read-only"));
-        assert!(text.contains("Nothing large enough to list"), "{text}");
+        assert!(text.contains("Nothing large enough."), "{text}");
+        assert!(text.contains("f shows all items."), "{text}");
         assert!(!text.contains("Gathering"));
         assert!(!text.lines().last().unwrap().contains("Space"));
         w.reviewing = true;
@@ -3153,6 +3799,7 @@ mod tests {
         press(&mut w, &mut app, KeyCode::Char('p'));
         let text = screen_text(&app, &w, 60, 16, "review");
         assert!(text.contains("Type CLEAN then Enter"));
+        assert!(text.contains("Clear Python cache"), "{text}");
         assert!(text.contains("nothing has run yet"));
         assert!(w.work.is_none());
         let (_sender, receiver) = mpsc::channel();
@@ -3195,18 +3842,18 @@ mod tests {
         press(&mut w, &mut app, KeyCode::Char(' '));
         assert!(w.plan.is_empty());
         let text = screen_text(&app, &w, 60, 16, "coverage-pending");
-        assert!(text.contains("coverage is not available yet"));
+        assert!(text.contains("Coverage unavailable."));
         assert!(!text.lines().last().unwrap().contains("Space"));
         press(&mut w, &mut app, KeyCode::Esc);
         assert!(!w.coverage);
     }
     #[test]
-    fn menu_focus_never_adds_actions_and_read_only_stays_locked() {
+    fn panel_focus_preserves_selection_and_read_only_stays_locked() {
         let (_home, mut app, mut w) = fixture();
-        w.focus = 0;
-        press(&mut w, &mut app, KeyCode::Char(' '));
-        assert!(w.plan.is_empty());
         press(&mut w, &mut app, KeyCode::Tab);
+        assert!(w.detail);
+        press(&mut w, &mut app, KeyCode::BackTab);
+        assert!(!w.detail);
         press(&mut w, &mut app, KeyCode::Char(' '));
         assert_eq!(w.plan.len(), 1);
         w.plan.clear();
@@ -3232,27 +3879,25 @@ mod tests {
         assert!(action_for_finding(&app, &finding.target, false).is_err());
     }
     #[test]
-    fn the_active_tab_is_highlighted_without_a_focus_mode() {
+    fn two_panels_stay_visible_and_tab_only_changes_focus() {
         let (_home, mut app, mut w) = fixture();
         app.terminal_width = 120;
         app.terminal_height = 30;
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
-        terminal
-            .draw(|frame| render(frame, frame.area(), &app, &w))
-            .unwrap();
-        let (overview, explore) = (
-            terminal.backend().buffer()[(13, 0)].style(),
-            terminal.backend().buffer()[(24, 0)].style(),
-        );
-        assert_ne!(overview.bg, explore.bg, "the current tab stands out");
+        let first = screen_text(&app, &w, 120, 30, "panels-list-focus");
+        assert!(first.contains("WHERE THE SPACE WENT") && first.contains("DETAILS"));
+        assert!(!first.lines().next().unwrap().contains("Overview"));
         press(&mut w, &mut app, KeyCode::Tab);
-        assert!(w.screen == Screen::Explore && w.focus == 1);
+        assert!(w.screen == Screen::Overview && w.detail);
+        let details = screen_text(&app, &w, 120, 30, "panels-detail-focus");
+        assert!(details.contains("WHERE THE SPACE WENT") && details.contains("DETAILS"));
+        press(&mut w, &mut app, KeyCode::Tab);
+        assert!(w.screen == Screen::Overview && !w.detail);
     }
     #[test]
     fn clearing_history_requires_a_separate_phrase_and_writable_session() {
         let (home, mut app, mut w) = fixture();
         care::save_session(home.path(), &Session::default()).unwrap();
-        w.navigate(2);
+        w.navigate(Screen::History);
         press(&mut w, &mut app, KeyCode::Delete);
         assert!(w.clearing_history);
         press(&mut w, &mut app, KeyCode::Enter);
@@ -3368,11 +4013,23 @@ mod tests {
         w.detail = true;
         let text = screen_text(&app, &w, 80, 40, "measured-investigation");
         assert!(text.contains("WHAT THE CHECKS FOUND"), "{text}");
-        assert!(text.contains("HOW THIS WAS CHECKED"));
+        let mut scrolled = text;
+        for _ in 0..12 {
+            press(&mut w, &mut app, KeyCode::PageDown);
+            scrolled.push_str(&screen_text(
+                &app,
+                &w,
+                80,
+                40,
+                "measured-investigation-scrolled",
+            ));
+        }
+        assert!(scrolled.contains("HOW THIS WAS CHECKED"));
         assert!(
-            text.contains("cleanup_rule("),
+            scrolled.contains("cleanup_rule("),
             "expanded details list each call"
         );
+        w.detail_scroll = 0;
         w.detail = false;
         let text = screen_text(&app, &w, 140, 40, "measured-investigation-compact");
         assert!(
@@ -3703,7 +4360,7 @@ mod tests {
         assert_eq!(w.session.investigations[1].id, second.id);
     }
     #[test]
-    fn compact_workspace_uses_a_full_width_list_and_detail_page() {
+    fn compact_workspace_keeps_both_panels_visible() {
         let (_home, mut app, mut w) = fixture();
         app.terminal_width = 60;
         app.terminal_height = 16;
@@ -3718,8 +4375,9 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(list_text.contains("WHERE THE SPACE WENT"));
-        press(&mut w, &mut app, KeyCode::Enter);
+        assert!(list_text.contains("STORAGE"));
+        assert!(list_text.contains("DETAILS"));
+        press(&mut w, &mut app, KeyCode::Tab);
         assert!(w.detail);
         terminal
             .draw(|frame| render(frame, frame.area(), &app, &w))
@@ -3732,6 +4390,576 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(detail_text.contains("DETAILS"));
+        assert!(detail_text.contains("STORAGE"));
+    }
+    #[test]
+    fn browsing_a_finding_and_its_cleanup_rule_uses_the_correct_list() {
+        let (home, mut app, mut w) = fixture();
+        let cache = fs::canonicalize(&app.entries[0].spec.path).unwrap();
+        fs::write(cache.join("fixture.bin"), vec![0; 4096]).unwrap();
+        app.entries[0].spec.path = cache.clone();
+        w.rebuild(&app);
+        app.inventory = Some(StorageInventory::scan(home.path(), home.path()));
+        press(&mut w, &mut app, KeyCode::Char('e'));
+        assert!(w.screen == Screen::Explore);
+        assert_eq!(app.explorer_path.as_ref(), Some(&cache));
+        app.explorer_path = cache.parent().map(Path::to_path_buf);
+        app.explorer_cursor = app
+            .explorer_items()
+            .iter()
+            .position(|item| item.path == cache)
+            .unwrap();
+        press(&mut w, &mut app, KeyCode::Char('f'));
+        assert!(w.screen == Screen::Overview);
+        assert!(matches!(&w.selected().unwrap().target, Target::Cache(path) if path == &cache));
+    }
+    #[test]
+    fn enter_drills_from_details_measures_missing_children_and_restores_parent_selection() {
+        let (home, mut app, mut w) = fixture();
+        let cache = app.entries[0].spec.path.canonicalize().unwrap();
+        let wheels = cache.join("wheels");
+        fs::create_dir(&wheels).unwrap();
+        fs::write(wheels.join("package.whl"), vec![7; 8192]).unwrap();
+        app.entries[0].spec.path = cache.clone();
+        w.rebuild(&app);
+        let mut inventory = StorageInventory::scan(home.path(), home.path());
+        inventory.children.remove(&wheels);
+        app.inventory = Some(inventory);
+        w.detail = true; // Enter works even while reading an investigation.
+        press(&mut w, &mut app, KeyCode::Enter);
+        assert!(w.screen == Screen::Explore && !w.detail);
+        assert_eq!(app.explorer_path.as_ref(), Some(&cache));
+        let parent_cursor = app.explorer_cursor;
+        press(&mut w, &mut app, KeyCode::Right);
+        assert_eq!(app.explorer_path.as_ref(), Some(&wheels));
+        assert!(w.measure.is_some(), "missing children must start a walk");
+        let started = Instant::now();
+        while w.measure.is_some() && started.elapsed() < Duration::from_secs(5) {
+            w.pump_measure(&mut app);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(w.measure.is_none());
+        assert_eq!(app.explorer_items()[0].path, wheels.join("package.whl"));
+        assert!(app.explorer_items()[0].size_kb > 0);
+        press(&mut w, &mut app, KeyCode::Enter);
+        assert!(w.detail, "files show details instead of an empty folder");
+        press(&mut w, &mut app, KeyCode::Left);
+        assert!(!w.detail);
+        assert_eq!(app.explorer_path.as_ref(), Some(&cache));
+        assert_eq!(app.explorer_cursor, parent_cursor);
+        assert!(w.plan.is_empty());
+        // The browser can select the exact cache action without a detour to findings.
+        app.explorer_path = cache.parent().map(Path::to_path_buf);
+        app.explorer_cursor = app
+            .explorer_items()
+            .iter()
+            .position(|i| i.path == cache)
+            .unwrap();
+        press(&mut w, &mut app, KeyCode::Char(' '));
+        assert!(matches!(&w.plan[0], Action::Clean(e) if e.spec.path == cache));
+        assert!(w.work.is_none());
+        assert!(wheels.join("package.whl").exists());
+    }
+    #[test]
+    fn browser_trash_requires_its_own_review_and_read_only_blocks_it() {
+        let (home, mut app, mut w) = fixture();
+        let root = home.path().canonicalize().unwrap();
+        let project = root.join("old-project");
+        fs::create_dir(&project).unwrap();
+        fs::write(project.join("notes.txt"), "keep until confirmed").unwrap();
+        app.inventory = Some(StorageInventory::scan(&root, &root));
+        app.explorer_path = Some(root.clone());
+        app.explorer_cursor = app
+            .explorer_items()
+            .iter()
+            .position(|i| i.path == project)
+            .unwrap();
+        w.navigate(Screen::Explore);
+        app.analysis_only = true;
+        press(&mut w, &mut app, KeyCode::Char('t'));
+        assert!(w.plan.is_empty());
+        app.analysis_only = false;
+        press(&mut w, &mut app, KeyCode::Char('t'));
+        assert!(matches!(&w.plan[0], Action::Trash(p) if p.path == project));
+        w.add_action(Action::Clean(app.entries[0].clone()));
+        assert_eq!(
+            w.plan.len(),
+            1,
+            "cleanup must never empty a newly trashed item"
+        );
+        w.note = None;
+        for (width, height) in [(60, 16), (80, 24), (120, 36)] {
+            let text = screen_text(&app, &w, width, height, "folder-browser");
+            assert!(
+                text.contains("FOLDERS") && text.contains("old-project"),
+                "{text}"
+            );
+            assert!(text.contains("Ask AI ›"));
+            assert!(text.contains("IN PLAN"), "{text}");
+        }
+        press(&mut w, &mut app, KeyCode::Char('p'));
+        let text = screen_text(&app, &w, 120, 36, "trash-review");
+        assert!(text.contains("Type TRASH then Enter"));
+        assert!(text.contains("Frees no space"));
+        w.acknowledgement = "CLEAN".into();
+        press(&mut w, &mut app, KeyCode::Enter);
+        assert!(w.work.is_none());
+        assert!(project.join("notes.txt").exists());
+        press(&mut w, &mut app, KeyCode::Esc);
+        press(&mut w, &mut app, KeyCode::Char('t'));
+        assert!(
+            w.plan.is_empty(),
+            "the same key removes the queued Trash action"
+        );
+        w.add_action(Action::Clean(app.entries[0].clone()));
+        press(&mut w, &mut app, KeyCode::Char('t'));
+        assert_eq!(w.plan.len(), 1, "isolation applies in both orders");
+        assert!(matches!(w.plan[0], Action::Clean(_)));
+    }
+    #[test]
+    fn failed_browser_measurement_stops_spinner_and_partial_empty_is_not_called_empty() {
+        let (_home, mut app, mut w) = fixture();
+        let (sender, receiver) = mpsc::channel();
+        drop(sender);
+        w.measure = Some(MeasureWork {
+            receiver,
+            stop: Arc::new(AtomicBool::new(false)),
+            path: app.account_home.clone(),
+            progress: Default::default(),
+        });
+        w.pump_measure(&mut app);
+        assert!(w.measure.is_none());
+        assert!(w.note.as_ref().unwrap().contains("stopped"));
+        w.navigate(Screen::Explore);
+        app.explorer_path = Some(app.account_home.clone());
+        w.measured_folders.insert(app.account_home.clone(), false);
+        let text = screen_text(&app, &w, 120, 36, "partial-folder");
+        assert!(text.contains("No readable children"));
+        assert!(!text.contains("This folder is empty"));
+        w.measured_folders.insert(app.account_home.clone(), true);
+        let text = screen_text(&app, &w, 120, 36, "empty-folder");
+        assert!(text.contains("This folder is empty"));
+    }
+    #[test]
+    fn overview_heatmap_tracks_selection_and_opens_folders_and_files_without_actions() {
+        let (home, mut app, mut w) = fixture();
+        let cache = app.entries[0].spec.path.canonicalize().unwrap();
+        fs::create_dir(cache.join("wheels")).unwrap();
+        fs::write(cache.join("wheels/package.whl"), vec![1; 32 * 1024]).unwrap();
+        let archive = cache.join("archive.zip");
+        fs::write(&archive, vec![2; 24 * 1024]).unwrap();
+        let other = home.path().join("Another folder");
+        fs::create_dir(&other).unwrap();
+        fs::write(other.join("notes.txt"), vec![3; 8192]).unwrap();
+        let other = other.canonicalize().unwrap();
+        app.entries[0].spec.path = cache.clone();
+        w.rebuild(&app);
+        let mut second = w.findings[0].clone();
+        second.id = format!("path:{}", other.display());
+        second.title = "Another folder".into();
+        second.target = Target::Folder(other.clone());
+        second.size_kb = 8;
+        second.quick_win = false;
+        w.findings.push(second);
+        w.show_all = true;
+        w.ask_draft = "What grew?".into();
+        app.inventory = Some(StorageInventory::scan(home.path(), home.path()));
+        for (width, height) in [(60, 16), (80, 24), (120, 36)] {
+            app.terminal_width = width;
+            app.terminal_height = height;
+            let text = screen_text(&app, &w, width, height, "overview-heatmap");
+            assert!(
+                text.contains("DETAILS") && text.contains("HEATMAP") && text.contains("Ask AI ›"),
+                "{text}"
+            );
+            assert!(
+                app.map_paths.borrow().contains(&archive),
+                "files remain clickable at {width}"
+            );
+            assert!(
+                app.map_paths.borrow().contains(&cache.join("wheels")),
+                "folders remain clickable at {width}"
+            );
+        }
+        press(&mut w, &mut app, KeyCode::Down);
+        screen_text(&app, &w, 120, 36, "heatmap-new-selection");
+        assert!(
+            app.map_paths
+                .borrow()
+                .iter()
+                .all(|path| path.starts_with(&other))
+        );
+        assert!(app.map_paths.borrow().contains(&other.join("notes.txt")));
+        press(&mut w, &mut app, KeyCode::Up);
+        let click = |app: &mut App, w: &mut Workspace, path: &Path| {
+            screen_text(app, w, 120, 36, "heatmap-click");
+            let index = app
+                .map_paths
+                .borrow()
+                .iter()
+                .position(|p| p == path)
+                .unwrap();
+            let rect = app
+                .hit_regions
+                .borrow()
+                .iter()
+                .find_map(|(rect, hit)| {
+                    matches!(hit, HitTarget::MapNode(i) if *i == index).then_some(*rect)
+                })
+                .unwrap();
+            w.mouse(
+                app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: rect.x,
+                    row: rect.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+            );
+        };
+        click(&mut app, &mut w, &cache.join("wheels"));
+        assert!(w.screen == Screen::Explore);
+        assert_eq!(
+            app.explorer_path.as_deref(),
+            Some(cache.join("wheels").as_path())
+        );
+        press(&mut w, &mut app, KeyCode::Char('g'));
+        click(&mut app, &mut w, &archive);
+        assert!(w.screen == Screen::Explore && w.detail);
+        assert_eq!(app.explorer_items()[app.explorer_cursor].path, archive);
+        assert!(screen_text(&app, &w, 120, 36, "heatmap-file").contains("This is a file"));
+        assert!(w.plan.is_empty() && app.selected.is_empty());
+        assert_eq!(w.ask_draft, "What grew?");
+        assert_eq!(fs::metadata(archive).unwrap().len(), 24 * 1024);
+    }
+
+    #[test]
+    fn mouse_scroll_targets_the_panel_under_the_pointer() {
+        let (_home, mut app, mut w) = fixture();
+        app.terminal_width = 120;
+        app.terminal_height = 30;
+        let mut second = w.findings[0].clone();
+        second.id = "second".into();
+        second.title = "Second item".into();
+        w.findings.push(second);
+        screen_text(&app, &w, 120, 30, "mouse-focus");
+        let wheel = |column| MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column,
+            row: 6,
+            modifiers: KeyModifiers::NONE,
+        };
+        w.mouse(&mut app, wheel(100));
+        assert!(w.detail);
+        assert_eq!(w.detail_scroll, 1);
+        assert_eq!(w.cursor, 0);
+        w.mouse(&mut app, wheel(5));
+        assert!(!w.detail);
+        assert_eq!(w.cursor, 1);
+        assert_eq!(w.detail_scroll, 0);
+    }
+    #[test]
+    fn navigation_back_restores_browser_root_and_selected_path_after_reordering() {
+        let (home, mut app, mut w) = fixture();
+        let root = home.path().canonicalize().unwrap();
+        fs::create_dir(root.join("another-folder")).unwrap();
+        app.inventory = Some(StorageInventory::scan(&root, &root));
+        w.navigate(Screen::Explore);
+        app.explorer_path = None;
+        let chosen = app.explorer_items()[0].path.clone();
+        press(&mut w, &mut app, KeyCode::Enter);
+        assert_eq!(app.explorer_path.as_ref(), Some(&chosen));
+        app.inventory
+            .as_mut()
+            .unwrap()
+            .children
+            .get_mut(&root)
+            .unwrap()
+            .iter_mut()
+            .filter(|item| item.path != chosen)
+            .for_each(|item| item.size_kb = 999_999);
+        press(&mut w, &mut app, KeyCode::Esc);
+        assert!(
+            w.screen == Screen::Explore,
+            "a root browser list is not the findings screen"
+        );
+        assert!(app.explorer_path.is_none());
+        assert_eq!(app.explorer_items()[app.explorer_cursor].path, chosen);
+        press(&mut w, &mut app, KeyCode::Esc);
+        assert!(w.screen == Screen::Overview);
+    }
+    #[test]
+    fn navigation_heatmap_has_a_real_parent_and_returns_to_its_finding() {
+        let (home, mut app, mut w) = fixture();
+        let root = home.path().canonicalize().unwrap();
+        let cache = app.entries[0].spec.path.canonicalize().unwrap();
+        let wheels = cache.join("wheels");
+        fs::create_dir(&wheels).unwrap();
+        fs::write(wheels.join("package.whl"), vec![1; 8192]).unwrap();
+        app.entries[0].spec.path = cache.clone();
+        w.rebuild(&app);
+        app.inventory = Some(StorageInventory::scan(&root, &root));
+        app.explorer_path = Some(root.join("unrelated-old-location"));
+        screen_text(&app, &w, 120, 36, "navigation-map");
+        let index = app
+            .map_paths
+            .borrow()
+            .iter()
+            .position(|p| p == &wheels)
+            .unwrap();
+        let rect = app
+            .hit_regions
+            .borrow()
+            .iter()
+            .find_map(|(r, h)| matches!(h, HitTarget::MapNode(i) if *i == index).then_some(*r))
+            .unwrap();
+        let finding = w.selected().unwrap().id.clone();
+        w.mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x,
+                row: rect.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.explorer_path.as_ref(), Some(&wheels));
+        press(&mut w, &mut app, KeyCode::Left);
+        assert_eq!(app.explorer_path.as_ref(), Some(&cache));
+        assert_eq!(app.explorer_items()[app.explorer_cursor].path, wheels);
+        press(&mut w, &mut app, KeyCode::Esc);
+        assert_eq!(
+            app.explorer_path.as_ref(),
+            Some(&wheels),
+            "Back follows visited lists; Left follows parents"
+        );
+        press(&mut w, &mut app, KeyCode::Esc);
+        assert!(w.screen == Screen::Overview);
+        assert_eq!(w.selected().unwrap().id, finding);
+    }
+    #[test]
+    fn navigation_overlays_capture_keys_and_ignore_hidden_header_controls() {
+        let (_home, mut app, mut w) = fixture();
+        w.navigate(Screen::Explore);
+        let path = app.explorer_path.clone();
+        for code in [KeyCode::Left, KeyCode::Backspace, KeyCode::Tab] {
+            w.coverage = true;
+            press(&mut w, &mut app, code);
+            assert!(!w.coverage);
+            assert_eq!(app.explorer_path, path);
+        }
+        w.navigate(Screen::Overview);
+        w.answer_open = true;
+        for code in [
+            KeyCode::Char(' '),
+            KeyCode::Enter,
+            KeyCode::Right,
+            KeyCode::Char('K'),
+        ] {
+            press(&mut w, &mut app, code);
+        }
+        assert!(w.answer_open && w.screen == Screen::Overview);
+        assert!(w.plan.is_empty() && w.kept.is_empty());
+        press(&mut w, &mut app, KeyCode::Tab);
+        assert!(!w.answer_open && !w.detail);
+        // Clicking the header while reviewing must not insert shortcut letters.
+        press(&mut w, &mut app, KeyCode::Char(' '));
+        screen_text(&app, &w, 120, 36, "navigation-before-review");
+        let header = w
+            .hits
+            .borrow()
+            .iter()
+            .find(|(r, c)| r.y == 0 && matches!(c, Control::Key(KeyCode::Char('h'))))
+            .unwrap()
+            .0;
+        press(&mut w, &mut app, KeyCode::Char('p'));
+        screen_text(&app, &w, 120, 36, "navigation-review");
+        w.mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: header.x,
+                row: header.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(w.reviewing && w.acknowledgement.is_empty());
+    }
+    #[test]
+    fn navigation_paging_follows_focus_and_scrolling_recovers_from_the_end() {
+        let (_home, mut app, mut w) = fixture();
+        w.history = (0..25)
+            .map(|n| Session {
+                state: format!("Session {n}: {}", "measured result ".repeat(150)),
+                ..Default::default()
+            })
+            .collect();
+        w.navigate(Screen::History);
+        screen_text(&app, &w, 120, 30, "navigation-history");
+        press(&mut w, &mut app, KeyCode::PageDown);
+        assert!(w.history_cursor > 1 && w.history_cursor < 24);
+        assert_eq!(w.detail_scroll, 0);
+        press(&mut w, &mut app, KeyCode::End);
+        assert_eq!(w.history_cursor, 24);
+        press(&mut w, &mut app, KeyCode::Home);
+        assert_eq!(w.history_cursor, 0);
+        press(&mut w, &mut app, KeyCode::Enter);
+        screen_text(&app, &w, 120, 30, "navigation-history-details");
+        let last = w.detail_max_scroll.get();
+        assert!(last > 5 && last < u16::MAX);
+        press(&mut w, &mut app, KeyCode::End);
+        for _ in 0..10 {
+            press(&mut w, &mut app, KeyCode::PageDown);
+        }
+        press(&mut w, &mut app, KeyCode::Up);
+        assert_eq!(
+            w.detail_scroll,
+            last - 1,
+            "Up moves immediately even after overscrolling"
+        );
+        assert_eq!(w.history_cursor, 0);
+        press(&mut w, &mut app, KeyCode::Home);
+        assert_eq!(w.detail_scroll, 0);
+    }
+    #[test]
+    fn navigation_palette_mouse_selection_and_wheel_outside_panels() {
+        let (_home, mut app, mut w) = fixture();
+        screen_text(&app, &w, 120, 30, "navigation-wheel");
+        let original = w.cursor;
+        w.mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 10,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(w.cursor, original);
+        assert!(!w.detail);
+        press(&mut w, &mut app, KeyCode::Char(':'));
+        screen_text(&app, &w, 120, 30, "navigation-palette");
+        let index = palette_matches("")
+            .iter()
+            .position(|(key, _, _)| *key == "h")
+            .unwrap();
+        let rect = w
+            .hits
+            .borrow()
+            .iter()
+            .find_map(|(r, c)| matches!(c, Control::PaletteRow(i) if *i == index).then_some(*r))
+            .unwrap();
+        w.mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x,
+                row: rect.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(w.palette.as_ref().unwrap().1, index);
+        press(&mut w, &mut app, KeyCode::Enter);
+        assert!(w.screen == Screen::History && w.palette.is_none());
+    }
+    #[test]
+    fn navigation_parent_keeps_child_selected_after_missing_index_finishes() {
+        let (home, mut app, mut w) = fixture();
+        let root = home.path().canonicalize().unwrap();
+        let cache = app.entries[0].spec.path.canonicalize().unwrap();
+        let child = cache.join("small-child");
+        fs::create_dir(&child).unwrap();
+        fs::write(child.join("note.txt"), "small").unwrap();
+        fs::write(cache.join("large-file.bin"), vec![1; 16384]).unwrap();
+        let mut inventory = StorageInventory::scan(&root, &root);
+        inventory.children.remove(&cache);
+        app.inventory = Some(inventory);
+        app.explorer_path = Some(child.clone());
+        w.navigate(Screen::Explore);
+        press(&mut w, &mut app, KeyCode::Left);
+        assert_eq!(app.explorer_path.as_ref(), Some(&cache));
+        assert_eq!(w.browser_pending_selection.as_ref(), Some(&child));
+        let started = Instant::now();
+        while w.measure.is_some() && started.elapsed() < Duration::from_secs(5) {
+            w.pump_measure(&mut app);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(w.measure.is_none());
+        assert_eq!(app.explorer_items()[app.explorer_cursor].path, child);
+        assert!(app.explorer_cursor > 0 && w.browser_pending_selection.is_none());
+    }
+    #[test]
+    fn navigation_process_mouse_and_resize_exit_work_without_actions() {
+        let (_home, mut app, mut w) = fixture();
+        app.processes = (0..3)
+            .map(|i| ProcessEntry {
+                pid: 70000 + i,
+                parent_pid: 1,
+                uid: 501,
+                state: "S".into(),
+                elapsed: "01:00".into(),
+                cpu_percent: "0".into(),
+                command: format!("Example {i}"),
+                rss_kb: None,
+                system_owned: false,
+                health: ProcessHealth::Running,
+                signalable: false,
+                signal_block_reason: Some("test fixture".into()),
+                outcome: None,
+                start_time: "start".into(),
+            })
+            .collect();
+        press(&mut w, &mut app, KeyCode::Char('P'));
+        screen_text(&app, &w, 120, 30, "navigation-processes");
+        let row = app
+            .hit_regions
+            .borrow()
+            .iter()
+            .find_map(|(r, h)| matches!(h, HitTarget::Process(1)).then_some(*r))
+            .unwrap();
+        w.mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: row.x,
+                row: row.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.process_cursor, 1);
+        w.mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: row.x,
+                row: row.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.process_cursor, 0);
+        press(&mut w, &mut app, KeyCode::End);
+        assert_eq!(app.process_cursor, 2);
+        let back = w
+            .hits
+            .borrow()
+            .iter()
+            .find_map(|(r, c)| matches!(c, Control::Key(KeyCode::Esc)).then_some(*r))
+            .unwrap();
+        w.mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: back.x,
+                row: back.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(!w.legacy && w.plan.is_empty());
+        w.reviewing = true;
+        app.terminal_width = 45;
+        app.terminal_height = 12;
+        press(&mut w, &mut app, KeyCode::Char('q'));
+        assert!(app.quit && w.acknowledgement.is_empty());
     }
     #[test]
     fn unified_screens_render_at_supported_sizes_and_export_previews() {
@@ -3807,9 +5035,13 @@ mod tests {
         let suggestion = suggestion_id(&app, &first.target).into_iter().collect();
         w.report = Some(report_for(
             &first,
-            "E2 shows most of the cache is wheels last changed months ago, and E3 found no open files. It can be rebuilt; clearing it trades disk space for a future download.",
+            "E2: Python cache contains 412 files, 1.0 GiB; 71% unchanged for over 90 days. E3: No process has files open here.",
             suggestion,
         ));
+        w.ai_framework = ai::FrameworkStatus::Available {
+            detail: String::new(),
+            diagnostics: None,
+        };
         let mut preview_case = investigation::InvestigationCase::new_developer(
             "/Users/example/Library/Caches/pip",
             w.revision,
@@ -3861,11 +5093,35 @@ mod tests {
             accounting_path: PathBuf::from("/"),
             filesystem: "synthetic".into(),
             capacity_kb: 250 * 1_048_576,
-            used_kb: 232 * 1_048_576,
+            used_kb: 202 * 1_048_576,
             free_kb: 18 * 1_048_576,
-            container_free_kb: None,
+            container_free_kb: Some(18 * 1_048_576),
             device: 1,
         });
+        // The preview uses a single coherent walk and capacity sample.
+        let inventory = app.inventory.as_mut().unwrap();
+        inventory.volume = w.volume.clone();
+        inventory.scanned_on_volume_kb = 202 * 1_048_576 - 400 * 1024;
+        inventory.scanned_kb = inventory.scanned_on_volume_kb;
+        inventory.unaccounted_kb = 400 * 1024;
+        inventory.roots = vec![StorageRoot {
+            path: "/".into(),
+            size_kb: inventory.scanned_kb,
+            device: 1,
+            scan_errors: 0,
+        }];
+        inventory.top_level = app
+            .entries
+            .iter()
+            .map(|entry| StorageItem {
+                path: entry.spec.path.clone(),
+                size_kb: entry.size_kb,
+                kind: StorageItemKind::Directory,
+                category: StorageCategory::DeveloperData,
+            })
+            .collect();
+        app.scan_root = "/".into();
+        w.rebuild(&app);
         w.metrics.pressure = Some(1);
         w.trend = VecDeque::from(vec![8, 12, 11, 22, 35, 28, 16, 12, 8, 7, 9, 10]);
         for (width, height) in [(60, 16), (80, 24), (120, 36), (160, 44)] {
@@ -3880,8 +5136,9 @@ mod tests {
             let first = (0..width)
                 .map(|x| buffer[(x, 0)].symbol())
                 .collect::<String>();
-            assert!(first.contains("Overview"));
+            assert!(first.contains("DISKRAY"));
             assert!(first.contains("History"));
+            assert!(!first.contains("Overview") && !first.contains("Explore"));
             if let Some(dir) = std::env::var_os("CARE_PREVIEW_DIR") {
                 fs::create_dir_all(&dir).unwrap();
                 fs::write(
@@ -3890,7 +5147,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            w.navigate(0);
+            w.navigate(Screen::Overview);
             w.user_moved = true;
             let reported = w
                 .report
@@ -3901,10 +5158,18 @@ mod tests {
                 .clone();
             w.cursor = w.visible().iter().position(|f| f.id == reported).unwrap();
             let overview = screen_text(&app, &w, width, height, "overview");
-            assert!(overview.contains("WHERE"), "{overview}");
+            assert!(
+                overview.contains("WHERE") || overview.contains("STORAGE"),
+                "{overview}"
+            );
             if width == 120 {
                 w.detail = true;
-                let details = screen_text(&app, &w, width, height, "details");
+                let mut details = screen_text(&app, &w, width, height, "details");
+                assert!(details.contains("HEATMAP") && details.contains("wheels"));
+                for _ in 0..8 {
+                    press(&mut w, &mut app, KeyCode::PageDown);
+                    details.push_str(&screen_text(&app, &w, width, height, "details-scrolled"));
+                }
                 let order: Vec<usize> = [
                     "AI suggests clearing",
                     "LOCAL AI",
@@ -3919,25 +5184,162 @@ mod tests {
                 })
                 .collect();
                 assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{details}");
+                w.detail_scroll = 0;
                 w.detail = false;
             }
             w.palette = Some((String::new(), 0));
             let palette = screen_text(&app, &w, width, height, "palette");
             assert!(palette.contains("COMMANDS"), "{palette}");
             w.palette = None;
-            w.navigate(0);
+            w.navigate(Screen::Overview);
             w.reviewing = true;
             terminal
                 .draw(|frame| render(frame, frame.area(), &app, &w))
                 .unwrap();
             w.reviewing = false;
-            w.navigate(2);
+            w.navigate(Screen::History);
             terminal
                 .draw(|frame| render(frame, frame.area(), &app, &w))
                 .unwrap();
-            w.navigate(0);
+            w.navigate(Screen::Overview);
         }
     }
+    #[test]
+    fn storage_balance_counts_walk_areas_once_and_keeps_filtered_space_in_the_remainder() {
+        use crate::storage::{StorageCategory, StorageRoot, VolumeStats};
+        let (_home, mut app, mut w) = fixture();
+        let gib = 1_048_576;
+        let cache_path = app.entries[0].spec.path.clone();
+        let mut nested = app.entries[0].clone();
+        nested.spec.path = cache_path.join("nested");
+        nested.size_kb = gib / 4;
+        app.entries.push(nested);
+        let item = |path: PathBuf, size_kb| StorageItem {
+            path,
+            size_kb,
+            kind: StorageItemKind::Directory,
+            category: StorageCategory::Other,
+        };
+        let mut inventory = StorageInventory::unavailable(Path::new("/"), "synthetic");
+        inventory.volume = Some(VolumeStats {
+            accounting_path: "/".into(),
+            filesystem: "fixture".into(),
+            capacity_kb: 100 * gib,
+            used_kb: 64 * gib,
+            free_kb: 36 * gib,
+            container_free_kb: Some(16 * gib),
+            device: 1,
+        });
+        inventory.scanned_on_volume_kb = 63 * gib + gib / 2;
+        inventory.scanned_kb = inventory.scanned_on_volume_kb + 10 * gib;
+        inventory.roots = vec![
+            StorageRoot {
+                path: "/".into(),
+                size_kb: inventory.scanned_on_volume_kb,
+                device: 1,
+                scan_errors: 7,
+            },
+            StorageRoot {
+                path: "/VM".into(),
+                size_kb: 10 * gib,
+                device: 2,
+                scan_errors: 0,
+            },
+        ];
+        inventory.top_level = (0..20)
+            .map(|n| item(format!("/area-{n:02}").into(), 2 * gib))
+            .collect();
+        inventory.top_level.extend([
+            item(cache_path.clone(), gib / 2),
+            item("/System/Library".into(), 17 * gib),
+            item("/VM/swap".into(), 10 * gib),
+        ]);
+        inventory.children.insert(
+            cache_path.clone(),
+            vec![item(cache_path.join("nested"), gib / 4)],
+        );
+        inventory.scan_errors = 7;
+        app.scan_root = "/".into();
+        w.volume = inventory.volume.clone();
+        app.inventory = Some(inventory);
+        w.rebuild(&app);
+        let assert_balance = |w: &Workspace| {
+            let (_, listed) = w.listed_storage();
+            let o = w.overview(&app);
+            assert!(listed <= o.measured_kb);
+            assert_eq!(
+                o.used_balance(listed)
+                    .iter()
+                    .map(|(_, kb)| *kb)
+                    .sum::<i128>(),
+                i128::from(o.used_kb)
+            );
+        };
+        assert_eq!(w.listed_storage().0, OVERVIEW_ROWS);
+        assert_balance(&w);
+        let full = screen_text(&app, &w, 120, 40, "storage-balance");
+        assert!(full.contains("Other measured files"), "{full}");
+        assert!(
+            full.contains("Unaccounted usage") && full.contains("512.0 MiB"),
+            "{full}"
+        );
+        assert!(full.contains("Other APFS volumes") && full.contains("Total used"));
+        assert!(
+            app.map_paths
+                .borrow()
+                .iter()
+                .any(|path| path == Path::new("/System/Library")),
+            "the macOS aggregate maps its real constituent paths"
+        );
+        for (width, height) in [(60, 16), (80, 24)] {
+            let text = screen_text(&app, &w, width, height, "storage-balance-compact");
+            assert!(
+                text.contains("Rest of used") && text.contains("Total used"),
+                "{text}"
+            );
+            assert!(text.contains("Ask AI ›"));
+        }
+        w.show_all = true;
+        assert_eq!(w.listed_storage().0, 22);
+        let cached = w
+            .visible()
+            .into_iter()
+            .find(|f| f.id == format!("path:{}", cache_path.display()))
+            .unwrap();
+        assert_eq!(
+            cached.size_kb,
+            gib / 2,
+            "list sizes come from the same walk, not the separate cleanup estimate"
+        );
+        assert!(
+            !w.visible()
+                .iter()
+                .any(|f| f.id.contains("/nested") || f.id.contains("/VM/"))
+        );
+        assert_balance(&w);
+        let before = w.listed_storage().1;
+        w.kept.insert("path:/area-00".into());
+        assert_eq!(w.listed_storage().1, before - 2 * gib);
+        assert_balance(&w);
+        let listed_before_refresh = w.listed_storage();
+        // Explorer refreshes may contain larger, newer children. They must not
+        // enter a balance made against the earlier whole-volume capacity sample.
+        app.inventory.as_mut().unwrap().children.insert(
+            "/area-01".into(),
+            vec![item("/area-01/new-child".into(), 7 * gib)],
+        );
+        app.entries[0].size_kb = 4 * gib;
+        w.rebuild(&app);
+        assert_eq!(w.listed_storage(), listed_before_refresh);
+        assert!(!w.visible().iter().any(|f| f.id.contains("new-child")));
+        w.coverage = true;
+        let totals = screen_text(&app, &w, 120, 40, "storage-totals");
+        assert!(
+            totals.contains("STORAGE BALANCE") && totals.contains("exact KiB"),
+            "{totals}"
+        );
+    }
+
     #[test]
     fn overview_ranks_disk_items_by_size_with_plain_verdicts() {
         let (_home, mut app, mut w) = fixture();
@@ -3946,7 +5348,7 @@ mod tests {
             "Overview is the landing screen"
         );
         let text = screen_text(&app, &w, 80, 24, "overview");
-        assert!(text.contains("Overview") && text.contains("Explore") && text.contains("History"));
+        assert!(text.contains("DETAILS") && text.contains("History"));
         assert!(text.contains("Python cache"), "{text}");
         assert!(text.contains("Safe to clear"), "{text}");
         assert!(text.contains("Quick wins"), "{text}");
@@ -3957,18 +5359,18 @@ mod tests {
         assert!(text.contains("✓ In plan"), "{text}");
         press(&mut w, &mut app, KeyCode::Char(' '));
         assert!(w.plan.is_empty());
-        // Enter explains in place; Esc returns to the same row.
-        press(&mut w, &mut app, KeyCode::Enter);
+        // Tab focuses details in place; Esc returns to the same row.
+        press(&mut w, &mut app, KeyCode::Tab);
         assert!(w.screen == Screen::Overview && w.detail);
         press(&mut w, &mut app, KeyCode::Esc);
         assert!(!w.detail && w.cursor == 0);
         for (key, screen) in [
-            (KeyCode::Char('3'), Screen::History),
-            (KeyCode::Char('2'), Screen::Explore),
-            (KeyCode::Tab, Screen::History),
-            (KeyCode::Tab, Screen::Overview),
-            (KeyCode::BackTab, Screen::History),
-            (KeyCode::Char('1'), Screen::Overview),
+            (KeyCode::Char('h'), Screen::History),
+            (KeyCode::Char('b'), Screen::Explore),
+            (KeyCode::Tab, Screen::Explore),
+            (KeyCode::Tab, Screen::Explore),
+            (KeyCode::BackTab, Screen::Explore),
+            (KeyCode::Char('g'), Screen::Overview),
         ] {
             press(&mut w, &mut app, key);
             assert!(w.screen == screen);
@@ -3997,7 +5399,7 @@ mod tests {
         assert_eq!(palette_matches("hist").len(), 1);
         let text = screen_text(&app, &w, 80, 24, "palette");
         assert!(text.contains("COMMANDS"), "{text}");
-        assert!(text.contains("Go to History"));
+        assert!(text.contains("Open saved scan history"));
         press(&mut w, &mut app, KeyCode::Enter);
         assert!(w.palette.is_none());
         assert!(w.screen == Screen::History);
@@ -4028,13 +5430,13 @@ mod tests {
         assert_eq!(w.asking.as_deref(), Some(follow[1]));
     }
     #[test]
-    fn review_groups_actions_and_totals_the_space() {
+    fn review_names_the_action_and_reclaim_total() {
         let (_home, mut app, mut w) = fixture();
         press(&mut w, &mut app, KeyCode::Char(' '));
         press(&mut w, &mut app, KeyCode::Char('p'));
         let text = screen_text(&app, &w, 100, 30, "review");
-        assert!(text.contains("CLEAR REBUILDABLE CONTENTS"), "{text}");
-        assert!(text.contains("up to 1.0 GiB to reclaim"), "{text}");
+        assert!(text.contains("Clear Python cache"), "{text}");
+        assert!(text.contains("1.0 GiB max"), "{text}");
         assert!(text.contains("Type CLEAN"));
     }
     #[test]
@@ -4098,19 +5500,37 @@ mod tests {
         }));
     }
     #[test]
-    fn ask_box_is_a_bounded_modal_that_starts_a_question_case() {
+    fn ask_composer_is_visible_by_default_and_starts_a_bounded_question_case() {
         let (_home, mut app, mut w) = fixture();
-        press(&mut w, &mut app, KeyCode::Char('/'));
-        assert!(w.asking.is_none(), "Ask needs a ready model");
-        assert!(w.note.as_deref().unwrap().contains("Apple Intelligence"));
         w.ai_framework = ai::FrameworkStatus::Available {
             detail: String::new(),
+            diagnostics: None,
         };
         for width in [60, 80, 120] {
+            app.terminal_width = width;
+            let text = screen_text(&app, &w, width, 16, "ask-idle");
+            assert!(text.contains("Ask AI ›"), "{width}");
+            assert!(text.contains("DETAILS"), "details stay visible at {width}");
+            assert!(w.asking.is_none(), "browsing has initial keyboard focus");
+            let hits = w.hits.borrow();
+            let composer = hits
+                .iter()
+                .rev()
+                .find(|(_, c)| matches!(c, Control::Ask))
+                .unwrap()
+                .0;
+            assert_eq!((composer.x, composer.width), (0, width));
+            for (pane, control) in hits.iter() {
+                if matches!(control, Control::Pane(_)) {
+                    assert_eq!(pane.bottom(), composer.y, "Ask belongs below both panels");
+                }
+            }
+            drop(hits);
             press(&mut w, &mut app, KeyCode::Char('/'));
             assert_eq!(w.asking.as_deref(), Some(""));
             let text = screen_text(&app, &w, width, 24, "ask");
-            assert!(text.contains("ASK ABOUT THIS MAC"), "{width}");
+            assert!(text.contains("Ask AI ›"), "{width}");
+            assert!(text.contains("DETAILS"), "{width}");
             press(&mut w, &mut app, KeyCode::Esc);
             assert!(w.asking.is_none());
         }
@@ -4145,6 +5565,179 @@ mod tests {
         assert!(text.contains("QUESTION"));
         press(&mut w, &mut app, KeyCode::Esc);
         assert!(!w.answer_open);
+        assert!(screen_text(&app, &w, 80, 24, "ask-after-answer").contains("Ask AI ›"));
+    }
+    #[test]
+    fn unavailable_ai_keeps_drafts_and_refreshes_without_submitting() {
+        let (_home, mut app, mut w) = fixture();
+        w.ai_framework = ai::FrameworkStatus::Unavailable {
+            detail: "Model not ready".into(),
+            diagnostics: None,
+        };
+        let (sender, receiver) = mpsc::channel();
+        w.ai_framework_work = Some(receiver);
+        press(&mut w, &mut app, KeyCode::Char('/'));
+        for c in "What grew?".chars() {
+            press(&mut w, &mut app, KeyCode::Char(c));
+        }
+        press(&mut w, &mut app, KeyCode::Enter);
+        assert_eq!(w.asking.as_deref(), Some("What grew?"));
+        assert!(w.agent.is_none());
+        assert!(w.note.is_none());
+        sender
+            .send(ai::FrameworkStatus::Unavailable {
+                detail: "Still unavailable".into(),
+                diagnostics: None,
+            })
+            .unwrap();
+        w.poll_ai_availability();
+        assert!(w.ai_framework_work.is_none());
+        let retry = w.ai_framework_retry_at.unwrap();
+        assert!(retry > Instant::now());
+        w.poll_ai_availability();
+        assert!(
+            w.ai_framework_work.is_none(),
+            "wait between background retries"
+        );
+        let text = screen_text(&app, &w, 60, 16, "ask-unavailable");
+        assert!(text.contains("What grew?"));
+        assert!(text.contains("F2 Settings"));
+        press(&mut w, &mut app, KeyCode::Esc);
+        assert!(w.asking.is_none());
+        assert_eq!(w.ask_draft, "What grew?");
+        let text = screen_text(&app, &w, 60, 16, "ask-draft");
+        assert!(text.contains("What grew?"));
+
+        // A new check can discover readiness without restarting the app.
+        w.ai_framework_retry_at = Some(Instant::now());
+        w.poll_ai_availability();
+        assert!(w.ai_framework_work.is_some());
+        assert!(w.ai_framework_retry_at.is_none());
+        let (sender, receiver) = mpsc::channel();
+        w.ai_framework_work = Some(receiver);
+        press(&mut w, &mut app, KeyCode::Char('/'));
+        assert_eq!(w.asking.as_deref(), Some("What grew?"));
+        sender
+            .send(ai::FrameworkStatus::Available {
+                detail: String::new(),
+                diagnostics: None,
+            })
+            .unwrap();
+        w.poll_ai_availability();
+        assert!(w.model_ready());
+        assert!(w.ai_framework_work.is_none());
+        assert!(w.ai_framework_retry_at.is_none());
+        assert!(w.agent.is_none(), "readiness does not send the draft");
+        assert_eq!(w.asking.as_deref(), Some("What grew?"));
+    }
+    #[test]
+    fn disconnected_availability_check_schedules_a_retry() {
+        let mut w = Workspace::empty();
+        let (sender, receiver) = mpsc::channel();
+        w.ai_framework_work = Some(receiver);
+        drop(sender);
+        w.poll_ai_availability();
+        assert!(matches!(
+            w.ai_framework,
+            ai::FrameworkStatus::Unavailable { .. }
+        ));
+        assert!(w.ai_framework_work.is_none());
+        assert!(w.ai_framework_retry_at.is_some());
+    }
+    #[test]
+    fn ai_status_shows_supported_language_and_readiness_blocker_without_losing_drafts() {
+        let (_home, mut app, mut w) = fixture();
+        let (_sender, receiver) = mpsc::channel();
+        w.ai_framework_work = Some(receiver);
+        w.ai_framework = ai::FrameworkStatus::Unavailable {
+            detail: "Mac/Siri languages differ: en-CA / en-US. Apple model is not ready.".into(),
+            diagnostics: Some(ai::ModelDiagnostics {
+                device_language: "en-CA".into(),
+                siri_language: Some("en-US".into()),
+                locale_supported: true,
+                context_size: 4096,
+                supported_languages: vec!["en-Latn-US".into()],
+            }),
+        };
+        for width in [60, 80, 120] {
+            let text = screen_text(&app, &w, width, 24, "ai-blocker");
+            assert!(text.contains("English (US) required"), "{text}");
+            assert!(text.contains("F3 AI") && text.contains("F2 Settings"));
+        }
+        w.asking = Some("What grew?".into());
+        press(&mut w, &mut app, KeyCode::F(3));
+        assert!(w.ai_status_open);
+        assert_eq!(w.ask_draft, "What grew?");
+        assert!(w.asking.is_none());
+        let text = screen_text(&app, &w, 120, 36, "ai-status");
+        assert!(text.contains("CURRENT AI REQUIREMENT"), "{text}");
+        assert!(
+            text.contains("both Mac and Siri to English (United States)"),
+            "{text}"
+        );
+        assert!(text.contains("Mac/Siri languages differ"), "{text}");
+        assert!(
+            text.contains("auto-detected") && text.contains("Automatic"),
+            "{text}"
+        );
+        assert!(
+            text.contains("supported by this model") && text.contains("Siri: en-US"),
+            "{text}"
+        );
+        press(&mut w, &mut app, KeyCode::Char(' '));
+        assert!(w.plan.is_empty());
+        press(&mut w, &mut app, KeyCode::Esc);
+        assert!(!w.ai_status_open);
+        press(&mut w, &mut app, KeyCode::Char('/'));
+        assert_eq!(w.asking.as_deref(), Some("What grew?"));
+    }
+    #[test]
+    fn clicking_ask_focuses_the_composer_and_clicking_a_row_keeps_the_draft() {
+        let (_home, mut app, mut w) = fixture();
+        w.ai_framework = ai::FrameworkStatus::Available {
+            detail: String::new(),
+            diagnostics: None,
+        };
+        screen_text(&app, &w, 120, 30, "ask-click");
+        let composer = w
+            .hits
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(_, control)| matches!(control, Control::Ask))
+            .unwrap()
+            .0;
+        let click = |rect: Rect| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + 1,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        w.mouse(&mut app, click(composer));
+        assert_eq!(w.asking.as_deref(), Some(""));
+        press(&mut w, &mut app, KeyCode::Char('q'));
+        w.mouse(&mut app, click(composer));
+        assert_eq!(
+            w.asking.as_deref(),
+            Some("q"),
+            "clicking must not type a slash"
+        );
+        let row = w
+            .hits
+            .borrow()
+            .iter()
+            .find(|(_, control)| matches!(control, Control::Row(_)))
+            .unwrap()
+            .0;
+        w.mouse(&mut app, click(row));
+        assert!(w.asking.is_none());
+        assert_eq!(w.ask_draft, "q");
+        assert!(!w.detail);
+        w.mouse(&mut app, click(composer));
+        assert_eq!(w.asking.as_deref(), Some("q"));
+        press(&mut w, &mut app, KeyCode::Tab);
+        assert!(w.asking.is_none());
+        assert_eq!(w.ask_draft, "q");
     }
     #[test]
     fn ai_suggestions_are_badges_that_never_change_the_plan() {
@@ -4196,6 +5789,7 @@ mod tests {
         add_key_area(&mut w, home.path());
         w.ai_framework = ai::FrameworkStatus::Available {
             detail: String::new(),
+            diagnostics: None,
         };
         w.metrics.pressure = Some(1);
         w.maybe_start_automatic(&app);
@@ -4260,6 +5854,7 @@ mod tests {
         w.auto_agent_started = true;
         w.ai_framework = ai::FrameworkStatus::Available {
             detail: String::new(),
+            diagnostics: None,
         };
         w.apply_triage(
             ai::Triage {

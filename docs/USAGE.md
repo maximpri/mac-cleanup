@@ -19,13 +19,17 @@ top-level folder in your home except media, apps, and sync folders; set
 
 ## The interactive workspace
 
-There are three screens: **Overview · Explore · History**. `1`–`3` or `Tab`
-switch between them, and `:` opens a searchable list of every command.
+The workspace has two persistent panels. The left lists storage items, folders,
+or saved scans; the right explains the selection and holds investigations and
+plan review. Ask AI spans the full width below both panels. `F3` shows the
+automatically detected Apple model and any readiness blocker.
+`Tab` moves keyboard focus between the panels. `:` opens every command.
 
-**Overview** answers "where did my space go?": a capacity bar (folders the scan
-measured, space it could not see, macOS and other volumes, free), then one line
-per item, largest first, each with a plain verdict such as *Safe to clear*,
-*In use by npx*, *App data · review*, or *Your files*. `Enter` explains an item,
+**Storage findings** (`g`) answer "where did my space go?": a capacity bar shows
+measured folders, unseen space, macOS and other volumes, and free space. Items
+appear largest first, with size and status on separate lines. Each has a plain
+verdict such as *Safe to clear*,
+*In use by npx*, *App data · review*, or *Your files*. `Enter` / `Right` opens folder contents,
 `Space` adds it to your plan, `a` adds every quick win, and `p` reviews the
 plan. Unreadable locations, small items, and ordinary running processes are
 left out until you press `f`.
@@ -35,12 +39,20 @@ known cleanup targets, temporary retention, incomplete downloads, and the full
 storage inventory. A large scan takes time; an unfinished or unreadable scan is
 not a complete measurement. `v` shows coverage and unexplained accounting.
 
-**Explore** browses folders largest first. `Enter` opens children; `Left` or
-`Backspace` returns. The right pane shows the selected folder's nested storage
+**Browse folders** (`b`, or `e` for the selected item) lists children largest first. `Enter` opens children; `Left` or
+`Backspace` goes to the containing folder. `Esc` closes details, then returns to
+the previous list and selection. The right pane shows the selected folder's nested storage
 map: rectangle area represents allocated space, and colors distinguish branches,
 not cleanup safety. Tiny items remain available in the list. Click a rectangle
-to explore its target. `i` measures the selected folder again; `o` reveals it
-in Finder. No separate terminal commands are required.
+to explore its target. `i` measures the current folder again; `o` reveals it
+in Finder. Missing folder measurements start automatically, with progress and
+explicit partial totals. `Space` queues cleanup for an exact supported rule.
+`t` queues a personal file/folder (or an individual user cache) for **Move to
+Trash**. `p` reviews it, then type `TRASH` to confirm. This is a separate plan
+from cache cleanup, and **does not free space until Trash is emptied**. Restore
+an item by dragging it out of Trash in Finder; Put Back may be unavailable.
+Protected/system locations, redirects, and whitelist entries remain blocked.
+No separate terminal commands are required.
 
 **Review plan** lists exact cleanup paths, process identities and signals, and
 relocation destinations with tradeoffs. `Space` adds/removes a finding's action;
@@ -52,7 +64,7 @@ actions are conservatively skipped. Every engine revalidates its targets.
 `s` to acknowledge process-signal consequences and `m` to acknowledge relocation
 and symlink consequences before `APPLY` is accepted.
 
-**History** keeps assessment records and per-action outcomes on this Mac in
+**History** (`h`) keeps assessment records and per-action outcomes on this Mac in
 `~/Library/Application Support/diskray/sessions`, with private directory/file
 permissions, a 30-day retention window, and a 50 MiB cap. It records before/after
 CPU, swap-rate, per-device activity, pressure, and free-space observations, plus
@@ -65,10 +77,34 @@ observations appears beside the raw results; it cannot add actions or targets.
 
 ## Keys
 
-The interface supports terminals from 60 columns × 16 rows. Narrow windows use
-a full-width list; Enter opens details, and Esc returns. Wide windows show
-evidence beside the list. An explanation starts with one plain sentence about what was measured,
-then what the checks found, what you can do, and how it was checked. Folder bars and maps show measured size, not waste.
+The interface supports terminals from 60 columns × 16 rows. Both panels stay
+visible at every supported size. `Tab` focuses the explanation;
+`Esc` returns focus to the list. The mouse wheel scrolls the panel under it.
+`PgUp` / `PgDn` pages the focused list or scrolls details; `Home` / `End` moves
+to its beginning or end. Clicking a heatmap preserves the correct return path.
+An explanation starts with what was measured, then what the checks found,
+what you can do, and how it was checked. Folder bars and maps show measured size.
+The right panel also shows a **contents heatmap** for the selected storage item.
+Click a folder rectangle to browse it or a file rectangle to inspect its details.
+The map follows selection, keeps Ask visible, and uses rectangle area for size.
+
+The storage list has a **SPACE BALANCE**: listed areas + other measured files +
+unaccounted usage + other APFS volumes = total used. Rows come from one folder
+walk and do not double-count nested cleanup targets. macOS-managed files are
+included in measured areas. Any measurement excess appears as a negative
+correction; it is not reclaimable space. `v` shows exact KiB totals and scan
+coverage. Small terminals show a compact subtotal with the full balance on `v`.
+
+**Ask AI** stays visible below both panels. Press `/` or click it to type,
+then `Enter` to ask. `Esc` or `Tab` returns to browsing and preserves your draft.
+**For now, local AI requires both Mac and Siri to use English (United States)**
+(`en-US`), with Apple Intelligence enabled and its model setup complete.
+`F3` shows this requirement alongside the detected language settings and model status.
+You can draft a question even while Apple Intelligence is unavailable; Diskray
+rechecks every 30 seconds and on Enter. `F2` opens System Settings. Questions
+are sent only when you press Enter with AI ready.
+If macOS requests a restart after a language change, save your work and restart
+before checking again. See [AI setup and live verification](AI.md).
 
 A persistent progress band shows **Checks → Folder map → Review**, with actual
 completed checks, scanned items, unreadable entries, and elapsed time. Unknown
@@ -81,23 +117,27 @@ text labels; `--no-color` is supported.
 
 | Key | Action |
 | --- | --- |
-| `1`–`3`, `Tab` / `Shift+Tab` | Overview · Explore · History. |
+| `Tab` / `Shift+Tab` | Switch focus between the list and details. |
+| `g` / `b` / `h` | Storage findings / browse folders / saved scans. |
 | `:` | Command palette: search every action and run it. |
 | Arrow keys | Choose a row; scroll an expanded explanation. |
 | `Enter` | Open folder children, finding details, or session results. |
-| `Space` | Add/remove the selected item's action. |
+| `Space` | Add/remove the exact selected cleanup action. |
+| `t` | Queue/unqueue a personally selected item for Trash review. |
 | `a` | Add every quick win to the plan. |
 | `p` | Review the exact action plan. |
-| `i` | Investigate finding with local AI and read-only tools; in Explore, measure selected folder. |
-| `/` | Ask local AI one question about this Mac (read-only tools). |
+| `i` | Investigate finding with local AI and read-only tools; while browsing, measure the selected folder. |
+| `/` | Focus the persistent Ask AI input (read-only investigation). |
+| `F2` | Open System Settings, including while typing in Ask. |
 | `e` / `d` | Explore selected finding's contents / expand evidence. |
 | `P` | Inspect current-account processes. |
 | `m` | Plan relocation to an external volume. |
 | `f` / `K` | All/fewer items; hide the selected item until the next scan. |
-| `v` | Show/hide scan coverage. |
+| `v` | Show/hide exact storage totals and scan coverage. |
 | `o` | Reveal selected path in Finder. |
 | `r` | Recheck storage and activity. |
-| `PgUp` / `PgDn` | Scroll evidence or review details. |
+| `PgUp` / `PgDn` | Page the focused list or scroll details. |
+| `Home` / `End` | Go to the beginning/end of the focused list or details. |
 | `M` / `A` | Toggle motion / open System Settings for Apple Intelligence. |
 | `a` (approval page) | Approve a pending fixed administrator-assisted diagnostic. |
 | `R` | Enable/disable saved fixed-catalog online research consent. |

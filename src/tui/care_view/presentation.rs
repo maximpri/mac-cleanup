@@ -15,28 +15,49 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, area: Rect, app: &App, w: &W
         area,
     );
     let notice_height = if w.note.is_some() && !w.help { 2 } else { 0 };
+    let show_ask = !w.help
+        && !w.legacy
+        && w.work.is_none()
+        && !w.clearing_history
+        && !w.reviewing
+        && !w.awaiting_approval();
     let regions = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(5),
+        Constraint::Length(if show_ask { 4 } else { 0 }),
         Constraint::Length(notice_height),
         Constraint::Length(2),
     ])
     .split(area);
-    render_navigation(frame, regions[0], app, w);
+    render_header(frame, regions[0], app, w);
+    // Header shortcuts must not type letters into a confirmation or palette.
+    // Those views expose their own controls in the footer.
+    if w.help
+        || w.legacy
+        || w.work.is_some()
+        || w.reviewing
+        || w.clearing_history
+        || w.palette.is_some()
+        || w.awaiting_approval()
+    {
+        w.hits.borrow_mut().clear();
+    }
     render_status(frame, regions[1], app, w);
-    let body = regions[2];
+    let panes = Layout::horizontal([Constraint::Percentage(44), Constraint::Percentage(56)])
+        .spacing(1)
+        .split(regions[2]);
+    if w.legacy && app.phase == Phase::Processes {
+        render_process_table(frame, panes[0], app);
+    } else {
+        render_list(frame, panes[0], app, w);
+    }
+    let body = panes[1];
     if w.help {
         render_help(frame, body, app, w);
     } else if w.legacy {
         match app.phase {
-            Phase::Processes => {
-                let split =
-                    Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
-                        .split(body);
-                render_process_table(frame, split[0], app);
-                render_process_details(frame, split[1], app);
-            }
+            Phase::Processes => render_process_details(frame, body, app),
             Phase::RelocationSources => render_relocation_sources(frame, body, app),
             Phase::RelocationDestination => render_relocation_destination(frame, body, app),
             Phase::RelocationPlanning | Phase::Relocating => {
@@ -49,18 +70,6 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, area: Rect, app: &App, w: &W
         }
     } else if w.work.is_some() {
         render_running(frame, body, app, w);
-    } else if let Some(text) = &w.asking {
-        text_panel(
-            frame,
-            body,
-            app,
-            " ASK ABOUT THIS MAC · Enter asks · Esc cancels ",
-            format!(
-                "Ask one question. Local AI answers on this Mac using read-only tools and the measurements shown here. It cannot change files, run commands, or add anything to your plan.\n\n› {}▏\n\nFor example: Why is my disk almost full? · What is using memory right now? · Which caches can I clear safely?",
-                text
-            ),
-            0,
-        );
     } else if w.clearing_history {
         text_panel(
             frame,
@@ -76,7 +85,7 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, area: Rect, app: &App, w: &W
     } else if w.reviewing {
         render_review(frame, body, app, w);
     } else if let Some(label) = w.agent.as_ref().and_then(|run| run.approval_label()) {
-        text_panel(
+        w.detail_max_scroll.set(text_panel(
             frame,
             body,
             app,
@@ -90,26 +99,22 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, area: Rect, app: &App, w: &W
                     .unwrap_or_else(|| "Current investigation".into()),
             ),
             w.detail_scroll,
-        );
+        ));
+    } else if w.ai_status_open {
+        render_ai_status(frame, body, app, w);
     } else if w.answer_open {
         render_answer(frame, body, app, w);
-    } else if w.detail || w.coverage {
-        render_evidence(frame, body, app, w);
-    } else if w.screen == Screen::Overview && body.width >= SPLIT_WIDTH {
-        let split = Layout::horizontal([Constraint::Percentage(56), Constraint::Percentage(44)])
-            .spacing(1)
-            .split(body);
-        render_list(frame, split[0], app, w);
-        render_evidence(frame, split[1], app, w);
-    } else if w.screen == Screen::Overview || body.width < 100 {
-        render_list(frame, body, app, w);
     } else {
-        let split = Layout::horizontal([Constraint::Percentage(43), Constraint::Percentage(57)])
-            .spacing(1)
-            .split(body);
-        render_list(frame, split[0], app, w);
-        render_evidence(frame, split[1], app, w);
+        render_evidence(frame, body, app, w);
     }
+    if show_ask {
+        render_ask(frame, regions[3], app, w);
+    }
+    // Broad pane targets come after their controls so rows and buttons win.
+    w.hits.borrow_mut().extend([
+        (panes[0], Control::Pane(false)),
+        (panes[1], Control::Pane(true)),
+    ]);
     if notice_height > 0 {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -118,77 +123,260 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, area: Rect, app: &App, w: &W
             ]))
             .style(Style::default().fg(app.color(AMBER)))
             .wrap(Wrap { trim: false }),
-            regions[3],
+            regions[4],
         );
     }
-    render_footer(frame, regions[4], app, w);
+    render_footer(frame, regions[5], app, w);
     if w.palette.is_some() {
-        render_palette(frame, body, app, w);
+        w.hits.borrow_mut().retain(|(_, control)| {
+            matches!(
+                control,
+                Control::Key(KeyCode::Enter | KeyCode::Esc | KeyCode::Up | KeyCode::Down)
+            )
+        });
+        app.hit_regions.borrow_mut().clear();
+        app.map_paths.borrow_mut().clear();
+        render_palette(frame, regions[2], app, w);
     }
 }
 
-fn render_navigation(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
-    let compact = area.width < 90;
-    let plan = if compact {
-        format!(" Plan ({}) [p]", w.plan.len())
+/// A shared composer below both panes; the question can concern the whole Mac.
+fn render_ask(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
+    let active = w.asking.is_some();
+    let color = app.color(if active { BLUE } else { FAINT });
+    let block = Block::bordered()
+        .border_style(Style::default().fg(color))
+        .style(Style::default().bg(app.color(SURFACE)))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let draft = w.asking.as_deref().unwrap_or(&w.ask_draft);
+    let placeholder = draft.is_empty();
+    let input = if placeholder {
+        "Ask about this Mac…"
     } else {
-        format!(" Review plan ({}) [p]", w.plan.len())
+        draft
     };
-    let brand = if compact { 3 } else { 10 };
-    let tabs = 11 + 10 + 10;
-    let free = w.volume.as_ref().map(|v| {
-        let ratio = v.disk_used_kb() as f64 / v.capacity_kb.max(1) as f64;
-        (
-            format!("{} free  ", format_kb(v.disk_free_kb())),
-            disk_usage_color(app, ratio),
-        )
-    });
-    let free_width = free
-        .as_ref()
-        .map(|(text, _)| text.chars().count() as u16)
-        .filter(|width| brand + tabs + width + plan.chars().count() as u16 <= area.width)
-        .unwrap_or(0);
+    let prefix = "Ask AI › ";
+    let room = inner.width.saturating_sub(prefix.chars().count() as u16) as usize;
+    let text = if active {
+        format!("{}▏", truncate_middle(input, room.saturating_sub(1)))
+    } else {
+        truncate_end(input, room)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(prefix, Style::default().fg(app.color(BLUE)).bold()),
+            Span::styled(
+                text,
+                Style::default().fg(app.color(if placeholder { MUTED } else { INK })),
+            ),
+        ])),
+        inner,
+    );
+    let (status, status_color) = match &w.ai_framework {
+        ai::FrameworkStatus::Detecting => ("Checking Apple Intelligence…".into(), MUTED),
+        ai::FrameworkStatus::Available { .. } => ("Apple Intelligence · on-device".into(), MUTED),
+        ai::FrameworkStatus::Missing { .. } => (
+            "AI helper missing · install the release bundle".into(),
+            AMBER,
+        ),
+        ai::FrameworkStatus::Unavailable { detail, .. } => (
+            format!(
+                "English (US) required for now · {}",
+                ai::display_text(detail)
+            ),
+            AMBER,
+        ),
+    };
+    let settings = matches!(w.ai_framework, ai::FrameworkStatus::Unavailable { .. });
+    let hint = if settings {
+        if inner.width >= 86 && w.ai_framework_work.is_some() {
+            "Checking… · F3 AI · F2 Settings"
+        } else if inner.width >= 86 && active {
+            "Enter retry · F3 AI · F2 Settings"
+        } else {
+            "F3 AI · F2 Settings"
+        }
+    } else if w.ai_framework_work.is_some() {
+        "F3 AI"
+    } else if !w.model_ready() {
+        if active {
+            "Enter retry · F3 AI"
+        } else {
+            "/ retry · F3 AI"
+        }
+    } else if active {
+        "Enter ask · F3 AI"
+    } else {
+        "/ type · F3 AI"
+    };
+    if inner.height >= 2 {
+        // Keep the recovery shortcut visible even when the reason is long.
+        let row = Rect::new(inner.x, inner.y + 1, inner.width, 1);
+        let parts = Layout::horizontal([
+            Constraint::Min(0),
+            Constraint::Length(hint.chars().count() as u16),
+        ])
+        .spacing(2)
+        .split(row);
+        frame.render_widget(
+            Paragraph::new(truncate_end(&status, parts[0].width as usize))
+                .style(Style::default().fg(app.color(status_color))),
+            parts[0],
+        );
+        frame.render_widget(
+            Paragraph::new(hint).style(Style::default().fg(app.color(MUTED))),
+            parts[1],
+        );
+        if let Some(offset) = hint.find("F3 AI") {
+            let x = parts[1].x + hint[..offset].chars().count() as u16;
+            w.hits
+                .borrow_mut()
+                .push((Rect::new(x, row.y, 5, 1), Control::Key(KeyCode::F(3))));
+        }
+        if settings {
+            let mut target = parts[1];
+            target.x = target.right().saturating_sub(11);
+            target.width = 11;
+            w.hits
+                .borrow_mut()
+                .push((target, Control::Key(KeyCode::F(2))));
+        }
+    }
+    w.hits.borrow_mut().push((area, Control::Ask));
+}
+
+fn render_ai_status(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
+    let mut text = format!(
+        "CURRENT AI REQUIREMENT\nFor now, set both Mac and Siri to English (United States), en-US.\nApple Intelligence must be enabled and its model setup complete.\n\nApple on-device model · Automatic\n\n{}\n",
+        w.ai_framework.description(),
+    );
+    if let Some(diagnostics) = w.ai_framework.diagnostics() {
+        text.push_str(&format!(
+            "\nLANGUAGE SUPPORT\nMac: {} · {}\nSiri: {}\n",
+            ai::display_text(&diagnostics.device_language),
+            if diagnostics.locale_supported {
+                "supported by this model"
+            } else {
+                "not supported by this model"
+            },
+            diagnostics
+                .siri_language
+                .as_deref()
+                .map(ai::display_text)
+                .unwrap_or_else(|| "not reported".into()),
+        ));
+        if !w.model_ready() {
+            if diagnostics.locale_supported
+                && diagnostics.siri_language.as_deref()
+                    == Some(diagnostics.device_language.as_str())
+            {
+                text.push_str("\nYour detected languages match and Apple's framework lists them as supported. Diskray's current setup requirement remains English (United States) for both Mac and Siri. Language support alone does not make the model ready.\n\nIF MODEL SETUP STAYS UNAVAILABLE\n1. F2 opens Settings: use English (United States) for both Mac and Siri, then allow Apple's model setup to finish.\n2. If setup remains stuck, save your work and restart the Mac, then check again.\n3. If it still fails, check macOS updates or contact Apple Support.\n\nThe framework cannot tell Diskray whether a download is progressing or a system service has failed. Diskray cannot install or repair Apple's model assets. Automatic rechecks detect recovery; they do not repair macOS.\n");
+            } else {
+                text.push_str("\nF2 opens Settings. For now, set both Mac and Siri to English (United States), then allow Apple's model setup to finish.\n");
+            }
+        }
+        if diagnostics.context_size > 0 {
+            text.push_str(&format!(
+                "\nModel context: {} tokens\n",
+                diagnostics.context_size
+            ));
+        } else {
+            text.push_str("\nModel context: not reported while unavailable\n");
+        }
+    }
+    text.push_str("\nMODEL CHOICE\nAutomatic: macOS selects the Apple model for this Mac. No alternative general-purpose on-device model is exposed to Diskray.\n\nAll inference stays on this Mac. Your system languages stay as you set them.\n\nDiskray checks again every 30 seconds while unavailable. r checks now; your Ask draft is preserved.");
+    if let Some(diagnostics) = w.ai_framework.diagnostics() {
+        text.push_str(&format!(
+            "\n\nLanguages reported by Apple's framework (Diskray currently requires English, US):\n{}",
+            diagnostics
+                .supported_languages
+                .iter()
+                .map(|tag| ai::display_text(tag))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    w.detail_max_scroll.set(text_panel(
+        frame,
+        area,
+        app,
+        " LOCAL AI · auto-detected ",
+        text,
+        w.detail_scroll,
+    ));
+}
+
+fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
+    let plan = format!(" p Plan ({}) ", w.plan.len());
     let regions = Layout::horizontal([
-        Constraint::Length(brand),
-        Constraint::Length(11),
-        Constraint::Length(10),
         Constraint::Length(10),
         Constraint::Min(0),
-        Constraint::Length(free_width),
-        Constraint::Length(plan.chars().count() as u16 + 1),
+        Constraint::Length(8),
+        Constraint::Length(12),
+        Constraint::Length(plan.chars().count() as u16),
     ])
     .split(area);
-    frame.render_widget(
-        Paragraph::new(if compact { " D " } else { " DISKRAY" })
-            .style(Style::default().fg(app.color(INK)).bold()),
+    button(
+        frame,
         regions[0],
+        app,
+        w,
+        " DISKRAY".into(),
+        Control::Key(KeyCode::Char('g')),
+        false,
     );
-    for (i, label) in [" Overview ", " Explore ", " History "].iter().enumerate() {
-        button(
-            frame,
-            regions[i + 1],
-            app,
-            w,
-            label.to_string(),
-            Control::Nav(i),
-            w.nav == i,
-        );
-    }
-    if let Some((text, color)) = free.filter(|_| free_width > 0) {
+    if let Some(volume) = &w.volume {
+        let ratio = volume.disk_used_kb() as f64 / volume.capacity_kb.max(1) as f64;
         frame.render_widget(
-            Paragraph::new(text).style(Style::default().fg(color)),
-            regions[5],
+            Paragraph::new(format!("{} free", format_kb(volume.disk_free_kb())))
+                .style(Style::default().fg(disk_usage_color(app, ratio))),
+            regions[1],
         );
     }
     button(
         frame,
-        regions[6],
+        regions[2],
+        app,
+        w,
+        " / Ask ".into(),
+        Control::Ask,
+        w.asking.is_some() || w.answer_open,
+    );
+    button(
+        frame,
+        regions[3],
+        app,
+        w,
+        " h History ".into(),
+        Control::Key(KeyCode::Char('h')),
+        false,
+    );
+    button(
+        frame,
+        regions[4],
         app,
         w,
         plan,
         Control::Key(KeyCode::Char('p')),
         w.reviewing || !w.plan.is_empty(),
     );
+}
+
+fn list_panel<'a>(app: &App, w: &Workspace, title: impl Into<Line<'a>>) -> Block<'a> {
+    let active = !w.detail
+        && !w.ai_status_open
+        && !w.help
+        && !w.reviewing
+        && w.asking.is_none()
+        && !w.clearing_history
+        && w.work.is_none();
+    panel(app, title).border_style(Style::default().fg(app.color(if active {
+        BLUE
+    } else {
+        FAINT
+    })))
 }
 
 fn meter(ratio: f64, width: usize) -> String {
@@ -290,14 +478,11 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
     if w.metrics.pressure.is_some_and(|p| p == 2 || p == 4) {
         context.push(format!("memory {}", w.metrics.pressure_label()));
     }
-    context.push(
-        match w.ai_framework {
-            ai::FrameworkStatus::Detecting => "AI checking",
-            ai::FrameworkStatus::Available { .. } => "AI ready",
-            _ => "AI off",
-        }
-        .to_string(),
-    );
+    context.push(if w.ai_framework_work.is_some() {
+        "AI checking".to_string()
+    } else {
+        w.ai_framework.compact().to_string()
+    });
     let context = format!("{} ", context.join(" · "));
     let right = (context.chars().count() as u16).min(area.width / 2);
     let parts = Layout::horizontal([Constraint::Min(0), Constraint::Length(right)]).split(area);
@@ -554,7 +739,7 @@ fn suggestion_text(app: &App, w: &Workspace, suggestions: &[String]) -> String {
         String::new()
     } else {
         format!(
-            "\n\nAI suggests reviewing: {}. Each is marked AI SUGGESTS in Findings; Space adds it and nothing runs until you confirm.",
+            "\n\nAI SUGGESTS: {}. Space adds it; p reviews the plan.",
             names.join(", ")
         )
     }
@@ -584,7 +769,7 @@ fn render_answer(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
         Some(report) => text.push_str(&format!(
             "\n{}\n{}{}\n",
             if report.by_model {
-                "LOCAL AI ANSWER · interpretation of measured evidence"
+                "LOCAL AI · MEASURED FINDINGS"
             } else {
                 "MEASURED RESULT · no AI"
             },
@@ -610,14 +795,14 @@ fn render_answer(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
     if let Some(error) = &w.ai_error {
         text.push_str(&format!("\n\nAI STATUS\n{error}"));
     }
-    text_panel(
+    w.detail_max_scroll.set(text_panel(
         frame,
         area,
         app,
         " ANSWER · Esc back · ↑↓ scroll ",
         text,
         w.detail_scroll,
-    );
+    ));
 }
 
 fn render_list(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
@@ -631,6 +816,7 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
 fn queued(w: &Workspace, f: &Finding) -> bool {
     w.plan.iter().any(|a| match (&f.target, a) {
         (Target::Cache(p), Action::Clean(e) | Action::ReviewClean(e)) => p == &e.spec.path,
+        (Target::Folder(p), Action::Trash(plan)) => p == &plan.path,
         (Target::Process(pid, _), Action::Signal(p, _)) => *pid == p.pid,
         _ => false,
     })
@@ -698,7 +884,7 @@ fn verdict(app: &App, w: &Workspace, f: &Finding) -> (String, Color) {
                     storage_item(app, path)
                         .map_or("Folder", |item| item.category.verdict())
                         .into(),
-                    BLUE,
+                    MUTED,
                 )
             }
         }
@@ -708,7 +894,7 @@ fn verdict(app: &App, w: &Workspace, f: &Finding) -> (String, Color) {
             if let Some(first) = words.get_mut(0..1) {
                 first.make_ascii_uppercase();
             }
-            (format!("{words} app"), BLUE)
+            (format!("{words} app"), MUTED)
         }
         Target::System => ("Needs attention".into(), CORAL),
     }
@@ -717,7 +903,11 @@ fn verdict(app: &App, w: &Workspace, f: &Finding) -> (String, Color) {
 /// What the user can do next, in plain words.
 fn next_step(app: &App, w: &Workspace, f: &Finding) -> String {
     if queued(w, f) {
-        return "In your plan. Space takes it out; p reviews the plan.".into();
+        return if matches!(f.target, Target::Folder(_)) {
+            "Queued for Trash. t takes it out; p reviews the plan. No space is freed until Trash is emptied."
+        } else {
+            "In your plan. Space takes it out; p reviews the plan."
+        }.into();
     }
     let act = |text: &str| {
         if app.analysis_only {
@@ -756,7 +946,7 @@ fn next_step(app: &App, w: &Workspace, f: &Finding) -> String {
                 .into(),
         },
         Target::Folder(_) => {
-            "e browses what is inside · o shows it in Finder · i investigates it.".into()
+            "Enter / → opens child folders and sizes · t reviews moving this item to Trash · o shows it in Finder.".into()
         }
         Target::Process(..) => {
             act("i investigates it first. Space adds a graceful stop to your plan.")
@@ -806,50 +996,171 @@ fn summary(app: &App, w: &Workspace, f: &Finding) -> String {
 /// Capacity as four parts that always add up: space in folders the scan
 /// measured, used space it could not see, macOS and other volumes, and free
 /// space. Each part has its own glyph, so the bar reads without color.
-fn capacity_bar(app: &App, o: &crate::why::Overview, width: usize) -> (Line<'static>, String) {
+fn capacity_bar(app: &App, o: &crate::why::Overview, width: usize) -> Line<'static> {
     let capacity = o.capacity_kb.max(1);
     let system = o.other_volumes_kb.min(o.used_kb);
     let data = o.used_kb - system;
     let (measured, unseen) = if o.folder_walk {
-        let unseen = o.unaccounted_kb.min(data);
+        let unseen = data.saturating_sub(o.measured_kb);
         (data - unseen, unseen)
     } else {
         (0, data)
     };
-    let cells = |kb: u64| ((kb as f64 / capacity as f64) * width as f64).round() as usize;
-    let (a, b, c) = (cells(measured), cells(unseen), cells(system));
+    // Cumulative boundaries prevent independently rounded segments overrunning
+    // the available width or hiding a small nonzero accounting component.
+    let cells = |kb: u64| {
+        ((u128::from(kb) * width as u128) / u128::from(capacity)).min(width as u128) as usize
+    };
+    let a = cells(measured);
+    let b = cells(measured + unseen).saturating_sub(a);
+    let c = cells(measured + unseen + system).saturating_sub(a + b);
     let free_cells = width.saturating_sub(a + b + c);
-    let bar = Line::from(vec![
+    Line::from(vec![
         Span::styled("█".repeat(a), Style::default().fg(app.color(BLUE))),
         Span::styled("▓".repeat(b), Style::default().fg(app.color(AMBER))),
         Span::styled("▒".repeat(c), Style::default().fg(app.color(MUTED))),
         Span::styled("░".repeat(free_cells), Style::default().fg(app.color(MINT))),
-    ]);
-    let legend = if !o.folder_walk {
+    ])
+}
+
+fn balance_line(app: &App, label: &str, kb: i128, width: usize, color: Color) -> Line<'static> {
+    let amount = format!(
+        "{}{}",
+        if kb < 0 { "−" } else { "" },
+        format_kb(kb.unsigned_abs().min(u64::MAX as u128) as u64)
+    );
+    let label_width = width.saturating_sub(amount.chars().count() + 1);
+    Line::styled(
         format!(
-            "{} used · {} free · measuring folders…",
-            format_kb(o.used_kb),
-            format_kb(o.free_kb)
-        )
-    } else if o.whole_volume {
-        let mut parts = vec![format!("█ folders {}", format_kb(measured))];
-        if unseen >= 1_048_576 {
-            parts.push(format!("▓ unseen {}", format_kb(unseen)));
-        }
-        if system >= 1_048_576 {
-            parts.push(format!("▒ system {}", format_kb(system)));
-        }
-        parts.push(format!("░ free {}", format_kb(o.free_kb)));
-        parts.join("  ")
+            "{:<label_width$} {amount}",
+            truncate_end(label, label_width)
+        ),
+        Style::default().fg(app.color(color)),
+    )
+}
+
+fn balance_footer(
+    app: &App,
+    w: &Workspace,
+    o: &crate::why::Overview,
+    width: usize,
+    expanded: bool,
+) -> Vec<Line<'static>> {
+    let (count, listed) = w.listed_storage();
+    let mut lines = if expanded {
+        o.used_balance(listed)
+            .into_iter()
+            .map(|(label, kb)| {
+                let label = if label == "Listed areas" {
+                    format!("Listed areas ({count})")
+                } else {
+                    label.to_string()
+                };
+                let color = if label == "Unaccounted usage" || kb < 0 {
+                    AMBER
+                } else {
+                    MUTED
+                };
+                balance_line(app, &label, kb, width, color)
+            })
+            .collect::<Vec<_>>()
     } else {
-        format!(
-            "█ this folder {}  ▒ rest of disk {}  ░ free {}",
-            format_kb(o.measured_kb),
-            format_kb(o.used_kb.saturating_sub(o.measured_kb)),
-            format_kb(o.free_kb)
-        )
+        vec![
+            balance_line(
+                app,
+                &format!("Listed ({count})"),
+                i128::from(listed),
+                width,
+                MUTED,
+            ),
+            balance_line(
+                app,
+                "Rest of used",
+                i128::from(o.used_kb) - i128::from(listed),
+                width,
+                MUTED,
+            ),
+        ]
     };
-    (bar, legend)
+    if expanded {
+        lines.insert(
+            0,
+            Line::styled(
+                "SPACE BALANCE · v exact totals",
+                Style::default().fg(app.color(BLUE)).bold(),
+            ),
+        );
+    }
+    lines.push(balance_line(
+        app,
+        "Total used",
+        i128::from(o.used_kb),
+        width,
+        INK,
+    ));
+    if expanded {
+        lines.push(balance_line(
+            app,
+            "Free",
+            i128::from(o.free_kb),
+            width,
+            MINT,
+        ));
+        let gap = i128::from(o.capacity_kb) - i128::from(o.used_kb) - i128::from(o.free_kb);
+        if gap != 0 {
+            lines.push(balance_line(app, "Capacity difference", gap, width, AMBER));
+        }
+        lines.push(balance_line(
+            app,
+            "Disk capacity",
+            i128::from(o.capacity_kb),
+            width,
+            INK,
+        ));
+    }
+    lines
+}
+
+fn balance_details(app: &App, w: &Workspace) -> Vec<Line<'static>> {
+    let o = w.overview(app);
+    let (count, listed) = w.listed_storage();
+    let mut lines = vec![
+        Line::styled(
+            "STORAGE BALANCE · exact KiB",
+            Style::default().fg(app.color(BLUE)).bold(),
+        ),
+        Line::raw(format!(
+            "{count} listed areas, including rows off screen. Hidden and smaller areas remain in Other measured files."
+        )),
+        Line::raw(""),
+    ];
+    let mut rows = o.used_balance(listed);
+    rows.extend([
+        ("Total used", i128::from(o.used_kb)),
+        ("Free", i128::from(o.free_kb)),
+    ]);
+    let gap = i128::from(o.capacity_kb) - i128::from(o.used_kb) - i128::from(o.free_kb);
+    if gap != 0 {
+        rows.push(("Capacity difference", gap));
+    }
+    rows.push(("Disk capacity", i128::from(o.capacity_kb)));
+    for (label, amount) in rows {
+        lines.push(Line::raw(format!("{label}: {amount} KiB")));
+    }
+    lines.extend([
+        Line::raw(""),
+        Line::raw("Listed areas + other measured files + unaccounted usage + other APFS volumes − measurement excess = total used. Displayed GiB values are rounded; the KiB values above reconcile exactly."),
+        Line::raw("Directory measurements come from one walk on the accounted volume. Cleanup estimates are not added again. macOS-managed files are included in measured files; other APFS volumes are separate."),
+        Line::raw("Unaccounted usage has no proven cause. Unreadable files, snapshots, filesystem metadata, or changes during scanning may contribute. It is not a cleanup estimate."),
+    ]);
+    if !o.whole_volume {
+        lines.push(Line::raw("This is a folder scan: Outside this scan includes the rest of the disk, not unexplained usage."));
+    }
+    if o.measurement_excess_kb > 0 {
+        lines.push(Line::styled("Measured file blocks exceed reported usage. Shared APFS blocks or changes during scanning may contribute; this is a discrepancy, not extra reclaimable space.", Style::default().fg(app.color(AMBER))));
+    }
+    lines.push(Line::raw(""));
+    lines
 }
 
 fn render_palette(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
@@ -882,6 +1193,15 @@ fn render_palette(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
         ));
     }
     for (index, (key, label, _)) in matches.iter().enumerate().skip(start).take(visible) {
+        w.hits.borrow_mut().push((
+            Rect::new(
+                inner.x,
+                inner.y + 1 + (index - start) as u16,
+                inner.width,
+                1,
+            ),
+            Control::PaletteRow(index),
+        ));
         lines.push(
             Line::from(vec![
                 Span::styled(
@@ -913,17 +1233,21 @@ fn row_name(app: &App, f: &Finding) -> String {
 fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
     let o = w.overview(app);
     let visible = w.visible();
-    let title = if w.volume.is_some() {
+    let title = if area.width < 40 {
+        " STORAGE ".to_string()
+    } else if w.volume.is_some() {
         format!(" WHERE YOUR {} WENT ", format_kb(o.used_kb))
     } else {
         " WHERE THE SPACE WENT ".to_string()
     };
-    let block = panel(app, title).title_bottom(Line::from(format!(
-        " {} of {} · f {} ",
-        if visible.is_empty() { 0 } else { w.cursor + 1 },
-        visible.len(),
-        if w.show_all { "fewer" } else { "all" }
-    )));
+    let position = if visible.is_empty() { 0 } else { w.cursor + 1 };
+    let filter = if w.show_all { "fewer" } else { "all" };
+    let footer_title = if area.width < 40 {
+        format!(" {position}/{} f {filter} v totals ", visible.len())
+    } else {
+        format!(" {position} of {} · f {filter} · v totals ", visible.len())
+    };
+    let block = list_panel(app, w, title).title_bottom(Line::from(footer_title));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let width = inner.width as usize;
@@ -931,9 +1255,22 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) 
 
     let mut header: Vec<Line<'static>> = Vec::new();
     if w.volume.is_some() {
-        let (bar, legend) = capacity_bar(app, &o, width.min(72));
-        header.push(bar);
-        header.push(Line::styled(truncate_end(&legend, width), muted));
+        header.push(capacity_bar(app, &o, width.min(72)));
+        header.push(Line::styled(
+            truncate_end(
+                if w.accounted_rows.is_some() && width < 35 {
+                    "v explains disk usage"
+                } else if w.accounted_rows.is_some() && o.whole_volume {
+                    "█ files  ▓ unaccounted  ▒ APFS  ░ free"
+                } else if w.accounted_rows.is_some() {
+                    "█ this scan  ▓ rest of disk  ░ free"
+                } else {
+                    "Measuring · cleanup estimates below"
+                },
+                width,
+            ),
+            muted,
+        ));
     } else {
         header.push(Line::styled(
             if w.complete {
@@ -958,10 +1295,12 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) 
         footer.push(Line::styled(
             truncate_end(
                 &if waiting.is_empty() {
-                    "✓ All quick wins are in your plan · p reviews it".to_string()
+                    "✓ Quick wins in plan".to_string()
+                } else if width < 40 {
+                    format!("Quick wins: {}", format_kb(total))
                 } else {
                     format!(
-                        "Quick wins: {} in {} rebuildable cache(s){}",
+                        "Quick wins: {} · {} item(s){}",
                         format_kb(total),
                         waiting.len(),
                         if app.analysis_only {
@@ -1029,24 +1368,41 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) 
         ));
     }
 
-    let rows_height = (inner.height as usize).saturating_sub(header.len() + footer.len() + 1);
+    if w.accounted_rows.is_some() {
+        let expanded = inner.height >= 24 && width >= 35;
+        let balance = balance_footer(app, w, &o, width, expanded);
+        // On a short terminal, reserve the accounting rows before the optional
+        // bar legend and spacing. The selected item must remain reachable too.
+        let minimum_row = if inner.height < 6 { 1 } else { 2 };
+        header.truncate((inner.height as usize).saturating_sub(balance.len() + minimum_row));
+        // Preserve space for at least two list rows; accounting takes priority
+        // over secondary status notes already available in details and help.
+        let room = (inner.height as usize).saturating_sub(header.len() + balance.len() + 4);
+        footer.truncate(room.min(2));
+        footer.extend(balance);
+    }
+    let rows_height = (inner.height as usize).saturating_sub(header.len() + footer.len());
+    let row_height = if rows_height < 2 { 1 } else { 2 };
     let mut lines = header.clone();
     let rows_top = inner.y + header.len() as u16;
     if visible.is_empty() {
         lines.push(Line::styled(
             if w.complete {
                 if w.kept.is_empty() {
-                    "Nothing large enough to list. f shows everything that was measured."
+                    "Nothing large enough."
                 } else {
-                    "You hid the remaining items. r scans again."
+                    "All items hidden."
                 }
             } else {
-                "Measuring… items appear here as each check finishes."
+                "Measuring folders…"
             },
             muted,
         ));
+        if rows_height >= 2 {
+            lines.push(Line::styled("f shows all items.", muted));
+        }
     }
-    let capacity = rows_height.max(1);
+    let capacity = (rows_height / row_height).max(1);
     let start = w.cursor.saturating_sub(capacity - 1);
     for (row, (index, f)) in visible
         .iter()
@@ -1056,20 +1412,12 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) 
         .enumerate()
     {
         let (verdict_text, color) = verdict(app, w, f);
-        let verdict_width = if width >= 70 {
-            24
-        } else if width >= 56 {
-            20
-        } else {
-            15
-        };
-        let verdict_text = truncate_end(&verdict_text, verdict_width);
         let size = if f.size_kb > 0 {
             format_kb(f.size_kb)
         } else {
             String::new()
         };
-        let name_width = width.saturating_sub(2 + 10 + 2 + verdict_width);
+        let name_width = width.saturating_sub(2 + 9);
         let name = truncate_middle(&row_name(app, f), name_width);
         let selected = index == w.cursor;
         let base = if selected {
@@ -1080,12 +1428,21 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) 
         lines.push(Line::from(vec![
             Span::styled(if selected { "› " } else { "  " }, base),
             Span::styled(format!("{name:<name_width$}"), base),
-            Span::styled(format!("{size:>10}"), base),
-            Span::styled("  ", base),
-            Span::styled(verdict_text, base.fg(app.color(color))),
+            Span::styled(format!("{size:>9}"), base),
         ]));
+        if row_height == 2 {
+            lines.push(Line::styled(
+                format!("  {}", truncate_end(&verdict_text, width.saturating_sub(2))),
+                base.fg(app.color(color)),
+            ));
+        }
         w.hits.borrow_mut().push((
-            Rect::new(inner.x, rows_top + row as u16, inner.width, 1),
+            Rect::new(
+                inner.x,
+                rows_top + (row * row_height) as u16,
+                inner.width,
+                row_height as u16,
+            ),
             Control::Row(index),
         ));
     }
@@ -1102,8 +1459,7 @@ fn render_folders(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
         .as_ref()
         .map(|p| ai::display_text(&p.display().to_string()))
         .unwrap_or_else(|| "Storage · largest first".into());
-    let block = panel(app, " EXPLORE · measured space, not waste ")
-        .title_bottom(Line::from(" Enter opens · ← parent · d details "));
+    let block = list_panel(app, w, " FOLDERS ").title_bottom(Line::from(" ← parent · g storage "));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(
@@ -1111,18 +1467,56 @@ fn render_folders(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
             .style(Style::default().fg(app.color(BLUE))),
         Rect::new(inner.x, inner.y, inner.width, inner.height.min(1)),
     );
+    let items = app.explorer_items();
+    let total: u64 = items.iter().map(|i| i.size_kb).sum();
+    let complete = app
+        .explorer_path
+        .as_ref()
+        .and_then(|path| w.measured_folders.get(path))
+        .copied()
+        .unwrap_or_else(|| app.inventory.as_ref().is_some_and(|i| i.complete));
+    let measuring = w.measure.as_ref().filter(|work| {
+        app.explorer_path
+            .as_ref()
+            .is_some_and(|path| path.starts_with(&work.path))
+    });
+    let status = if let Some(work) = measuring {
+        format!(
+            "Measuring · {} items · {} so far",
+            work.progress.items,
+            format_kb(work.progress.size_kb)
+        )
+    } else {
+        format!(
+            "{} items · {}{}",
+            items.len(),
+            format_kb(total),
+            if complete { "" } else { " observed · partial" }
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(truncate_middle(&status, inner.width as usize))
+            .style(Style::default().fg(app.color(MUTED))),
+        Rect::new(
+            inner.x,
+            inner.y + 1,
+            inner.width,
+            inner.height.saturating_sub(1).min(1),
+        ),
+    );
     let rows = Rect::new(
         inner.x,
-        inner.y + 1,
+        inner.y + 2,
         inner.width,
-        inner.height.saturating_sub(1),
+        inner.height.saturating_sub(2),
     );
-    let items = app.explorer_items();
     if items.is_empty() {
-        let text = if !w.complete || w.measure.is_some() {
-            "Measuring folder contents…\nTotals will appear when the walk finishes."
+        let text = if !w.complete || measuring.is_some() {
+            "Measuring folder contents…\nSizes update when this walk finishes. You can keep browsing."
+        } else if complete {
+            "This folder is empty.\n← returns to the parent. i measures it again."
         } else {
-            "No measured children here.\n← returns to the parent. i measures a selected folder."
+            "No readable children measured here.\n← returns to the parent. i retries this folder; v shows coverage."
         };
         frame.render_widget(
             Paragraph::new(text)
@@ -1132,7 +1526,6 @@ fn render_folders(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
         );
         return;
     }
-    let max = items.iter().map(|i| i.size_kb).max().unwrap_or(1).max(1);
     let capacity = (rows.height as usize / 2).max(1);
     let start = app.explorer_cursor.saturating_sub(capacity - 1);
     for (row, (index, item)) in items
@@ -1156,6 +1549,23 @@ fn render_folders(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
                 .to_string_lossy(),
         );
         let size = format_kb(item.size_kb);
+        let queued = w.plan.iter().any(|a| a.path() == Some(item.path.as_path()));
+        let action = if queued {
+            "IN PLAN"
+        } else if let Some(entry) = app.entries.iter().find(|e| e.spec.path == item.path) {
+            match entry.status {
+                CacheStatus::Ready | CacheStatus::Optional => "Space: cleanup",
+                CacheStatus::Review => "Space: review data",
+                _ => entry.status.label(),
+            }
+        } else {
+            item.category.verdict()
+        };
+        let percent = if total == 0 {
+            0
+        } else {
+            (item.size_kb as f64 * 100.0 / total as f64).round() as u64
+        };
         let lines = vec![
             Line::styled(
                 format!(
@@ -1175,9 +1585,13 @@ fn render_folders(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
             ),
             Line::styled(
                 format!(
-                    "  {}  {}",
-                    meter(item.size_kb as f64 / max as f64, 12),
-                    item.category.verdict()
+                    "  {} {:>3}% · {}",
+                    meter(
+                        item.size_kb as f64 / total.max(1) as f64,
+                        if rect.width < 38 { 3 } else { 8 }
+                    ),
+                    percent,
+                    action
                 ),
                 Style::default().fg(app.color(BLUE)),
             ),
@@ -1195,8 +1609,8 @@ fn render_folders(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
 }
 
 fn render_history_list(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
-    let block = panel(app, " HISTORY · stored on this Mac ")
-        .title_bottom(Line::from(" Enter results · r recheck "));
+    let block =
+        list_panel(app, w, " SAVED SCANS ").title_bottom(Line::from(" Esc storage · r recheck "));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if w.history.is_empty() {
@@ -1286,9 +1700,9 @@ fn ai_section(lines: &mut Vec<Line<'static>>, app: &App, label: &str, text: Stri
 
 fn render_evidence(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
     if w.coverage {
-        let lines = if app.inventory.is_none() {
+        let mut lines = if app.inventory.is_none() {
             vec![
-                Line::raw("Folder-map coverage is not available yet."),
+                Line::raw("Coverage unavailable."),
                 Line::raw(""),
                 Line::raw(
                     "The scan is still measuring. The progress band shows current work; Esc returns to your findings.",
@@ -1311,12 +1725,18 @@ fn render_evidence(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) 
                 })
                 .collect()
         };
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(panel(app, " SCAN COVERAGE · Esc back · PgUp/PgDn scroll "))
-                .wrap(Wrap { trim: false })
-                .scroll((w.detail_scroll, 0)),
+        if w.accounted_rows.is_some() {
+            let mut balance = balance_details(app, w);
+            balance.append(&mut lines);
+            lines = balance;
+        }
+        scrollable_lines(
+            frame,
             area,
+            app,
+            w,
+            " TOTALS & COVERAGE · Esc back · PgUp/PgDn ",
+            lines,
         );
         return;
     }
@@ -1324,7 +1744,16 @@ fn render_evidence(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) 
         render_results(frame, area, app, w);
         return;
     }
-    let selected_item = if w.screen == Screen::Explore {
+    let macos_group = w.screen == Screen::Overview
+        && w.selected().is_some_and(|f| f.id == care::MACOS_FINDING_ID);
+    let selected_item = if macos_group {
+        w.selected().map(|finding| StorageItem {
+            path: PathBuf::from("/"),
+            size_kb: finding.size_kb,
+            kind: StorageItemKind::Directory,
+            category: crate::storage::StorageCategory::SystemData,
+        })
+    } else if w.screen == Screen::Explore {
         app.explorer_items()
             .get(app.explorer_cursor)
             .map(|i| (*i).clone())
@@ -1359,13 +1788,28 @@ fn render_evidence(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) 
                 "WHAT YOU CAN DO",
                 if item.kind == StorageItemKind::Directory {
                     format!(
-                        "Enter opens it · ← goes up · o shows it in Finder.\n{}",
+                        "Enter / → opens it · ← goes up · o shows it in Finder.\n{}",
                         item.category.advice()
                     )
                 } else {
                     format!("o shows it in Finder.\n{}", item.category.advice())
                 },
             );
+            let cleanup = if app.analysis_only {
+                "This session is read-only.".into()
+            } else if w.plan.iter().any(|a| a.path() == Some(item.path.as_path())) {
+                "In your plan. p reviews the exact action. Use Space to remove a cleanup action or t to remove a Trash move. Nothing has run yet.".into()
+            } else if let Some(entry) = app.entries.iter().find(|e| e.spec.path == item.path) {
+                format!(
+                    "Space adds this exact cleanup rule: {} · {}.\n{}\np reviews your plan before anything runs.",
+                    entry.spec.label,
+                    entry.status.label(),
+                    entry.spec.note
+                )
+            } else {
+                "No automatic cleanup rule. If you no longer need this personal item, t queues the entire item for Trash; p reviews it. Trash does not free space until emptied. Protected app/system locations stay unavailable.".into()
+            };
+            section(&mut lines, app, "CLEANUP", cleanup);
             lines.push(Line::raw(""));
             lines.push(Line::styled(
                 format!("Location: {}", item.path.display()),
@@ -1411,7 +1855,7 @@ fn render_evidence(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) 
             (Some(report), _) if report.by_model => ai_section(
                 &mut lines,
                 app,
-                "LOCAL AI · AN INTERPRETATION OF THE CHECKS",
+                "LOCAL AI · MEASURED FINDINGS",
                 format!(
                     "{}{}",
                     report.summary,
@@ -1468,32 +1912,54 @@ fn render_evidence(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) 
             "Choose a finding to understand the evidence and next step.",
         ));
     }
-    // Compact screens keep every explanation scrollable. Larger panes earn a
-    // real measured visualization; never reserve space for an empty map.
-    // Folder maps belong to Explore; in the Overview the explanation keeps
-    // all the room.
-    let disk = false;
-    let activity = false;
-    let visual_height =
-        if area.height >= 25 && w.screen == Screen::Explore && selected_item.is_some() {
-            9
+    // Keep the selected area's contents visible in both lists. Even a compact
+    // terminal gets a small map; explanations remain independently scrollable.
+    let filesystem_selection = selected_item.is_some()
+        || w.selected().is_some_and(|f| {
+            w.screen == Screen::Overview && matches!(f.target, Target::Cache(_) | Target::Folder(_))
+        });
+    let map_children = if macos_group {
+        Some(w.macos_items.as_slice())
+    } else {
+        selected_item.as_ref().and_then(|item| {
+            app.inventory
+                .as_ref()?
+                .children
+                .get(&item.path)
+                .map(Vec::as_slice)
+        })
+    };
+    let visual_height = if filesystem_selection && area.height >= 7 {
+        if map_children.is_some_and(|children| children.iter().any(|child| child.size_kb > 0)) {
+            (area.height * 2 / 5).clamp(3, 16)
         } else {
-            0
-        };
+            area.height.saturating_sub(4).min(5)
+        }
+    } else {
+        0
+    };
     let parts =
-        Layout::vertical([Constraint::Min(5), Constraint::Length(visual_height)]).split(area);
+        Layout::vertical([Constraint::Min(3), Constraint::Length(visual_height)]).split(area);
     let text = Paragraph::new(lines).wrap(Wrap { trim: false });
     let block = panel(
         app,
         if w.detail {
-            " DETAILS · Esc back "
+            " DETAILS · Tab to list "
         } else {
-            " DETAILS · Enter expands "
+            " DETAILS · Tab to focus "
         },
     );
+    let block = block.border_style(Style::default().fg(app.color(
+        if w.detail && w.asking.is_none() {
+            BLUE
+        } else {
+            FAINT
+        },
+    )));
     let inner = block.inner(parts[0]);
     let line_count = text.line_count(inner.width) as u16;
     let max_scroll = line_count.saturating_sub(inner.height);
+    w.detail_max_scroll.set(max_scroll);
     let scroll = w.detail_scroll.min(max_scroll);
     let block = block.title_bottom(Line::from(if max_scroll > 0 {
         format!(
@@ -1509,34 +1975,15 @@ fn render_evidence(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) 
     if visual_height > 0
         && let Some(item) = selected_item
     {
-        folder_map::render_care_map(frame, parts[1], app, &item);
-    } else if visual_height > 0 && disk {
-        if let Some(v) = &w.volume {
-            let ratio = (v.disk_used_kb() as f64 / v.capacity_kb.max(1) as f64).clamp(0., 1.);
-            frame.render_widget(
-                Gauge::default()
-                    .block(panel(app, " DISK CAPACITY · not a cleanup estimate "))
-                    .gauge_style(Style::default().fg(disk_usage_color(app, ratio)))
-                    .ratio(ratio)
-                    .label(format!(
-                        "{} used · {} free",
-                        format_kb(v.disk_used_kb()),
-                        format_kb(v.disk_free_kb())
-                    )),
-                parts[1],
-            );
-        }
-    } else if visual_height > 0 && activity {
-        let data: Vec<_> = w.trend.iter().copied().collect();
-        frame.render_widget(
-            ratatui::widgets::Sparkline::default()
-                .block(
-                    panel(app, " CPU HISTORY · sampled account processes ")
-                        .title_bottom(Line::from(" 100% = one core · includes scan activity ")),
-                )
-                .data(&data)
-                .style(Style::default().fg(app.color(BLUE))),
+        folder_map::render_care_map(frame, parts[1], app, &item, map_children);
+    } else if visual_height > 0 {
+        text_panel(
+            frame,
             parts[1],
+            app,
+            " HEATMAP ",
+            "Contents have not been measured yet. The map fills in as the scan progresses.".into(),
+            0,
         );
     }
 }
@@ -1600,14 +2047,14 @@ fn render_results(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
             text
         })
         .unwrap_or_else(|| "No saved scan selected.".into());
-    text_panel(
+    w.detail_max_scroll.set(text_panel(
         frame,
         area,
         app,
         " RESULTS · ↑↓ scroll ",
         text,
         w.detail_scroll,
-    );
+    ));
 }
 
 fn render_review(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
@@ -1615,7 +2062,9 @@ fn render_review(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
         text_panel(frame, area, app, " YOUR PLAN IS EMPTY ", "Nothing is queued.\n\n1. Return to Findings with Esc.\n2. Read a finding and its tradeoff.\n3. Space adds a supported action to the plan.\n4. p opens this review before anything runs.\n\nAdding to a plan never changes files.".into(), 0);
         return;
     }
-    let word = if w.plan.iter().any(|a| matches!(a, Action::ReviewClean(_))) {
+    let word = if w.plan.iter().any(|a| matches!(a, Action::Trash(_))) {
+        "TRASH"
+    } else if w.plan.iter().any(|a| matches!(a, Action::ReviewClean(_))) {
         "DELETE"
     } else if w
         .plan
@@ -1636,10 +2085,10 @@ fn render_review(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
         })
         .sum();
     let mut text = format!(
-        "{} action(s){} · nothing has run yet",
+        "{} action(s){}",
         w.plan.len(),
         if reclaim > 0 {
-            format!(" · up to {} to reclaim", format_kb(reclaim))
+            format!(" · {} max", format_kb(reclaim))
         } else {
             String::new()
         }
@@ -1650,7 +2099,10 @@ fn render_review(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
         .map(|report| report.suggestions.as_slice())
         .unwrap_or_default();
     type Group = (&'static str, fn(&Action) -> bool);
-    let groups: [Group; 4] = [
+    let groups: [Group; 5] = [
+        ("MOVE SELECTED ITEMS TO TRASH", |a| {
+            matches!(a, Action::Trash(_))
+        }),
         ("CLEAR REBUILDABLE CONTENTS", |a| {
             matches!(a, Action::Clean(_))
         }),
@@ -1666,7 +2118,9 @@ fn render_review(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
         if actions.is_empty() {
             continue;
         }
-        text.push_str(&format!("\n\n{heading}"));
+        if w.plan.len() > 1 {
+            text.push_str(&format!("\n\n{heading}"));
+        }
         for action in actions {
             number += 1;
             let why = if suggested_ids.contains(&action.id()) {
@@ -1674,30 +2128,34 @@ fn render_review(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
             } else {
                 ""
             };
-            text.push_str(&format!("\n\n{number}. {}{why}", action.description()));
+            if w.plan.len() == 1 {
+                text.push_str(&format!("\n\n{}{why}", action.description()));
+            } else {
+                text.push_str(&format!("\n{number}. {}{why}", action.description()));
+            }
         }
     }
-    text_panel(
+    w.review_max_scroll.set(text_panel(
         frame,
         parts[0],
         app,
         " REVIEW EXACT ACTIONS · ↑↓ scroll ",
         text,
         w.review_scroll,
-    );
+    ));
     let mut acknowledgements = Vec::new();
     if w.plan.iter().any(|a| matches!(a, Action::Signal(..))) {
         acknowledgements.push(if w.signals_ack {
-            "✓ signals acknowledged"
+            "s [✓] Signals"
         } else {
-            "s acknowledge signal consequences"
+            "s [ ] Signals"
         });
     }
     if w.plan.iter().any(|a| matches!(a, Action::Move(..))) {
         acknowledgements.push(if w.moves_ack {
-            "✓ relocation acknowledged"
+            "m [✓] Move"
         } else {
-            "m acknowledge move consequences"
+            "m [ ] Move"
         });
     }
     frame.render_widget(
@@ -1711,7 +2169,7 @@ fn render_review(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
                 Style::default().fg(app.color(AMBER)),
             ),
             Line::styled(
-                " Esc returns without changes · Delete clears the plan",
+                " Esc back · Delete clears plan",
                 Style::default().fg(app.color(MUTED)),
             ),
         ])
@@ -1780,20 +2238,20 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
     section(
         &mut lines,
         app,
-        "SCREENS",
-        "1 Overview   where your space went, largest first, with a plain verdict for each item\n2 Explore    browse folders by size\n3 History    past scans and what each cleanup actually freed\nTab switches screens. : lists every command and runs it.".into(),
+        "TWO PANELS",
+        "The left panel lists storage items, folders, or saved scans. The right panel explains your selection and holds investigations and plan review. Ask AI spans the width below both panels: / or a click focuses input; Esc returns to browsing and keeps your draft. F3 shows the detected model and any AI blocker.\nTab switches focus. ↑↓ selects on the left and scrolls on the right. Enter / → opens a folder, including from details. ← / Backspace goes to the containing folder. Esc closes details, then goes back to the previous list. Home / End and PgUp / PgDn move within the focused panel.\ng storage findings · b browse folders · h saved scans\n: lists every command.".into(),
     );
     section(
         &mut lines,
         app,
         "MOST USED",
-        "↑ ↓  choose          Enter  explain the item      Esc  back\nSpace  add to plan   a  add all quick wins          p  review the plan\ni  investigate       /  ask a question              v  what the scan could not see\ne  browse folder     o  show in Finder              r  scan again\nq  quit".into(),
+        "↑ ↓  choose          Enter  open folder      Esc  back\nSpace  add to plan   a  add all quick wins          p  review the plan\ni  investigate       /  ask a question              v  what the scan could not see\nt  queue for Trash   o  show in Finder              r  scan again\nq  quit".into(),
     );
     section(
         &mut lines,
         app,
         "SAFETY",
-        "Scanning never changes anything. Nothing runs until you review exact paths and type a confirmation word. Only rebuildable caches are ever cleared routinely; app data needs its own DELETE confirmation.".into(),
+        "Scanning never changes anything. Nothing runs until you review exact paths and type a confirmation word. Only rebuildable caches are cleared routinely; app data needs its own DELETE confirmation. User-selected files and folders can be moved to Trash in a separate TRASH plan. This frees no space until Trash is emptied.".into(),
     );
     section(
         &mut lines,
@@ -1806,11 +2264,26 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
             if w.online_research { "on" } else { "off" }
         ),
     );
+    scrollable_lines(frame, area, app, w, " HELP · Esc back · ↑↓ scroll ", lines);
+}
+
+fn scrollable_lines(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    w: &Workspace,
+    title: &str,
+    lines: Vec<Line<'_>>,
+) {
+    let block = panel(app, title);
+    let inner = block.inner(area);
+    let text = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let max_scroll =
+        (text.line_count(inner.width).min(u16::MAX as usize) as u16).saturating_sub(inner.height);
+    w.detail_max_scroll.set(max_scroll);
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(panel(app, " HELP · Esc back · ↑↓ scroll "))
-            .wrap(Wrap { trim: false })
-            .scroll((w.detail_scroll, 0)),
+        text.block(block)
+            .scroll((w.detail_scroll.min(max_scroll), 0)),
         area,
     );
 }
@@ -1820,6 +2293,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
     if w.help {
         commands.extend([
             ("Esc", "back", KeyCode::Esc),
+            ("↑↓", "scroll", KeyCode::Down),
+        ]);
+    } else if w.ai_status_open {
+        commands.extend([
+            ("Esc", "back", KeyCode::Esc),
+            ("r", "check AI", KeyCode::Char('r')),
+            ("F2", "Settings", KeyCode::F(2)),
             ("↑↓", "scroll", KeyCode::Down),
         ]);
     } else if w.work.is_some() {
@@ -1832,9 +2312,16 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
         ]);
     } else if w.asking.is_some() {
         commands.extend([
-            ("Enter", "ask", KeyCode::Enter),
-            ("Esc", "cancel", KeyCode::Esc),
+            (
+                "Enter",
+                if w.model_ready() { "ask" } else { "retry AI" },
+                KeyCode::Enter,
+            ),
+            ("Esc", "browse", KeyCode::Esc),
         ]);
+        if !w.model_ready() {
+            commands.push(("F2", "Settings", KeyCode::F(2)));
+        }
     } else if w.reviewing || w.clearing_history {
         commands.extend([
             ("Esc", "back", KeyCode::Esc),
@@ -1859,10 +2346,11 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
         ]);
     } else if w.detail || w.coverage {
         commands.extend([
-            ("Esc", "back", KeyCode::Esc),
+            ("Tab", "list", KeyCode::Tab),
             ("↑↓", "scroll", KeyCode::Down),
         ]);
         if w.screen == Screen::Overview && !w.coverage {
+            commands.push(("Enter", "browse", KeyCode::Enter));
             commands.push(("i", "investigate", KeyCode::Char('i')));
             if !app.analysis_only
                 && w.selected()
@@ -1871,10 +2359,18 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
                 commands.push(("Space", "add to plan", KeyCode::Char(' ')));
             }
         }
+        if w.screen == Screen::Explore {
+            commands.push(("Enter", "open", KeyCode::Enter));
+            if !app.analysis_only {
+                commands.push(("Space", "cleanup", KeyCode::Char(' ')));
+                commands.push(("t", "Trash", KeyCode::Char('t')));
+            }
+        }
     } else {
         match w.screen {
             Screen::Overview => {
-                commands.push(("Enter", "explain", KeyCode::Enter));
+                commands.push(("Enter", "browse", KeyCode::Enter));
+                commands.push(("Tab", "details", KeyCode::Tab));
                 if !app.analysis_only
                     && w.selected()
                         .is_some_and(|f| matches!(f.target, Target::Cache(_) | Target::Process(..)))
@@ -1884,14 +2380,19 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
                 if !app.analysis_only && w.findings.iter().any(|f| f.quick_win) {
                     commands.push(("a", "quick wins", KeyCode::Char('a')));
                 }
-                commands.push(("p", "review", KeyCode::Char('p')));
+                commands.push(("e", "browse", KeyCode::Char('e')));
+                commands.push(("i", "investigate", KeyCode::Char('i')));
             }
             Screen::Explore => {
                 commands.extend([
                     ("Enter", "open", KeyCode::Enter),
                     ("←", "up", KeyCode::Left),
-                    ("o", "Finder", KeyCode::Char('o')),
                 ]);
+                if !app.analysis_only {
+                    commands.push(("Space", "cleanup", KeyCode::Char(' ')));
+                    commands.push(("t", "Trash", KeyCode::Char('t')));
+                }
+                commands.push(("i", "measure", KeyCode::Char('i')));
             }
             Screen::History => commands.extend([
                 ("Enter", "results", KeyCode::Enter),

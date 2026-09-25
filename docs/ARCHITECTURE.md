@@ -43,9 +43,20 @@ provides historical design context. The current implementation checkpoint is in
   stops a model that ignores its budget. The helper has no filesystem, shell,
   or remote capability of its own. `selftest` exercises the bridge without a
   model, and `measure` reports token budgets.
-- `src/tui/care_view.rs` owns Overview/Explore/History, the command palette, model activity visuals,
+- `src/tui/care_view.rs` owns the two-panel workspace and its storage/folder/history lists, the command palette, model activity visuals,
   shared review plans, sequential execution, and before/after observations.
-- Existing cache, process, whitelist, and relocation engines own all mutation
+- Storage accounting uses disjoint areas from the inventory's accounted device,
+  with sizes retained from that walk. Cleanup estimates and later explorer
+  measurements cannot inflate the balance. `why::Overview::used_balance`
+  reconciles listed areas, the measured remainder, unexplained usage, other
+  APFS volumes, and any measurement excess. The TUI shows exact KiB totals on `v`.
+- `src/file_actions.rs` owns manually selected Trash plans. The TUI alone can
+  create one from a browser selection, in a separate typed-TRASH plan. Paths,
+  ownership, volume, whitelist (including descendants), and file/parent identity
+  are revalidated immediately before NSFileManager's native Trash operation.
+  There is no permanent-delete fallback, and moved bytes count as zero freed.
+  The AI and MCP cannot propose or execute this action.
+- Existing cache, process, whitelist, and relocation engines own all other mutation
   safeguards. No model-generated path or signal is executed. Model suggestions
   are badges on actions Rust already allows; the user adds and confirms them.
 - Administrator-assisted diagnostics are fixed read-only collectors. The TUI
@@ -97,16 +108,16 @@ of listing every exact target. Some modal phases also left the menu accessible.
 
 ## Redesign
 
-The interface uses warm charcoal surfaces, ivory text, amber navigation, green
-availability, blue-gray review states, and coral destructive decisions. Labels
+The interface uses slate surfaces, bright text, blue panel focus, green
+availability, violet AI findings, and coral destructive decisions. Labels
 and focus markers communicate state independently of color. Terminal font choice
 remains under the user's control.
 
-- **Storage audit:** location selection, visible scan stages, readable findings,
-  and separate reclaimable/selected totals. Explore, Heatmap, Cleanup decisions,
-  and Scan coverage share one inventory and drill-down state. Wide terminals have
-  a nested treemap beside the folder browser; `h` expands it at every supported
-  width, and `i` opens full decision details. `folder_map.rs` partitions terminal
+- **Storage audit:** visible scan stages, readable findings, and separate
+  reclaimable/selected totals. Storage findings, folder browsing, and scan
+  coverage share one inventory. `e` browses a finding and `i` investigates it.
+  Taller terminals show a nested map within the folder inspector.
+  `folder_map.rs` partitions terminal
   rectangles by allocated size and reads descendants from the existing inventory.
   Nested rectangles register their exact paths before parent hit regions, so
   clicking a child opens that child. Branch colors never imply cleanup eligibility.
@@ -119,10 +130,10 @@ remains under the user's control.
 - **Confirmations:** exact targets and consequences scroll independently of the
   always-visible decision controls. They own keyboard and mouse interaction.
 
-A persistent top menu is shown at every supported width, with shorter labels
-in narrow terminals. Tab switches focus between the top menu and content;
-navigation has no numbered menu labels. At less than 60 columns or 16 rows, the
-UI displays a resize message and blocks hidden actions while still allowing
+The current workspace keeps a list on the left and details or the active task
+on the right at every supported width. Tab switches panel focus. Header actions
+open Ask, saved scans, and plan review; there are no screen tabs. At less than
+60 columns or 16 rows, the UI displays a resize message and blocks hidden actions while still allowing
 cancellation and exit handling.
 
 ## Boundaries

@@ -288,3 +288,21 @@ The original path remains usable through the symlink, while new data is stored
 on the external volume. Keep that volume mounted before starting the owning
 application. Relocation is never part of `--clean --yes` and is never inferred
 from the largest-consumer inventory.
+
+
+## Manually selected Move to Trash
+
+The folder browser's `t` action queues the entire selected item for native macOS
+Trash. It requires a separate plan and typed `TRASH` confirmation. It cannot mix
+with cleanup actions, including emptying Trash. Moved bytes are not counted as
+freed space. Restore items by dragging them out of Trash in Finder; Put Back may
+be unavailable. No permanent-delete fallback is attempted.
+
+This action is limited to owned files/folders on the home volume, inside the
+home directory, without symlinked paths. Home and standard folder anchors,
+Library data other than individual user caches, authentication directories,
+Diskray's working-directory ancestors, and whitelist-protected paths (including
+protected descendants) are refused. The path policy and file/parent identity
+are checked again at execution. Read-only mode blocks selection. AI and MCP
+have no access to this action. Selecting an item does not mean Diskray judged
+it disposable: the review explicitly warns that apps using it may stop working.

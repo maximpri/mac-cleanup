@@ -16,6 +16,7 @@ pub mod care;
 pub mod cli;
 pub mod commands;
 pub mod downloads;
+mod file_actions;
 pub mod growth;
 pub mod headless;
 pub mod history;

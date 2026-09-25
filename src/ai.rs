@@ -26,17 +26,27 @@ const MISSING_HELPER: &str =
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameworkStatus {
     Detecting,
-    Available { detail: String },
-    Unavailable { detail: String },
-    Missing { detail: String },
+    Available {
+        detail: String,
+        diagnostics: Option<ModelDiagnostics>,
+    },
+    Unavailable {
+        detail: String,
+        diagnostics: Option<ModelDiagnostics>,
+    },
+    Missing {
+        detail: String,
+    },
 }
 
 impl FrameworkStatus {
     pub fn description(&self) -> String {
         match self {
             Self::Detecting => "Apple Foundation Models · detecting".into(),
-            Self::Available { detail } => format!("Apple Foundation Models · available{detail}"),
-            Self::Unavailable { detail } => {
+            Self::Available { detail, .. } => {
+                format!("Apple Foundation Models · available{detail}")
+            }
+            Self::Unavailable { detail, .. } => {
                 format!("Apple Foundation Models · unavailable · {detail}")
             }
             Self::Missing { detail } => {
@@ -53,6 +63,24 @@ impl FrameworkStatus {
             Self::Missing { .. } => "AI helper missing",
         }
     }
+
+    pub fn diagnostics(&self) -> Option<&ModelDiagnostics> {
+        match self {
+            Self::Available { diagnostics, .. } | Self::Unavailable { diagnostics, .. } => {
+                diagnostics.as_ref()
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ModelDiagnostics {
+    pub device_language: String,
+    pub siri_language: Option<String>,
+    pub locale_supported: bool,
+    pub context_size: usize,
+    pub supported_languages: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -96,6 +124,7 @@ struct Response {
     insight: Option<Insight>,
     triage: Option<Triage>,
     capabilities: Option<Capabilities>,
+    diagnostics: Option<ModelDiagnostics>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -152,7 +181,7 @@ pub fn friendly_error(code: Option<&str>, message: &str) -> String {
             "Apple Intelligence is turned off. Press A to open System Settings.".into()
         }
         Some("model_not_ready") => {
-            "Apple Intelligence is still preparing its model. Try again once the download finishes."
+            "macOS reports its Apple model unavailable. Check Apple Intelligence setup in Settings."
                 .into()
         }
         Some("context") => "The evidence was too large for the on-device model.".into(),
@@ -292,6 +321,50 @@ fn request_once(
     cancelled: &AtomicBool,
     stopped: &str,
 ) -> Result<Response, String> {
+    let response = read_response(payload, request_id, timeout, cancelled, stopped)?;
+    if !response.available {
+        return Err(availability_error(&response));
+    }
+    if let Some(error) = &response.error {
+        return Err(friendly_error(response.error_code.as_deref(), error));
+    }
+    Ok(response)
+}
+
+fn availability_error(response: &Response) -> String {
+    if response.error_code.as_deref() == Some("model_not_ready")
+        && let Some(diagnostics) = &response.diagnostics
+        && let Some(siri) = &diagnostics.siri_language
+    {
+        if siri != &diagnostics.device_language {
+            return format!(
+                "Mac/Siri languages differ: {} / {}. Apple model is not ready.",
+                display_text(&diagnostics.device_language),
+                display_text(siri),
+            );
+        }
+        if diagnostics.locale_supported {
+            return "Apple model unavailable in macOS. Languages match; F3 for recovery steps."
+                .into();
+        }
+    }
+    friendly_error(
+        response.error_code.as_deref(),
+        response
+            .error
+            .as_deref()
+            .unwrap_or("Apple Intelligence is unavailable. Check System Settings."),
+    )
+}
+
+/// Preserve capability and diagnostic data even when macOS reports unavailable.
+fn read_response(
+    payload: &Value,
+    request_id: &str,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+    stopped: &str,
+) -> Result<Response, String> {
     let mut helper = HelperProcess::spawn()?;
     helper.send(payload)?;
     helper.close_input();
@@ -309,15 +382,6 @@ fn request_once(
             || response.request_id.as_deref() != Some(request_id)
         {
             return Err("Apple AI helper version or request mismatch.".into());
-        }
-        if !response.available {
-            return Err(response.error.map_or_else(
-                || "Enable Apple Intelligence and allow its model to download.".into(),
-                |error| friendly_error(response.error_code.as_deref(), &error),
-            ));
-        }
-        if let Some(error) = &response.error {
-            return Err(friendly_error(response.error_code.as_deref(), error));
         }
         return Ok(response);
     }
@@ -342,13 +406,19 @@ pub fn framework_status() -> FrameworkStatus {
         "operation": "capabilities",
     });
     let never = AtomicBool::new(false);
-    match request_once(
+    match read_response(
         &payload,
         "availability",
         Duration::from_secs(5),
         &never,
         "availability check timed out",
     ) {
+        Ok(response) if !response.available || response.error.is_some() => {
+            FrameworkStatus::Unavailable {
+                detail: availability_error(&response),
+                diagnostics: response.diagnostics,
+            }
+        }
         Ok(response) => {
             let detail = response
                 .capabilities
@@ -374,10 +444,14 @@ pub fn framework_status() -> FrameworkStatus {
                     )
                 })
                 .unwrap_or_default();
-            FrameworkStatus::Available { detail }
+            FrameworkStatus::Available {
+                detail,
+                diagnostics: response.diagnostics,
+            }
         }
         Err(detail) => FrameworkStatus::Unavailable {
             detail: display_text(&detail),
+            diagnostics: None,
         },
     }
 }
@@ -626,7 +700,7 @@ echo"#,
 echo '{"protocol":3,"request_id":"triage:7","available":false,"error_code":"model_not_ready","error":"unavailable(FoundationModels.SystemLanguageModel.Availability.UnavailableReason.modelNotReady)"}'"#,
         )));
         let error = triage(&one_subject_request(), &cancelled).unwrap_err();
-        assert!(error.contains("preparing its model"), "{error}");
+        assert!(error.contains("Apple model unavailable"), "{error}");
         assert!(!error.contains("FoundationModels"));
         set_test_helper(Some(fake_helper(dir.path(), "read line\nexec sleep 30")));
         cancelled.store(true, Ordering::Relaxed);
@@ -680,6 +754,50 @@ echo '{"protocol":3,"request_id":"triage:7","available":false,"error_code":"mode
             assert!(!text.contains("FoundationModels"), "{code}");
         }
         assert_eq!(friendly_error(None, "plain\u{1b}text"), "plaintext");
+    }
+    #[test]
+    fn model_diagnostics_distinguish_supported_language_from_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        let diagnostic = serde_json::json!({
+            "device_language": "en-CA", "siri_language": "en-US",
+            "locale_supported": true, "context_size": 4096,
+            "supported_languages": ["en-Latn-US"]
+        });
+        let mut response = serde_json::json!({
+            "protocol": 3, "request_id": "availability", "available": false,
+            "error_code": "model_not_ready", "error": "Framework unavailable",
+            "diagnostics": diagnostic,
+        });
+        for (siri, mismatch) in [(Some("en-US"), true), (Some("en-CA"), false), (None, false)] {
+            response["diagnostics"]["siri_language"] = serde_json::json!(siri);
+            set_test_helper(Some(fake_helper(
+                dir.path(),
+                &format!("read line\necho '{response}'"),
+            )));
+            let status = framework_status();
+            assert!(matches!(status, FrameworkStatus::Unavailable { .. }));
+            assert!(status.diagnostics().unwrap().locale_supported);
+            assert_eq!(status.description().contains("languages differ"), mismatch);
+            assert_eq!(
+                status
+                    .description()
+                    .contains("Languages match; F3 for recovery steps"),
+                siri == Some("en-CA"),
+                "matching languages must not be presented as a remaining repair",
+            );
+            assert!(!status.description().contains("Waiting"));
+        }
+        response["available"] = serde_json::json!(true);
+        response["error"] = Value::Null;
+        response["error_code"] = Value::Null;
+        set_test_helper(Some(fake_helper(
+            dir.path(),
+            &format!("read line\necho '{response}'"),
+        )));
+        let status = framework_status();
+        assert!(matches!(status, FrameworkStatus::Available { .. }));
+        assert_eq!(status.diagnostics().unwrap().context_size, 4096);
+        set_test_helper(None);
     }
     #[test]
     fn rejects_invented_actions_and_investigations() {

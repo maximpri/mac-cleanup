@@ -33,6 +33,8 @@ pub struct Overview {
     pub unaccounted_kb: u64,
     /// Space used by other volumes in the same APFS container.
     pub other_volumes_kb: u64,
+    /// Signed correction when directory measurements exceed filesystem usage.
+    pub measurement_excess_kb: u64,
     pub snapshots: usize,
     /// Hidden-space figures only mean something for a whole volume.
     pub whole_volume: bool,
@@ -43,6 +45,40 @@ pub struct Overview {
 }
 
 impl Overview {
+    /// Exact KiB arithmetic. Directory blocks are measurements, not unique
+    /// physical APFS extents: show any excess rather than silently clipping it.
+    pub fn used_balance(&self, listed_kb: u64) -> Vec<(&'static str, i128)> {
+        let mut rows = vec![
+            ("Listed areas", i128::from(listed_kb)),
+            (
+                "Other measured files",
+                i128::from(self.measured_kb) - i128::from(listed_kb),
+            ),
+            (
+                if self.whole_volume {
+                    "Unaccounted usage"
+                } else {
+                    "Outside this scan"
+                },
+                i128::from(if self.whole_volume {
+                    self.unaccounted_kb
+                } else {
+                    self.used_kb.saturating_sub(self.measured_kb)
+                }),
+            ),
+        ];
+        if self.whole_volume {
+            rows.push(("Other APFS volumes", i128::from(self.other_volumes_kb)));
+        }
+        if self.measurement_excess_kb > 0 {
+            rows.push((
+                "Measurement excess",
+                -i128::from(self.measurement_excess_kb),
+            ));
+        }
+        rows
+    }
+
     pub fn hidden_kb(&self) -> u64 {
         self.unaccounted_kb + self.other_volumes_kb
     }
@@ -61,6 +97,8 @@ pub fn overview(
     findings: &[Finding],
     review_limit: usize,
 ) -> Overview {
+    // Reconcile the walk against the capacity reading captured with that walk.
+    let volume = inventory.and_then(|i| i.volume.as_ref()).or(volume);
     let whole = whole_volume(root);
     let label = |finding: &Finding| match &finding.target {
         Target::Cache(path) | Target::Folder(path) => display_path(path, root, home),
@@ -108,15 +146,24 @@ pub fn overview(
             _ => None,
         })
         .collect();
+    let measured = inventory.map_or(0, |i| i.scanned_on_volume_kb);
+    let used = volume.map_or(0, VolumeStats::disk_used_kb);
+    let other = volume
+        .filter(|_| whole)
+        .map_or(0, VolumeStats::other_volume_kb);
+    let data = used.saturating_sub(other);
     Overview {
         capacity_kb: volume.map_or(0, |v| v.capacity_kb),
-        used_kb: volume.map_or(0, VolumeStats::disk_used_kb),
+        used_kb: used,
         free_kb: volume.map_or(0, VolumeStats::disk_free_kb),
-        measured_kb: inventory.map_or(0, |i| i.scanned_on_volume_kb),
-        unaccounted_kb: inventory.filter(|_| whole).map_or(0, |i| i.unaccounted_kb),
-        other_volumes_kb: volume
-            .filter(|_| whole)
-            .map_or(0, VolumeStats::other_volume_kb),
+        measured_kb: measured,
+        unaccounted_kb: if whole {
+            data.saturating_sub(measured)
+        } else {
+            0
+        },
+        other_volumes_kb: other,
+        measurement_excess_kb: measured.saturating_sub(data),
         snapshots: inventory.map_or(0, |i| i.local_snapshots.len()),
         whole_volume: whole,
         folder_walk: inventory.is_some(),
@@ -155,5 +202,72 @@ pub fn whole_volume(root: &Path) -> bool {
     match (device(root), root.parent().and_then(device)) {
         (Some(inner), Some(outer)) => inner != outer,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn balances_small_gaps_excess_and_folder_scope_using_one_capacity_sample() {
+        let gib = 1_048_576;
+        let volume = VolumeStats {
+            accounting_path: "/data".into(),
+            filesystem: "test".into(),
+            capacity_kb: 250 * gib,
+            used_kb: 200 * gib,
+            free_kb: 50 * gib,
+            container_free_kb: Some(20 * gib),
+            device: 1,
+        };
+        let stale = VolumeStats {
+            used_kb: 150 * gib,
+            container_free_kb: Some(40 * gib),
+            ..volume.clone()
+        };
+        for measured in [0, 200 * gib - 400 * 1024, 200 * gib, 210 * gib] {
+            let mut inventory =
+                StorageInventory::unavailable(Path::new("/"), "synthetic partial scan");
+            inventory.volume = Some(volume.clone());
+            inventory.scanned_on_volume_kb = measured;
+            inventory.unaccounted_kb = 999; // Never mix a cached gap with another capacity sample.
+            for root in [Path::new("/"), Path::new("/a/synthetic/subfolder")] {
+                let o = overview(
+                    root,
+                    Path::new("/home"),
+                    Some(&stale),
+                    Some(&inventory),
+                    &[],
+                    0,
+                );
+                assert_eq!(o.used_kb, 230 * gib);
+                for listed in [0, measured / 2, measured] {
+                    assert_eq!(
+                        o.used_balance(listed)
+                            .iter()
+                            .map(|(_, kb)| kb)
+                            .sum::<i128>(),
+                        i128::from(o.used_kb)
+                    );
+                    assert_eq!(o.used_kb + o.free_kb, o.capacity_kb);
+                }
+                if root == Path::new("/") {
+                    assert_eq!(o.other_volumes_kb, 30 * gib);
+                    assert_eq!(o.unaccounted_kb, (200 * gib).saturating_sub(measured));
+                    assert_eq!(o.measurement_excess_kb, measured.saturating_sub(200 * gib));
+                } else {
+                    assert_eq!(
+                        o.unaccounted_kb, 0,
+                        "a partial folder scan is not unknown whole-disk usage"
+                    );
+                    assert!(
+                        o.used_balance(0)
+                            .iter()
+                            .any(|(label, _)| *label == "Outside this scan")
+                    );
+                }
+            }
+        }
     }
 }

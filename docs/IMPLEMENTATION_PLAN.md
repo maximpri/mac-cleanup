@@ -8,6 +8,38 @@ the accepted scope: a Rust/Ratatui utility for developers and AI-tool users,
 Apple Intelligence in the first release, macOS 26+ on compatible Apple silicon,
 and a visual workflow without chat.
 
+## Workspace and AI readiness checkpoint — 2026-09-24
+
+This checkpoint and [TUI_NAVIGATION.md](TUI_NAVIGATION.md) supersede the older
+tab and narrow-screen layout descriptions below.
+
+- Two persistent panels with a shared Ask input below both. Folder selection
+  drives the child-size list and heatmap; Enter/Right drills down,
+  Left/Backspace opens the parent, and Escape returns to the previous list and
+  selection. Keyboard, mouse, overlays, and paging respect the active panel.
+- Storage accounting reconciles disjoint measured areas and makes incomplete
+  coverage and any accounting difference explicit.
+- Model conclusions are composed from cited collector output and validated
+  hypothesis links. Model-written factual prose is not accepted as a conclusion.
+- Manual Move to Trash has its own exact-target, typed-TRASH plan, protected
+  path and identity checks, and no permanent-delete fallback. Moving an item
+  to Trash is not counted as freed space. The native Trash round-trip test
+  remains opt-in and unverified on this Mac because macOS denied inspection
+  of its Trash; the earlier attempt stopped before creating or moving a test item.
+- AI status highlights the temporary English (United States) setup requirement
+  and detected Mac/Siri languages. The development Mac now reports both as
+  `en-US`, but Apple still reports `modelNotReady` with missing-asset errors.
+  Older helpers and the current helper rebuilt with SDK 27.0 also fail.
+  The user will restart manually later. Live inference and model-directed
+  tool use remain pending; historical September 18 results below do not
+  certify the current revision. See [the readiness record](AI_READINESS_2026-09-24.md).
+
+Validation: 252 active Rust tests pass; the native Trash round-trip test remains
+ignored. Formatting, strict Clippy, private Rust documentation, helper protocol
+checks, and the terminal smoke test pass. The smoke test explicitly selects its
+fixture folder because a live memory-pressure warning may appear first.
+These checks do not certify live model inference or native Trash restoration.
+
 ## Tool-calling checkpoint — 2026-09-23
 
 Apple Foundation Models now calls bounded read-only tools itself (protocol v3,

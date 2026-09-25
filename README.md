@@ -6,7 +6,7 @@
 [![License: GPL v3+](https://img.shields.io/badge/License-GPLv3%2B-blue.svg)](LICENSE)
 ![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 
-![Diskray's Overview: capacity split into measured folders, unseen space, macOS, and free space, then every large item with a plain verdict](docs/images/overview.svg)
+![Diskray's two panels: storage items and their status on the left, measured explanations and actions on the right](docs/images/overview.svg)
 
 "System Data is 180 GB" is not an answer. Diskray measures where the space
 actually went, explains what each large item is and whether it is safe to
@@ -38,7 +38,16 @@ sh scripts/build-release.sh          # adds the AI helper when this Mac supports
 ```
 
 Local AI needs Apple silicon, macOS 26 or later, and Apple Intelligence turned
-on. Everything else works on any recent Mac. Full Disk Access is optional;
+on with its model downloaded.
+
+> **Current AI requirement: English (United States).** For now, set both your
+> Mac language and Siri language to **English (United States)** to use Diskray's
+> embedded Apple Foundation Model. Allow Apple's model setup to finish.
+
+See [local AI setup and verification](docs/AI.md) for availability diagnostics
+and the live inference check.
+
+Everything else works on any recent Mac. Full Disk Access is optional;
 unreadable folders are reported as unreadable, never as empty.
 
 ## Thirty-second tour
@@ -51,10 +60,14 @@ diskray artifacts                    # node_modules, target, .venv in projects u
 claude mcp add --scope user diskray -- diskray mcp   # give coding agents read-only disk tools
 ```
 
-The interactive app opens on **Overview**: where your space went, largest
-first, with a plain verdict for each item. `Enter` explains an item, `Space`
-adds it to your plan, `a` adds every quick win, `p` reviews the plan before
-anything runs, and `:` lists every other command.
+The interactive app uses **two panels**: storage items and their status on the
+left, an explanation and actions on the right. `Tab` switches focus, `e` browses
+a folder (`Enter` / `Right` also drills down), `h` opens saved scans, and `Space`
+adds a supported cleanup action to your plan. `t` queues a selected personal item
+for a separate, reviewed Move to Trash; this frees no space until Trash is emptied. `p`
+reviews that plan before anything runs; `:` lists every command.
+The **Ask AI** input stays open below both panels. Press `/` or click it to
+type; `Esc` returns to browsing and keeps your draft.
 
 ![An explanation: what was measured, what the checks found, what you can do, and how it was checked](docs/images/details.svg)
 

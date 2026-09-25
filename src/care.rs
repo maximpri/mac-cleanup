@@ -1339,7 +1339,7 @@ pub fn findings(
         } else {
             "observed in a partial scan"
         };
-        for item in breakdown.items.iter().take(40) {
+        for item in &breakdown.items {
             if targets.contains(&item.path) {
                 continue;
             }
@@ -1361,9 +1361,9 @@ pub fn findings(
         if breakdown.macos_kb >= min_kb {
             results.push(Finding {
                 id: MACOS_FINDING_ID.into(),
-                title: "macOS system files".into(),
+                title: "macOS-managed files".into(),
                 observation: format!(
-                    "{} {measured} in /System, /usr, swap files, and other macOS-managed locations",
+                    "{} {measured} in macOS-managed paths on the scanned volume. Other APFS volumes are accounted separately",
                     cache::format_kb(breakdown.macos_kb)
                 ),
                 consequence: "macOS manages this space. Diskray never changes it.".into(),

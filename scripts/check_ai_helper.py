@@ -80,7 +80,13 @@ invalid = request({"protocol": 999, "request_id": "version-test", "operation": "
 assert not invalid["available"] and invalid["error"]
 availability = request({"protocol": PROTOCOL, "request_id": "capabilities", "operation": "capabilities"})
 assert availability["available"] or availability.get("error_code")
+diagnostics = availability["diagnostics"]
+assert isinstance(diagnostics["locale_supported"], bool)
+assert diagnostics["device_language"] and diagnostics["context_size"] >= 0
+assert isinstance(diagnostics["supported_languages"], list)
+assert all(isinstance(tag, str) for tag in diagnostics["supported_languages"])
 if availability["available"]:
+    assert diagnostics["context_size"] > 0
     capabilities = availability["capabilities"]
     assert capabilities["provider"].startswith("Apple Foundation Models")
     assert capabilities["dynamic_schemas"] is True and capabilities["tool_calling"] is True
@@ -182,7 +188,7 @@ if "--live" in sys.argv:
         report = message["report"]
         break
     session.close()
-    assert report["summary"].strip()
+    assert report["evidence_ids"]
     assert set(report["suggested_actions"]) <= {"A1"}
     assert report["phase"] in {"complete", "inconclusive"}
     print(f"PASS: live tool-using investigation · tools {used} · cited {report['evidence_ids']}"

@@ -1,20 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 
-// High-contrast slate surfaces. Color is supplemental: every state has a text label.
-pub(super) const BACKGROUND: Color = Color::Rgb(15, 20, 29);
-pub(super) const INK: Color = Color::Rgb(235, 240, 247);
-pub(super) const MUTED: Color = Color::Rgb(169, 182, 199);
-pub(super) const FAINT: Color = Color::Rgb(58, 73, 93);
-pub(super) const SURFACE: Color = Color::Rgb(21, 29, 41);
-pub(super) const SURFACE_RAISED: Color = Color::Rgb(39, 57, 78);
-pub(super) const MINT: Color = Color::Rgb(162, 194, 151);
-pub(super) const BLUE: Color = Color::Rgb(111, 190, 255);
-pub(super) const AMBER: Color = Color::Rgb(230, 184, 104);
-pub(super) const CORAL: Color = Color::Rgb(230, 137, 119);
-pub(super) const ORCHID: Color = Color::Rgb(152, 183, 188);
+// Graphite surfaces, cyan controls, and semantic status accents. Text has at
+// least 7:1 contrast on SURFACE and 4.5:1 on SURFACE_RAISED. Every state also
+// has a text label; FAINT is for separators, never supporting text.
+pub(super) const BACKGROUND: Color = Color::Rgb(14, 18, 23);
+pub(super) const INK: Color = Color::Rgb(232, 238, 245);
+pub(super) const MUTED: Color = Color::Rgb(160, 175, 193);
+pub(super) const FAINT: Color = Color::Rgb(58, 72, 87);
+pub(super) const SURFACE: Color = Color::Rgb(23, 29, 36);
+pub(super) const SURFACE_RAISED: Color = Color::Rgb(36, 58, 73);
+pub(super) const MINT: Color = Color::Rgb(136, 205, 174);
+pub(super) const BLUE: Color = Color::Rgb(114, 196, 221);
+pub(super) const AMBER: Color = Color::Rgb(237, 190, 112);
+pub(super) const CORAL: Color = Color::Rgb(239, 147, 139);
+pub(super) const ORCHID: Color = Color::Rgb(146, 174, 192);
 /// The one accent reserved for model output, so AI text is never mistaken for a measurement.
-pub(super) const VIOLET: Color = Color::Rgb(196, 167, 255);
+pub(super) const VIOLET: Color = Color::Rgb(195, 176, 238);
 
 pub(super) fn panel<'a>(app: &App, title: impl Into<Line<'a>>) -> Block<'a> {
     Block::bordered()

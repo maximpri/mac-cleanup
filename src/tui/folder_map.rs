@@ -3,12 +3,14 @@
 use super::*;
 
 const PALETTE: [Color; 6] = [
-    Color::Rgb(54, 108, 154),
-    Color::Rgb(91, 88, 151),
-    Color::Rgb(42, 116, 125),
-    Color::Rgb(129, 93, 66),
-    Color::Rgb(119, 77, 113),
-    Color::Rgb(65, 101, 135),
+    // Muted blue, teal, and slate distinguish branches without implying risk.
+    // Pale labels retain at least 7:1 contrast on every tile.
+    Color::Rgb(36, 72, 91),
+    Color::Rgb(37, 79, 83),
+    Color::Rgb(53, 66, 88),
+    Color::Rgb(63, 75, 87),
+    Color::Rgb(43, 64, 76),
+    Color::Rgb(53, 75, 73),
 ];
 
 struct Tile<'a> {
@@ -207,8 +209,80 @@ fn draw_tiles(
 pub(super) fn render_folder_map(frame: &mut Frame<'_>, area: Rect, app: &App, item: &StorageItem) {
     render_map(frame, area, app, item, false);
 }
-pub(super) fn render_care_map(frame: &mut Frame<'_>, area: Rect, app: &App, item: &StorageItem) {
-    render_map(frame, area, app, item, true);
+pub(super) fn render_care_map(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    item: &StorageItem,
+    grouped_children: Option<&[StorageItem]>,
+) {
+    let mut block = panel(
+        app,
+        if area.width < 40 {
+            " HEATMAP "
+        } else {
+            " CONTENTS HEATMAP · area = size "
+        },
+    );
+    if area.height >= 8 {
+        block = block.title_bottom(Line::from(" Click a child · Enter / → browse "));
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
+        return;
+    }
+    if item.kind != StorageItemKind::Directory {
+        frame.render_widget(
+            Paragraph::new("This is a file, with no child folders. o reveals it in Finder.")
+                .wrap(Wrap { trim: true }),
+            inner,
+        );
+        return;
+    }
+    let children = grouped_children.or_else(|| {
+        app.inventory
+            .as_ref()
+            .and_then(|inventory| inventory.children.get(&item.path))
+            .map(Vec::as_slice)
+    });
+    match children {
+        Some(children) if children.iter().any(|child| child.size_kb > 0) => {
+            // Exact sizes remain readable even when a small tile cannot hold a label.
+            let count = if inner.height >= 8 {
+                children.len().min(4) as u16
+            } else {
+                0
+            };
+            for (row, child) in children.iter().take(count as usize).enumerate() {
+                let rect = Rect::new(inner.x, inner.y + row as u16, inner.width, 1);
+                let size = format_kb(child.size_kb);
+                let label = format!(
+                    "{} {}  {}",
+                    if child.kind == StorageItemKind::Directory {
+                        "▸"
+                    } else {
+                        "·"
+                    },
+                    truncate_middle(
+                        &name(child),
+                        inner.width.saturating_sub(size.len() as u16 + 4) as usize
+                    ),
+                    size
+                );
+                frame.render_widget(
+                    Paragraph::new(label).style(Style::default().fg(app.color(INK))),
+                    rect,
+                );
+                hit(app, rect, child);
+            }
+            let tiles_area = Rect::new(inner.x, inner.y + count, inner.width, inner.height - count);
+            draw_tiles(frame, tiles_area, app, &tiles(children, item.size_kb), 0, 0);
+        }
+        _ => {
+            frame.render_widget(Paragraph::new("No measured contents. The folder may be empty or unreadable; v shows coverage.").wrap(Wrap { trim: true }), inner);
+        }
+    }
 }
 fn render_map(frame: &mut Frame<'_>, area: Rect, app: &App, item: &StorageItem, care: bool) {
     let block = panel(
@@ -337,6 +411,7 @@ impl App {
                 path.parent()
                     .and_then(|p| i.children.get(p))
                     .and_then(|children| children.iter().find(|c| c.path == path))
+                    .or_else(|| i.top_level.iter().find(|c| c.path == path))
                     .or_else(|| i.children.values().flatten().find(|c| c.path == path))
             })
             .cloned();

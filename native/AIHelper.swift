@@ -260,6 +260,25 @@ struct AIHelper {
         }
     }
 
+    /// Read-only diagnostics: model support is public framework data. Siri's
+    /// language preference is best-effort and may be absent on some OS versions;
+    /// it never overrides the framework's authoritative availability result.
+    static func modelDiagnostics(_ model: SystemLanguageModel) -> [String: Any] {
+        let language = Locale.preferredLanguages.first ?? Locale.current.identifier
+        let normalize = { (value: String) in Locale(identifier: value).identifier(.bcp47) }
+        var result: [String: Any] = [
+            "device_language": normalize(language),
+            "locale_supported": model.supportsLocale(Locale(identifier: language)),
+            "context_size": model.contextSize,
+            "supported_languages": model.supportedLanguages.map { $0.maximalIdentifier }.sorted(),
+        ]
+        if let siri = UserDefaults(suiteName: "com.apple.assistant.backedup")?.string(forKey: "Session Language"),
+           !siri.isEmpty {
+            result["siri_language"] = normalize(siri)
+        }
+        return result
+    }
+
     static func choice(_ name: String, _ description: String, _ values: [String]) -> DynamicGenerationSchema {
         DynamicGenerationSchema(
             name: name,
@@ -330,12 +349,10 @@ struct AIHelper {
     /// short-ID patterns because tools issue them during the session; the app
     /// rejects any ID it did not issue.
     static func reportSchema(hypotheses: [String]) throws -> GenerationSchema {
-        let text = DynamicGenerationSchema(type: String.self)
         let evidenceID = DynamicGenerationSchema(type: String.self, guides: [.pattern(try Regex("E[0-9]{1,2}"))])
         let actionID = DynamicGenerationSchema(type: String.self, guides: [.pattern(try Regex("A[0-9]{1,2}"))])
         var properties: [DynamicGenerationSchema.Property] = [
-            .init(name: "summary", description: "Two to four plain sentences that cite evidence IDs such as E2.", schema: text),
-            .init(name: "evidence_ids", description: "Evidence IDs the summary relies on.", schema: array(evidenceID, maximum: 4)),
+            .init(name: "evidence_ids", description: "Up to four evidence IDs that best answer the question. The app writes the answer directly from these checks.", schema: array(evidenceID, maximum: 4)),
         ]
         if !hypotheses.isEmpty {
             let verdict = DynamicGenerationSchema(name: "Verdict", properties: [
@@ -345,7 +362,8 @@ struct AIHelper {
             properties.append(.init(name: "verdicts", schema: array(verdict, maximum: hypotheses.count)))
         }
         properties.append(.init(name: "suggested_actions", description: "At most two action IDs such as A1, only when evidence supports them.", schema: array(actionID, maximum: 2)))
-        properties.append(.init(name: "phase", schema: choice("Phase", "complete only when a hypothesis is supported.", ["complete", "inconclusive"])))
+        let phases = hypotheses.isEmpty ? ["inconclusive"] : ["complete", "inconclusive"]
+        properties.append(.init(name: "phase", schema: choice("Phase", "complete only when a cited hypothesis is supported.", phases)))
         return try GenerationSchema(root: DynamicGenerationSchema(name: "Report", properties: properties), dependencies: [])
     }
 
@@ -356,7 +374,6 @@ struct AIHelper {
             return ["hypothesis": hypothesis, "status": status]
         }
         return [
-            "summary": object["summary"] as? String ?? "",
             "evidence_ids": strings(object, "evidence_ids"),
             "verdicts": verdicts,
             "suggested_actions": strings(object, "suggested_actions"),
@@ -405,6 +422,7 @@ struct AIHelper {
         if case .unavailable(let reason) = model.availability {
             emitter.emit(["protocol": protocolVersion, "request_id": request.requestID, "available": false,
                           "type": "error", "error_code": unavailableCode(reason),
+                          "diagnostics": modelDiagnostics(model),
                           "error": "Apple Intelligence unavailable. Check System Settings and model downloads."])
             return
         }
@@ -415,7 +433,7 @@ struct AIHelper {
             } else {
                 tokenCounting = false
             }
-            emitter.emit(response(request, ["capabilities": [
+            emitter.emit(response(request, ["diagnostics": modelDiagnostics(model), "capabilities": [
                 "helper_version": helperVersion,
                 "provider": "Apple Foundation Models · on-device",
                 "context_size": model.contextSize,

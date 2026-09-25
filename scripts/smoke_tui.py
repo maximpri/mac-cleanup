@@ -126,7 +126,7 @@ class Session:
                 return
             if self.process.poll() is not None:
                 raise AssertionError(f"TUI exited before {text!r}: {self.process.returncode}")
-        raise AssertionError(f"TUI did not display {text!r} within {timeout}s")
+        raise AssertionError(f"TUI did not display {text!r} within {timeout}s\n{self.screen.text()}")
 
     def send(self, keys):
         os.write(self.master, keys)
@@ -180,64 +180,121 @@ def main():
         print("PASS: read-only JSON schema 5")
         session = Session(binary, "--analyze", "--volume", str(root))
         try:
+            session.wait_for("Total used", timeout=45)
+            # A real memory-pressure warning can precede storage findings.
+            # Select the fixture explicitly before checking its folder map.
+            session.wait_for("Volume Trash")
+            for _ in range(12):
+                if re.search(r"›\s+Volume Trash(?:\s|$)", session.screen.text()):
+                    break
+                session.send(b"\x1b[B")
+                session.pump(0.2)
+            else:
+                raise AssertionError(f"fixture Trash was not selected\n{session.screen.text()}")
+            session.wait_for("CONTENTS HEATMAP")
+            session.wait_for("disposable-fixture.bin")
+            session.send(b"\x1bOR")  # F3: auto-detected Apple model and readiness.
+            session.wait_for("auto-detected")
+            session.wait_for("Automatic")
+            session.send(b"\x1b")
+            session.wait_for("CONTENTS HEATMAP")
+            session.send(b"v")
+            session.wait_for("STORAGE BALANCE")
+            session.wait_for("Outside this scan")
+            session.send(b"\x1b")
             session.wait_for("WHERE")
             session.send(b":")
             session.wait_for("COMMANDS")
             session.send(b"history\r")
-            session.wait_for("HISTORY")
-            session.send(b"1")
+            session.wait_for("SAVED SCANS")
+            session.send(b"g")
             session.wait_for("WHERE")
+            session.send(b"\r")  # Open the selected finding directly.
+            session.wait_for("FOLDERS")
+            session.wait_for("disposable-fixture.bin")
+            session.send(b"\r")  # A file opens details; Esc only leaves those details.
+            session.wait_for("Tab to list")
+            session.send(b"\x1b")
+            session.wait_for("Tab to focus")
+            session.send(b"v")
+            session.wait_for("TOTALS & COVERAGE")
+            session.send(b"\x1b[D")  # Left closes coverage before any folder navigation.
+            session.wait_for("DETAILS")
+            session.wait_for("FOLDERS")
+            session.send(b"\x1b[D")  # Actual parent contains the sibling keep.txt.
+            session.wait_for("keep.txt")
+            session.send(b"\x1b")  # Back restores the folder we came from.
+            session.wait_for("disposable-fixture.bin")
+            session.send(b"\x1b")
+            session.wait_for("WHERE")
+            session.send(b"\r")
+            session.wait_for("FOLDERS")
+            session.send(b"t ")  # Neither Trash nor cleanup is selectable read-only.
+            session.pump(0.2)
+            session.send(b"p")
+            session.wait_for("YOUR PLAN IS EMPTY")
+            assert candidate.exists(), "browsing and read-only actions must preserve files"
+            session.send(b"\x1b")
+            session.wait_for("FOLDERS")
+            session.send(b"g")
+            session.wait_for("WHERE")
+            session.send(b"b")
+            session.wait_for("FOLDERS")
             session.send(b"\t")
-            session.wait_for("EXPLORE")
+            session.wait_for("Tab to list")
+            session.send(b"\t")
             session.send(b"P")
             session.wait_for("LIVE PROCESSES")
             session.send(b"\x1b")
-            session.wait_for("Overview")
+            session.wait_for("DISKRAY")
             session.resize(60, 16)
-            session.wait_for("Overview")
+            session.wait_for("DISKRAY")
             session.send(b"?")
             session.wait_for("HELP")
             session.send(b" ")
             session.pump(0.15)
             assert candidate.exists(), "help must capture action keys"
             session.send(b"\x1b")
-            session.wait_for("EXPLORE")
-            session.send(b"\t")
-            session.wait_for("HISTORY")
+            session.wait_for("FOLDERS")
+            session.send(b"h")
+            session.wait_for("SAVED SCANS")
             session.send(b"\r")
             session.wait_for("RESULTS")
             session.send(b"\x1b")
-            session.wait_for("HISTORY")
+            session.wait_for("SAVED SCANS")
             session.resize(45,12)
             session.wait_for("Expand the terminal")
             session.send(b"CLEAN\r")
             session.pump(0.8)  # Keep the window small until queued keys have been handled.
             assert candidate.exists()
             session.resize(120,30)
-            session.wait_for("Overview")
+            session.wait_for("DISKRAY")
             time.sleep(0.25)
             session.send(b"q")
             assert session.wait_exit()==0
         finally:
             session.close()
-        print("PASS: Overview home, command palette, tabs, process inspection, read-only resize, and exit")
+        print("PASS: two panels, command palette, panel focus, process inspection, read-only resize, and exit")
         session = Session(binary, "--analyze", "--volume", str(root))
         try:
             session.wait_for("✓ Scan", timeout=45)
+            session.wait_for("Ask AI ›")
             session.send(b"/")
-            session.pump(0.4)
-            if "ASK ABOUT THIS MAC" in session.screen.text():
-                session.send(b"q")
-                session.pump(0.3)
-                assert session.process.poll() is None, "q is text inside the Ask box"
-                session.send(b"\x1b")
-                session.wait_for("WHERE")
-            else:
-                session.wait_for("Ask needs Apple Intelligence")
+            session.wait_for("Esc browse")
+            session.send(b"q")
+            session.wait_for("Ask AI › q")
+            assert session.process.poll() is None, "q is text inside the Ask box"
+            session.send(b"\x1b")
+            session.wait_for("WHERE")
+            assert "Ask AI › q" in session.screen.text(), "Esc must preserve the draft"
+            session.send(b"/")
+            session.wait_for("Esc browse")
+            assert "Ask AI › q" in session.screen.text(), "refocusing must restore the draft"
+            session.send(b"\x1b")
             session.pump(3.0)  # Let measured triage settle so the selection is stable.
             session.send(b"i")
-            session.pump(0.3)
-            session.send(b"\r")
+            # i already focuses details. An extra Enter can clear the completion
+            # message when a small fixture's investigation finishes immediately.
             session.wait_for("Investigation finished", timeout=90)
             seen = session.screen.text()
             for _ in range(12):  # PgDn: measurements come before interpretation.
@@ -265,7 +322,11 @@ def main():
                 session.send(b"p")
                 session.wait_for("Reviewing your plan")
                 review_text = session.screen.text()
-                if str(trash) in review_text:
+                # Exact paths wrap in the right panel. Rejoin its bordered
+                # content without interleaving text from the persistent list.
+                right_text = "".join(line.rsplit("│", 2)[-2].strip()
+                                     for line in review_text.splitlines() if line.count("│") >= 4)
+                if str(trash) in right_text:
                     break
                 if "YOUR PLAN IS EMPTY" in review_text:
                     session.send(b"\x1b")
