@@ -2255,3 +2255,35 @@ fn nested_folder_map_opens_exact_paths_and_preserves_review_selection() {
             .all(|c| !matches!(c.bg, Color::Rgb(..)))
     );
 }
+
+#[test]
+fn path_truncation_keeps_the_item_name_and_elides_whole_folders() {
+    let path = "~/Projects/app/target/debug/app";
+    assert_eq!(truncate_path(path, 40), path);
+    assert_eq!(truncate_path(path, 20), "~/…/target/debug/app");
+    assert_eq!(truncate_path(path, 15), "~/…/debug/app");
+    assert_eq!(truncate_path(path, 12), "…/debug/app");
+    assert_eq!(truncate_path(path, 6), "…/app");
+    assert_eq!(
+        truncate_path("~/a/an-extremely-long-file-name.bin", 12)
+            .chars()
+            .count(),
+        12
+    );
+    assert_eq!(
+        truncate_path("plain-name-without-slashes", 10)
+            .chars()
+            .count(),
+        10
+    );
+}
+
+#[test]
+fn share_bars_are_proportional_and_exactly_as_wide_as_requested() {
+    for ratio in [0.0, 0.01, 0.33, 0.5, 0.999, 1.0, 1.5] {
+        assert_eq!(share_bar(ratio, 10).chars().count(), 10, "{ratio}");
+    }
+    assert_eq!(share_bar(1.0, 4), "████");
+    assert_eq!(share_bar(0.5, 4), "██  ");
+    assert_eq!(share_bar(0.0, 3), "   ");
+}

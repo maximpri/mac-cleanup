@@ -260,6 +260,8 @@ impl Server {
         // The project search does not need the disk assessment.
         let outcome = if name == "stale_artifacts" {
             Ok(self.stale_artifacts(&arguments))
+        } else if name == "old_installers" {
+            Ok(self.old_installers())
         } else {
             match self.snapshot_ready() {
                 Err(waiting) => Ok(ToolText::plain(waiting)),
@@ -705,6 +707,28 @@ impl Server {
         }
     }
 
+    fn old_installers(&self) -> ToolText {
+        let report = crate::installers::find(&self.home);
+        let mut lines = if report.installers.is_empty() {
+            vec!["No installer files over 1 MB in Downloads or Desktop.".to_string()]
+        } else {
+            let mut lines = vec![format!(
+                "{} in installer files, {} for apps already installed (report only; cannot be proposed for cleanup):",
+                format_kb(report.total_kb()),
+                format_kb(report.redundant_kb())
+            )];
+            lines.extend(report.lines(|path| agent_tools::short_path(path, &self.home), 25));
+            lines
+        };
+        if !report.complete {
+            lines.push("Partial: the search stopped at its size limit.".into());
+        }
+        ToolText {
+            text: lines.join("\n"),
+            structured: Some(report.to_json()),
+        }
+    }
+
     /// Save a proposal of eligible cleanup targets for the user to review.
     fn propose(&mut self, arguments: &Value) -> Result<ToolText, String> {
         let paths: Vec<&str> = arguments
@@ -896,6 +920,12 @@ pub fn tool_definitions() -> Vec<Value> {
             "description": "Build output (node_modules, target, .venv, .build, .gradle, .next) in projects nobody has touched for a while, with how to regenerate each. Report only; these cannot be proposed for cleanup.",
             "inputSchema": {"type": "object", "properties": {"min_age_days": {"type": "integer", "minimum": 1, "maximum": 3650, "description": "Report projects untouched for at least this many days (default 60)."}}, "additionalProperties": false},
             "annotations": read_only("Stale build output"),
+        }),
+        json!({
+            "name": "old_installers",
+            "description": "Installer files (.dmg, .pkg, .xip, .iso) in Downloads and Desktop with size, age, whether the matching app is already installed, and whether one is mounted. Report only; these cannot be proposed for cleanup.",
+            "inputSchema": empty,
+            "annotations": read_only("Old installers"),
         }),
         json!({
             "name": "propose_cleanup",

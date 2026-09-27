@@ -118,6 +118,11 @@ with tempfile.TemporaryDirectory(prefix="diskray-mcp-") as temporary:
     assert not artifacts["isError"] and artifacts["structuredContent"]["deleted"] is False
     print("PASS: stale_artifacts reports without needing the assessment")
 
+    installers = client.call("old_installers", {})
+    assert not installers["isError"] and installers["structuredContent"]["deleted"] is False
+    assert installers["structuredContent"]["schema"] == "diskray.installers/1"
+    print("PASS: old_installers reports without needing the assessment")
+
     for escape in [str(root / ".." / ".."), "/etc", str(root / "etc-link"), "relative"]:
         result = client.call("list_children", {"path": escape})
         assert result["isError"], (escape, result)

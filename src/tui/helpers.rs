@@ -22,6 +22,47 @@ pub(super) fn truncate_middle(value: &str, max_chars: usize) -> String {
     format!("{prefix}…{suffix}")
 }
 
+/// Shorten a `/`-separated path by eliding whole leading folders, so the
+/// item's own name stays readable: `~/Projects/app/target/debug/app` becomes
+/// `~/…/debug/app` rather than a cut through the middle of a folder name.
+/// Falls back to [`truncate_middle`] when even the final name is too long.
+pub(super) fn truncate_path(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    let parts: Vec<&str> = value.split('/').collect();
+    let fits = |candidate: &String| candidate.chars().count() <= max_chars;
+    if parts.len() > 2 {
+        let head = parts[0];
+        for start in 2..parts.len() {
+            let tail = parts[start..].join("/");
+            let candidate = format!("{head}/…/{tail}");
+            if !head.is_empty() && fits(&candidate) {
+                return candidate;
+            }
+            let candidate = format!("…/{tail}");
+            if fits(&candidate) {
+                return candidate;
+            }
+        }
+    }
+    truncate_middle(parts.last().copied().unwrap_or(value), max_chars)
+}
+
+/// A proportional bar drawn with eighth blocks, `width` cells wide.
+pub(super) fn share_bar(ratio: f64, width: usize) -> String {
+    const EIGHTHS: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+    let eighths = (ratio.clamp(0., 1.) * (width * 8) as f64).round() as usize;
+    let full = eighths / 8;
+    let partial = EIGHTHS[eighths % 8];
+    let used = full + usize::from(!partial.is_empty());
+    format!(
+        "{}{partial}{}",
+        "█".repeat(full),
+        " ".repeat(width.saturating_sub(used))
+    )
+}
+
 pub(super) fn render_vertical_scrollbar(
     frame: &mut Frame<'_>,
     area: Rect,
