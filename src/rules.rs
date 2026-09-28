@@ -729,6 +729,11 @@ mod tests {
                 "Crash reports",
                 CacheTier::Routine,
             ),
+            (
+                ".codex/sessions",
+                "Codex conversation transcripts",
+                CacheTier::ReviewOnly,
+            ),
         ];
         let rules = &builtin().rules;
         assert_eq!(rules.len(), legacy.len());

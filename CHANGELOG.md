@@ -12,6 +12,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `.pkg`, `.xip`, and `.iso` files in Downloads and Desktop with their age,
   whether the matching app is already installed, and whether one is mounted.
   Report only.
+- `~/.codex/sessions` is identified as Codex conversation transcripts
+  (review only). The guidance points to `codex delete`, which removes each
+  transcript together with its history records.
 - Storage rows show a proportional size bar and each item's share of used
   space, and long paths keep the item's own name (`~/…/target/debug/app`)
   instead of cutting through a folder name.
