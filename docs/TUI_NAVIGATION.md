@@ -113,10 +113,11 @@ The answer contains the question, selected measured findings, and tool timeline.
 Intelligence to submit, but drafts can be written while it is unavailable.
 Diskray rechecks availability every 30 seconds while unavailable; focusing Ask
 or pressing Enter also retries. A draft is never sent automatically when AI
-becomes ready. While AI is unavailable, the bar highlights the current
-English (US) requirement and the reported reason. `F3` opens local AI status:
-the current requirement to use English (United States) for both Mac and Siri,
-the auto-selected Apple model, current language support,
+becomes ready. While AI is unavailable, the bar shows the reported reason;
+terminals under 24 rows fold it into a clickable `F3` badge on the input line
+until you start typing. `F3` opens local AI status: the requirements, a
+language blocker only when the Mac language is unsupported or differs from
+Siri's, the auto-selected Apple model, current language support,
 Mac and Siri language settings when detected, and recovery guidance. Apple
 exposes one general-purpose on-device model through the installed framework;
 macOS selects its version, so there is no alternate version picker. `F2` opens

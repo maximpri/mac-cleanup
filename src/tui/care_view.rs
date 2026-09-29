@@ -5661,7 +5661,8 @@ mod tests {
         };
         for width in [60, 80, 120] {
             let text = screen_text(&app, &w, width, 24, "ai-blocker");
-            assert!(text.contains("English (US) required"), "{text}");
+            assert!(text.contains("AI unavailable"), "{text}");
+            assert!(!text.contains("English (US) required"), "{text}");
             assert!(text.contains("F3 AI") && text.contains("F2 Settings"));
         }
         w.asking = Some("What grew?".into());
@@ -5670,11 +5671,9 @@ mod tests {
         assert_eq!(w.ask_draft, "What grew?");
         assert!(w.asking.is_none());
         let text = screen_text(&app, &w, 120, 36, "ai-status");
-        assert!(text.contains("CURRENT AI REQUIREMENT"), "{text}");
-        assert!(
-            text.contains("both Mac and Siri to English (United States)"),
-            "{text}"
-        );
+        assert!(text.contains("AI REQUIREMENTS"), "{text}");
+        assert!(text.contains("LANGUAGE BLOCKER"), "{text}");
+        assert!(!text.contains("English (United States)"), "{text}");
         assert!(text.contains("Mac/Siri languages differ"), "{text}");
         assert!(
             text.contains("auto-detected") && text.contains("Automatic"),

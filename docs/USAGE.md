@@ -8,6 +8,7 @@
 | `diskray why` | One-screen explanation: capacity, hidden space, largest folders, quick wins, what grew. `--json` for scripts |
 | `diskray ask "why is my disk full?"` | One question answered by the on-device model using read-only tools |
 | `diskray artifacts` | Build output (`node_modules`, `target`, `.venv`, …) in projects untouched for 60+ days. Report only |
+| `diskray installers` | Installer files (`.dmg`, `.pkg`, `.xip`, `.iso`) in Downloads and Desktop, with age and whether the app is already installed. `--json` for scripts. Report only |
 | `diskray mcp` | Read-only tools for coding agents over MCP ([docs/MCP.md](MCP.md)) |
 | `diskray review` | Review a cleanup proposal an agent saved, with the usual confirmation |
 | `diskray rules list` / `check FILE` | Show or validate cleanup rule packs ([docs/RULES.md](RULES.md)) |
@@ -97,9 +98,9 @@ coverage. Small terminals show a compact subtotal with the full balance on `v`.
 
 **Ask AI** stays visible below both panels. Press `/` or click it to type,
 then `Enter` to ask. `Esc` or `Tab` returns to browsing and preserves your draft.
-**For now, local AI requires both Mac and Siri to use English (United States)**
-(`en-US`), with Apple Intelligence enabled and its model setup complete.
-`F3` shows this requirement alongside the detected language settings and model status.
+Local AI needs Apple Intelligence turned on with its model downloaded, and the
+Mac and Siri set to the same language that Apple Intelligence supports.
+`F3` shows the detected languages, any real language blocker, and model status.
 You can draft a question even while Apple Intelligence is unavailable; Diskray
 rechecks every 30 seconds and on Enter. `F2` opens System Settings. Questions
 are sent only when you press Enter with AI ready.

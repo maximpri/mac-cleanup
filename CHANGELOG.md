@@ -6,6 +6,30 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `diskray installers` (and the `old_installers` MCP tool) reports `.dmg`,
+  `.pkg`, `.xip`, and `.iso` files in Downloads and Desktop with their age,
+  whether the matching app is already installed, and whether one is mounted.
+  Report only.
+- `~/.codex/sessions` is identified as Codex conversation transcripts
+  (review only). The guidance points to `codex delete`, which removes each
+  transcript together with its history records.
+- Storage rows show a proportional size bar and each item's share of used
+  space, and long paths keep the item's own name (`~/…/target/debug/app`)
+  instead of cutting through a folder name.
+
+### Changed
+
+- Local AI no longer claims to require English (United States). Diskray shows
+  a language blocker only when the Mac language is unsupported by Apple's
+  model or differs from Siri's.
+- Investigations tell the model how many tool calls remain, answer a repeated
+  identical call with its earlier evidence ID instead of re-running it, and
+  retry once when the on-device model is busy.
+- On terminals under 24 rows the Ask bar takes one line until you type.
+- The storage footer shows `/ ask` instead of a second "browse" command.
+
 ### Fixed
 
 - The startup volume's capacity came from the sealed system volume, so the

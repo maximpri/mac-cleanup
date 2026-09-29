@@ -25,7 +25,13 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, area: Rect, app: &App, w: &W
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(5),
-        Constraint::Length(if show_ask { 4 } else { 0 }),
+        // Short terminals fold the AI status into the input line until the
+        // user starts typing, so the panels keep the rows.
+        Constraint::Length(match (show_ask, area.height < 24 && w.asking.is_none()) {
+            (false, _) => 0,
+            (true, true) => 3,
+            (true, false) => 4,
+        }),
         Constraint::Length(notice_height),
         Constraint::Length(2),
     ])
@@ -158,7 +164,24 @@ fn render_ask(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
         draft
     };
     let prefix = "Ask AI › ";
-    let room = inner.width.saturating_sub(prefix.chars().count() as u16) as usize;
+    let compact = inner.height < 2;
+    let badge = if compact {
+        match &w.ai_framework {
+            ai::FrameworkStatus::Available { .. } => " F3 AI ready ".to_string(),
+            other => format!(" F3 {} ", other.compact()),
+        }
+    } else {
+        String::new()
+    };
+    let input_row = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width.saturating_sub(badge.chars().count() as u16),
+        inner.height.min(1),
+    );
+    let room = input_row
+        .width
+        .saturating_sub(prefix.chars().count() as u16) as usize;
     let text = if active {
         format!("{}▏", truncate_middle(input, room.saturating_sub(1)))
     } else {
@@ -172,8 +195,19 @@ fn render_ask(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
                 Style::default().fg(app.color(if placeholder { MUTED } else { INK })),
             ),
         ])),
-        inner,
+        input_row,
     );
+    if compact && inner.width > badge.chars().count() as u16 + 20 {
+        let rect = Rect::new(input_row.right(), inner.y, badge.chars().count() as u16, 1);
+        let color = if w.model_ready() { MUTED } else { AMBER };
+        frame.render_widget(
+            Paragraph::new(badge.clone()).style(Style::default().fg(app.color(color))),
+            rect,
+        );
+        w.hits
+            .borrow_mut()
+            .push((rect, Control::Key(KeyCode::F(3))));
+    }
     let (status, status_color) = match &w.ai_framework {
         ai::FrameworkStatus::Detecting => ("Checking Apple Intelligence…".into(), MUTED),
         ai::FrameworkStatus::Available { .. } => ("Apple Intelligence · on-device".into(), MUTED),
@@ -182,10 +216,7 @@ fn render_ask(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
             AMBER,
         ),
         ai::FrameworkStatus::Unavailable { detail, .. } => (
-            format!(
-                "English (US) required for now · {}",
-                ai::display_text(detail)
-            ),
+            format!("AI unavailable · {}", ai::display_text(detail)),
             AMBER,
         ),
     };
@@ -249,7 +280,7 @@ fn render_ask(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
 
 fn render_ai_status(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
     let mut text = format!(
-        "CURRENT AI REQUIREMENT\nFor now, set both Mac and Siri to English (United States), en-US.\nApple Intelligence must be enabled and its model setup complete.\n\nApple on-device model · Automatic\n\n{}\n",
+        "AI REQUIREMENTS\nApple silicon, macOS 26 or later, and Apple Intelligence turned on with its model downloaded.\nMac and Siri must use the same language, and Apple Intelligence must support it.\n\nApple on-device model · Automatic\n\n{}\n",
         w.ai_framework.description(),
     );
     if let Some(diagnostics) = w.ai_framework.diagnostics() {
@@ -268,13 +299,10 @@ fn render_ai_status(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace)
                 .unwrap_or_else(|| "not reported".into()),
         ));
         if !w.model_ready() {
-            if diagnostics.locale_supported
-                && diagnostics.siri_language.as_deref()
-                    == Some(diagnostics.device_language.as_str())
-            {
-                text.push_str("\nYour detected languages match and Apple's framework lists them as supported. Diskray's current setup requirement remains English (United States) for both Mac and Siri. Language support alone does not make the model ready.\n\nIF MODEL SETUP STAYS UNAVAILABLE\n1. F2 opens Settings: use English (United States) for both Mac and Siri, then allow Apple's model setup to finish.\n2. If setup remains stuck, save your work and restart the Mac, then check again.\n3. If it still fails, check macOS updates or contact Apple Support.\n\nThe framework cannot tell Diskray whether a download is progressing or a system service has failed. Diskray cannot install or repair Apple's model assets. Automatic rechecks detect recovery; they do not repair macOS.\n");
+            if let Some(blocker) = diagnostics.language_blocker() {
+                text.push_str(&format!("\nLANGUAGE BLOCKER\n{blocker}\nF2 opens Settings. Choose one supported language for both Mac and Siri, then allow Apple's model setup to finish.\n"));
             } else {
-                text.push_str("\nF2 opens Settings. For now, set both Mac and Siri to English (United States), then allow Apple's model setup to finish.\n");
+                text.push_str("\nYour Mac and Siri languages match and Apple's model supports them, so language is not the blocker.\n\nIF MODEL SETUP STAYS UNAVAILABLE\n1. F2 opens Settings: check Apple Intelligence & Siri and allow Apple's model download to finish.\n2. If setup remains stuck, save your work and restart the Mac, then check again.\n3. If it still fails, check macOS updates or contact Apple Support.\n\nThe framework cannot tell Diskray whether a download is progressing or a system service has failed. Diskray cannot install or repair Apple's model assets. Automatic rechecks detect recovery; they do not repair macOS.\n");
             }
         }
         if diagnostics.context_size > 0 {
@@ -289,7 +317,7 @@ fn render_ai_status(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace)
     text.push_str("\nMODEL CHOICE\nAutomatic: macOS selects the Apple model for this Mac. No alternative general-purpose on-device model is exposed to Diskray.\n\nAll inference stays on this Mac. Your system languages stay as you set them.\n\nDiskray checks again every 30 seconds while unavailable. r checks now; your Ask draft is preserved.");
     if let Some(diagnostics) = w.ai_framework.diagnostics() {
         text.push_str(&format!(
-            "\n\nLanguages reported by Apple's framework (Diskray currently requires English, US):\n{}",
+            "\n\nLanguages Apple's on-device model supports:\n{}",
             diagnostics
                 .supported_languages
                 .iter()
@@ -386,6 +414,21 @@ fn meter(ratio: f64, width: usize) -> String {
         "━".repeat(filled),
         "┄".repeat(width.saturating_sub(filled))
     )
+}
+
+/// An item's share of used space: "42%", "0.4%", or "<0.1%".
+fn share_label(size_kb: u64, used_kb: u64) -> String {
+    if used_kb == 0 || size_kb == 0 {
+        return String::new();
+    }
+    let percent = size_kb as f64 * 100. / used_kb as f64;
+    if percent >= 9.95 {
+        format!("{:.0}%", percent.min(100.))
+    } else if percent >= 0.1 {
+        format!("{percent:.1}%")
+    } else {
+        "<0.1%".into()
+    }
 }
 
 /// "3217270" → "3.2M", for counts of scanned files.
@@ -1404,6 +1447,9 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) 
     }
     let capacity = (rows_height / row_height).max(1);
     let start = w.cursor.saturating_sub(capacity - 1);
+    // Bars compare rows with the largest listed item, like a size-sorted
+    // folder view; the percentage is each item's share of used space.
+    let largest_kb = visible.iter().map(|f| f.size_kb).max().unwrap_or(0);
     for (row, (index, f)) in visible
         .iter()
         .enumerate()
@@ -1418,7 +1464,7 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) 
             String::new()
         };
         let name_width = width.saturating_sub(2 + 9);
-        let name = truncate_middle(&row_name(app, f), name_width);
+        let name = truncate_path(&row_name(app, f), name_width);
         let selected = index == w.cursor;
         let base = if selected {
             selected_row_style(app)
@@ -1431,10 +1477,28 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) 
             Span::styled(format!("{size:>9}"), base),
         ]));
         if row_height == 2 {
-            lines.push(Line::styled(
+            let share = share_label(f.size_kb, o.used_kb);
+            let bar_width = (width / 5).min(14);
+            let room = width.saturating_sub(2 + verdict_text.chars().count());
+            let status = Span::styled(
                 format!("  {}", truncate_end(&verdict_text, width.saturating_sub(2))),
                 base.fg(app.color(color)),
-            ));
+            );
+            let mut spans = vec![status];
+            // Proportion is shown only when it fits beside the whole status.
+            if largest_kb > 0 && f.size_kb > 0 && bar_width >= 4 && room > bar_width + 6 {
+                let bar = share_bar(f.size_kb as f64 / largest_kb as f64, bar_width);
+                spans.push(Span::styled(
+                    format!("{:>pad$}", "", pad = room - bar_width - 6),
+                    base,
+                ));
+                spans.push(Span::styled(bar, base.fg(app.color(color))));
+                spans.push(Span::styled(
+                    format!("{share:>6}"),
+                    base.fg(app.color(MUTED)),
+                ));
+            }
+            lines.push(Line::from(spans));
         }
         w.hits.borrow_mut().push((
             Rect::new(
@@ -2380,8 +2444,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
                 if !app.analysis_only && w.findings.iter().any(|f| f.quick_win) {
                     commands.push(("a", "quick wins", KeyCode::Char('a')));
                 }
-                commands.push(("e", "browse", KeyCode::Char('e')));
                 commands.push(("i", "investigate", KeyCode::Char('i')));
+                commands.push(("/", "ask", KeyCode::Char('/')));
             }
             Screen::Explore => {
                 commands.extend([

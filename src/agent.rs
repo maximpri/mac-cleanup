@@ -19,7 +19,7 @@ use crate::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{
         Arc,
@@ -184,6 +184,11 @@ pub struct AgentRun {
     script_seq: usize,
     notes: Vec<String>,
     activity: Option<String>,
+    /// Evidence already collected per (tool, target label). Greedy sampling
+    /// on a small model can repeat an identical call; the repeat is answered
+    /// with the earlier evidence ID instead of spending the budget again.
+    seen: HashMap<(&'static str, String), String>,
+    repeats: u8,
 }
 
 pub fn start(
@@ -252,6 +257,8 @@ pub fn start(
         context_bytes: 0,
         evidence_seq: case.evidence.len(),
         script_seq: 0,
+        seen: HashMap::new(),
+        repeats: 0,
         notes: Vec::new(),
         activity: None,
     };
@@ -361,6 +368,15 @@ impl AgentRun {
         self.driver = Driver::Finisher(helper);
         self.activity = Some("writing the report from collected evidence".into());
         Ok(())
+    }
+
+    /// " · 3 tool calls left", so the model can plan its remaining checks.
+    fn calls_left_note(&self) -> String {
+        match self.budget.saturating_sub(self.calls) {
+            0 => " · No tool calls left; write the report.".into(),
+            1 => " · 1 tool call left".into(),
+            left => format!(" · {left} tool calls left"),
+        }
     }
 
     fn reply(&self, call_id: &str, output: &str) {
@@ -527,19 +543,38 @@ impl AgentRun {
         world: &ToolWorld<'_>,
         events: &mut Vec<Event>,
     ) {
-        if self.calls >= self.budget {
+        if self.calls >= self.budget || self.repeats >= self.budget {
             return self.reply(call_id, BUDGET_REPLY);
         }
         if self.context_bytes + agent_tools::OUTPUT_CAP > CONTEXT_BYTES {
             return self.reply(call_id, CONTEXT_REPLY);
         }
-        self.calls += 1;
-        case.decision_count = self.calls;
         let call = match agent_tools::parse_call(tool, arguments, &self.tools) {
             Ok(call) => call,
-            Err(reason) => return self.reject(case, call_id, tool, &reason, by_model),
+            Err(reason) => {
+                self.calls += 1;
+                case.decision_count = self.calls;
+                return self.reject(case, call_id, tool, &reason, by_model);
+            }
         };
         let label = agent_tools::label(&call, &self.handles, world);
+        // A second process sample is a new reading, not a repeat.
+        let repeatable = call.tool.name == "sample_process";
+        if let Some(id) = self
+            .seen
+            .get(&(call.tool.name, label.clone()))
+            .filter(|_| !repeatable)
+        {
+            self.repeats += 1;
+            let reply = format!(
+                "Already checked as {id}. Use that evidence or call a different tool.{}",
+                self.calls_left_note()
+            );
+            self.context_bytes += reply.len();
+            return self.reply(call_id, &reply);
+        }
+        self.calls += 1;
+        case.decision_count = self.calls;
         match agent_tools::dispatch(&call, world, &mut self.handles) {
             Dispatch::Ready(outcome) => self.complete(
                 case,
@@ -690,6 +725,7 @@ impl AgentRun {
     ) {
         self.evidence_seq += 1;
         let id = format!("E{}", self.evidence_seq);
+        self.seen.insert((tool, label.clone()), id.clone());
         let text = agent_tools::cap(&outcome.text);
         let mut record =
             investigation::evidence(&id, outcome.kind, &label, &text, &[], &[], outcome.status);
@@ -714,7 +750,8 @@ impl AgentRun {
         if let Some(inventory) = outcome.inventory {
             events.push(Event::Merge(inventory));
         }
-        let reply = agent_tools::cap(&format!("{id} · {text}"));
+        // The remaining budget follows the capped output so it is never cut.
+        let reply = agent_tools::cap(&format!("{id} · {text}")) + &self.calls_left_note();
         self.context_bytes += reply.len();
         self.reply(call_id, &reply);
         if self.pending.is_empty() && self.approval.is_none() {
@@ -813,7 +850,7 @@ impl AgentRun {
         case.conclusion = Some(summary.clone());
         case.phase = CasePhase::Inconclusive;
         case.suggested_actions.clear();
-        let mut notes: Vec<String> = self.notes.drain(..).collect();
+        let mut notes: Vec<String> = std::mem::take(&mut self.notes);
         notes.extend(note.map(str::to_owned));
         Finish {
             summary,
@@ -1227,8 +1264,11 @@ read done"#,
         let dir = tempfile::tempdir().unwrap();
         agent_helper(
             dir.path(),
-            r#"for n in 1 2 3 4 5; do
-echo "{\"protocol\":3,\"request_id\":\"$id\",\"type\":\"tool_call\",\"call_id\":\"c$n\",\"tool\":\"growth_history\",\"arguments\":\"{\\\"folder\\\":\\\"n1\\\"}\"}"
+            r#"echo "{\"protocol\":3,\"request_id\":\"$id\",\"type\":\"tool_call\",\"call_id\":\"c1\",\"tool\":\"growth_history\",\"arguments\":\"{\\\"folder\\\":\\\"n1\\\"}\"}"
+read result
+case "$result" in *"2 tool calls left"*) ;; *) exit 5;; esac
+for n in 2 3 4 5; do
+echo "{\"protocol\":3,\"request_id\":\"$id\",\"type\":\"tool_call\",\"call_id\":\"c$n\",\"tool\":\"invented_$n\",\"arguments\":\"{}\"}"
 read result
 case "$n:$result" in 4:*budget*) ;; 4:*) exit 4;; esac
 done
@@ -1253,6 +1293,36 @@ read done"#,
                 .skip(1)
                 .all(|evidence| !evidence.status.can_support_hypothesis())
         );
+    }
+
+    #[test]
+    fn repeated_identical_calls_reuse_evidence_without_spending_budget() {
+        let fixture = Fixture::new();
+        let dir = tempfile::tempdir().unwrap();
+        agent_helper(
+            dir.path(),
+            r#"for n in 1 2 3; do
+echo "{\"protocol\":3,\"request_id\":\"$id\",\"type\":\"tool_call\",\"call_id\":\"c$n\",\"tool\":\"folder_age\",\"arguments\":\"{\\\"folder\\\":\\\"n1\\\"}\"}"
+read result
+case "$n:$result" in 1:*E2*) ;; [23]:*"Already checked as E2"*) ;; *) exit 6;; esac
+done
+echo "{\"protocol\":3,\"request_id\":\"$id\",\"type\":\"tool_call\",\"call_id\":\"c4\",\"tool\":\"list_children\",\"arguments\":\"{\\\"folder\\\":\\\"n1\\\"}\"}"
+read result
+case "$result" in *E3*"1 tool call left"*) ;; *) exit 7;; esac
+echo "{\"protocol\":3,\"request_id\":\"$id\",\"type\":\"final\",\"available\":true,\"report\":{\"summary\":\"Done.\",\"evidence_ids\":[\"E2\",\"E3\"],\"verdicts\":[],\"suggested_actions\":[],\"phase\":\"inconclusive\"}}"
+read done"#,
+        );
+        let mut case = InvestigationCase::new_storage("pip", 1, true);
+        baseline(&mut case);
+        let mut run = start(&mut case, fixture.subject(), true, true);
+        ai::set_test_helper(None);
+        let none = |_: &Target| None;
+        let world = fixture.world(&none);
+        let (finish, _) = run_until_finished(&mut run, &mut case, &world, &|_| true);
+        assert!(finish.by_model, "{:?}", finish.notes);
+        assert_eq!(run.calls, 2, "repeats are answered, not re-run");
+        assert_eq!(case.tool_calls.len(), 2);
+        assert_eq!(finish.cited, vec!["E2", "E3"]);
     }
 
     #[test]

@@ -55,11 +55,12 @@ and also accepts paths inside it.
 | `memory_state` | Memory pressure, swap activity, and the largest memory users |
 | `process_details` | One process's identity, state, memory, and parent (never its arguments) |
 | `stale_artifacts` | Build output (`node_modules`, `target`, `.venv`, …) in projects untouched for 60+ days; report only |
+| `old_installers` | Installer files in Downloads and Desktop, with age, whether the app is installed, and whether one is mounted; report only |
 | `propose_cleanup` | Saves up to 10 eligible cleanup-rule targets for your review; deletes nothing |
 
 The first tool call starts a full assessment in the background. Until it
 finishes (usually a minute or two for a startup volume), tools other than
-`stale_artifacts` say so and ask
+`stale_artifacts` and `old_installers` say so and ask
 the agent to try again. The result is cached for five minutes; call
 `disk_overview` with `refresh: true` to start over.
 
