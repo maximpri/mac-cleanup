@@ -850,7 +850,7 @@ impl AgentRun {
         case.conclusion = Some(summary.clone());
         case.phase = CasePhase::Inconclusive;
         case.suggested_actions.clear();
-        let mut notes: Vec<String> = self.notes.drain(..).collect();
+        let mut notes: Vec<String> = std::mem::take(&mut self.notes);
         notes.extend(note.map(str::to_owned));
         Finish {
             summary,
