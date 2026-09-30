@@ -22,6 +22,9 @@ remove, and only then lets you act, one reviewed action at a time.
 - **The space other tools can't see.** Local snapshots, other APFS volumes, and
   space the folder walk cannot read are measured and shown, and every cleanup
   is verified afterwards against the free space macOS reports.
+- **Move useful data to an external drive.** Select a folder and press `m` for
+  measured drive capacity and on-device AI advice. Review the exact move, then
+  Diskray copies and verifies the data and preserves its old path with a symlink.
 
 ## Install
 
@@ -67,7 +70,8 @@ adds a supported cleanup action to your plan. `t` queues a selected personal ite
 for a separate, reviewed Move to Trash; this frees no space until Trash is emptied. `p`
 reviews that plan before anything runs; `:` lists every command.
 The **Ask AI** input stays open below both panels. Press `/` or click it to
-type; `Esc` returns to browsing and keeps your draft.
+type. `Left` / `Right`, `Home` / `End`, `Backspace`, and `Delete` edit your
+question; `Esc` returns to browsing and keeps your draft and cursor position.
 
 ![An explanation: what was measured, what the checks found, what you can do, and how it was checked](docs/images/details.svg)
 

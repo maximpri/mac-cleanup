@@ -94,6 +94,10 @@ impl App {
             relocation_source: None,
             relocation_destination: String::new(),
             relocation_destination_error: None,
+            relocation_destinations: Vec::new(),
+            relocation_advice: String::new(),
+            relocation_allow_ai: true,
+            relocation_advice_worker: None,
             relocation_plan: None,
             relocation_plan_worker: None,
             relocation_worker: None,
@@ -438,30 +442,47 @@ impl App {
             return;
         };
         self.relocation_source = Some(source);
-        self.relocation_destination = self
-            .default_relocation_destination()
-            .map_or_else(String::new, |path| path.display().to_string());
+        self.relocation_destination.clear();
         self.relocation_destination_error = None;
         self.phase = Phase::RelocationDestination;
+        self.start_relocation_advice();
     }
 
-    pub(super) fn default_relocation_destination(&self) -> Option<PathBuf> {
-        self.locations
-            .iter()
-            .find(|location| {
-                location.path.starts_with(Path::new("/Volumes"))
-                    && location.kind == ScanLocationKind::Usb
-            })
-            .or_else(|| {
-                self.locations.iter().find(|location| {
-                    location.path.starts_with(Path::new("/Volumes"))
-                        && location.kind != ScanLocationKind::Network
-                })
-            })
-            .map(|location| location.path.clone())
+    pub(super) fn open_relocation_for_item(&mut self, mut item: StorageItem) -> Result<(), String> {
+        if self.analysis_only {
+            return Err("Relocation is disabled in read-only analysis mode.".into());
+        }
+        if item.kind != StorageItemKind::Directory
+            || !fs::symlink_metadata(&item.path).is_ok_and(|metadata| metadata.is_dir())
+            || crate::cache::has_symlink_component_below(&item.path, Path::new("/"))
+        {
+            return Err(
+                "Select a real folder to move; files and symlinks cannot be relocated.".into(),
+            );
+        }
+        let path = relocation_inventory_path(&item.path)
+            .ok_or("The selected folder is no longer available.")?;
+        let home = self
+            .account_home
+            .canonicalize()
+            .map_err(|e| e.to_string())?;
+        if !((path.starts_with(&home) && path != home)
+            || (path.starts_with("/private/tmp") && path != Path::new("/private/tmp")))
+        {
+            return Err("Select a folder inside your home directory.".into());
+        }
+        item.path = path;
+        self.relocation_sources = vec![item];
+        self.relocation_source_cursor = 0;
+        self.relocation_plan = None;
+        self.relocation_report = None;
+        self.sidebar_focus = false;
+        self.choose_relocation_source();
+        Ok(())
     }
 
     pub(super) fn start_relocation_plan(&mut self) {
+        self.relocation_advice_worker = None;
         let Some(source) = self
             .relocation_source
             .as_ref()

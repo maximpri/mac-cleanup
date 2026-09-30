@@ -76,7 +76,7 @@ case used the measured fallback. Rust checks passed 276 tests (one ignored).
 
 The development Mac now completes actual on-device inference. The release
 helper built with the macOS 27.0 SDK passes `check_ai_helper.py --live`, including
-triage and a tool-using investigation. That
+triage, constrained relocation advice, and a tool-using investigation. That
 investigation called five read-only tools and cited only evidence they returned.
 The framework reported an 8,192-token context; this fixture used 1,029 setup
 tokens. These are local validation results, not performance guarantees.
@@ -93,6 +93,28 @@ records the earlier `modelNotReady` state; it is historical, not the current
 status. A successful protocol-only test still does not establish live inference.
 
 ## How investigations work
+
+### Storage reallocation advice
+
+The `m` move flow also uses the on-device model at the destination decision.
+Rust discovers external Mac-formatted volumes, measures capacity, and gathers
+a bounded modification-age profile of the selected folder. A short structured
+request contains only category, allocated size, recent-change status, and opaque
+volume IDs with capacity figures. In a fresh `SystemLanguageModel.default`
+session, guided generation restricts the answer to one supplied volume ID,
+`keep_local`, or `inspect_first`. Rust rejects unknown choices. Neither paths
+nor file contents are sent to this operation, and there are no model tools.
+
+Measurements appear before inference finishes. Advice is visibly labeled,
+never overwrites destination input, and expires when the user leaves or
+refreshes the screen. A 20-second inference limit, cancellation, and the
+workspace's critical-memory-pressure guard keep measured selection available.
+Missing helpers, unavailable models, and invalid responses show a measured
+fallback. The transfer still requires full engine validation and the ordinary
+move acknowledgment and typed plan confirmation. This advice is separate from
+investigation action badges, which still cannot suggest relocation actions.
+
+### Tool-backed investigations
 
 **Local AI** first ranks measured key areas and eligible quick wins; triage can
 only reorder Rust-approved findings and never changes eligibility. `i` opens an

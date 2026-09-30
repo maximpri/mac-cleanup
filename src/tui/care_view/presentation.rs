@@ -160,7 +160,7 @@ fn render_ask(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
     let prefix = "Ask AI › ";
     let room = inner.width.saturating_sub(prefix.chars().count() as u16) as usize;
     let text = if active {
-        format!("{}▏", truncate_middle(input, room.saturating_sub(1)))
+        input_window(input, if placeholder { 0 } else { w.ask_cursor }, room)
     } else {
         truncate_end(input, room)
     };
@@ -500,16 +500,6 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
             .style(Style::default().fg(app.color(MUTED))),
         parts[1],
     );
-}
-
-/// Cut a sentence at the end with an ellipsis; paths use `truncate_middle`.
-fn truncate_end(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
-        return text.to_string();
-    }
-    let mut cut: String = text.chars().take(width.saturating_sub(1)).collect();
-    cut.push('…');
-    cut
 }
 
 fn activity_status(w: &Workspace) -> Option<String> {
@@ -1569,7 +1559,12 @@ fn render_folders(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
         let lines = vec![
             Line::styled(
                 format!(
-                    "{} {}  {}",
+                    "{}{} {}  {}",
+                    if index == app.explorer_cursor {
+                        "›"
+                    } else {
+                        " "
+                    },
                     if item.kind == StorageItemKind::Directory {
                         "▸"
                     } else {
@@ -1577,21 +1572,28 @@ fn render_folders(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
                     },
                     truncate_middle(
                         &name,
-                        rect.width.saturating_sub(size.len() as u16 + 4) as usize
+                        rect.width.saturating_sub(size.len() as u16 + 5) as usize
                     ),
                     size
                 ),
                 Style::default().fg(app.color(INK)).bold(),
             ),
             Line::styled(
-                format!(
-                    "  {} {:>3}% · {}",
-                    meter(
-                        item.size_kb as f64 / total.max(1) as f64,
-                        if rect.width < 38 { 3 } else { 8 }
-                    ),
-                    percent,
-                    action
+                truncate_end(
+                    &if rect.width < 30 {
+                        format!("{percent}% · {action}")
+                    } else {
+                        format!(
+                            "   {} {:>3}% · {}",
+                            meter(
+                                item.size_kb as f64 / total.max(1) as f64,
+                                if rect.width < 38 { 3 } else { 8 }
+                            ),
+                            percent,
+                            action
+                        )
+                    },
+                    rect.width as usize,
                 ),
                 Style::default().fg(app.color(BLUE)),
             ),
@@ -1636,7 +1638,12 @@ fn render_history_list(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspa
             Paragraph::new(vec![
                 Line::styled(
                     format!(
-                        "{} · {} actions",
+                        "{} {} · {} actions",
+                        if index == w.history_cursor {
+                            "›"
+                        } else {
+                            " "
+                        },
                         crate::history::format_timestamp(
                             std::time::UNIX_EPOCH + Duration::from_secs(s.updated)
                         ),

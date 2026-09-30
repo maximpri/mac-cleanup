@@ -256,8 +256,10 @@ context or bundled Apple reference notes. The app never signals the daemon.
 
 For a large directory that is useful but does not need startup-disk
 performance, use the explicit relocation command. It requires an existing
-directory on a mounted volume under `/Volumes`; the destination must be on a
-different filesystem and network volumes are rejected. The source must be a
+directory on a mounted, writable external APFS or Mac OS Extended volume under
+`/Volumes`; the destination must be on a different filesystem. Internal disks,
+disk images, network volumes, unsupported formats, and ordinary unmounted
+folders under `/Volumes` are rejected. The source must be a
 real directory inside the current account's home or a child of
 `/private/tmp`, with no symlinks, special files, other-user-owned entries, open
 file handles, or running owning application.
@@ -288,6 +290,22 @@ The original path remains usable through the symlink, while new data is stored
 on the external volume. Keep that volume mounted before starting the owning
 application. Relocation is never part of `--clean --yes` and is never inferred
 from the largest-consumer inventory.
+
+The copy budget uses the greater of allocated and logical size, plus 5% or
+64 MiB of overhead (whichever is larger). Capacity is checked again when
+executing the reviewed plan; concurrent disk use can still make a copy fail.
+Device/inode identities and the destination volume UUID must still match.
+Destination commits use macOS exclusive renames, so even an empty pre-existing
+folder cannot be overwritten. Native `copyfile` preserves extended attributes,
+resource forks, ACLs, and timestamps. File bytes are compared again after the
+original is staged and before linking; a mismatch restores the original.
+
+The destination screen's on-device AI advice chooses only from measured drive
+IDs or conservative review decisions. It receives category, size, modification
+age, and capacity facts, without paths or file contents. It cannot create a
+destination, bypass validation, enqueue a move, or confirm a plan. Modification
+age does not establish that data is unused, and compatibility with a symlink
+must be reviewed for the owning app.
 
 
 ## Manually selected Move to Trash

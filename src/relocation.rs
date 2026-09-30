@@ -12,15 +12,135 @@ use std::{
     os::unix::fs::{MetadataExt, symlink},
     path::{Path, PathBuf},
     process,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::Serialize;
 
-use crate::cache::{self, CacheTarget, ScanLocationKind};
+use crate::cache::{self, CacheTarget, PathIdentity};
 
 const VOLUMES_ROOT: &str = "/Volumes";
 const TEMP_ROOT: &str = "/private/tmp";
+
+/// A currently mounted, writable external Mac volume. This is a measurement,
+/// never authorization to move data; planning and execution recheck it.
+#[derive(Debug, Clone)]
+pub struct Destination {
+    pub path: PathBuf,
+    pub free_kb: u64,
+    pub capacity_kb: u64,
+    pub volume_uuid: String,
+}
+
+/// Include room for metadata and allocation overhead. Sparse/compressed data
+/// may expand when copied, so allocated size alone is not enough.
+pub fn required_destination_kb(allocated_kb: u64, logical_bytes: u64) -> u64 {
+    let data = allocated_kb.max(logical_bytes.div_ceil(1024));
+    data.saturating_add((data / 20).max(64 * 1024))
+}
+
+fn plist_value<'a>(plist: &'a str, key: &str, tag: &str) -> Option<&'a str> {
+    let value = plist
+        .split_once(&format!("<key>{key}</key>"))?
+        .1
+        .trim_start();
+    value
+        .strip_prefix(&format!("<{tag}>"))?
+        .split_once(&format!("</{tag}>"))
+        .map(|(value, _)| value)
+}
+
+fn plist_bool(plist: &str, key: &str) -> Option<bool> {
+    let value = plist
+        .split_once(&format!("<key>{key}</key>"))?
+        .1
+        .trim_start();
+    if value.starts_with("<true/>") {
+        Some(true)
+    } else if value.starts_with("<false/>") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn destination_from_info(path: PathBuf, info: &str) -> Result<Destination, String> {
+    if plist_bool(info, "Internal") != Some(false) {
+        return Err("Choose an external disk; internal or unidentified disks are not relocation destinations.".into());
+    }
+    if plist_value(info, "BusProtocol", "string") == Some("Disk Image") {
+        return Err("Choose a physical external drive, not a disk image.".into());
+    }
+    if plist_bool(info, "WritableVolume") != Some(true) {
+        return Err(
+            "The external volume is read-only or its write access could not be verified.".into(),
+        );
+    }
+    if !matches!(
+        plist_value(info, "FilesystemType", "string"),
+        Some("apfs" | "hfs")
+    ) {
+        return Err(
+            "Choose an APFS or Mac OS Extended external volume to preserve Mac file metadata."
+                .into(),
+        );
+    }
+    let number = |key| plist_value(info, key, "integer").and_then(|s| s.trim().parse::<u64>().ok());
+    let free = match (number("VolumeFreeSpace"), number("APFSContainerFree")) {
+        (Some(volume), Some(container)) => Some(volume.min(container)),
+        (volume, container) => volume.or(container),
+    }
+    .or_else(|| number("FreeSpace"))
+    .ok_or("Could not measure free space on the external volume.")?;
+    let uuid = plist_value(info, "VolumeUUID", "string")
+        .filter(|s| !s.is_empty())
+        .ok_or("Could not identify the external volume.")?;
+    Ok(Destination {
+        path,
+        free_kb: free / 1024,
+        capacity_kb: number("TotalSize").ok_or("Could not measure external volume capacity.")?
+            / 1024,
+        volume_uuid: uuid.to_owned(),
+    })
+}
+
+/// Validate a destination without creating files or directories.
+pub fn inspect_destination(path: &Path, source: &Path) -> Result<Destination, String> {
+    let path = validate_destination_root(path, source)?;
+    let text = path
+        .to_str()
+        .ok_or("Destination path is not valid UTF-8.")?;
+    let info = crate::care::query(
+        "/usr/sbin/diskutil",
+        &["info", "-plist", text],
+        Duration::from_secs(5),
+    )
+    .map_err(|error| format!("Could not inspect the external volume: {error}"))?;
+    destination_from_info(path, &info)
+}
+
+/// Discover a bounded list; callers run this off the UI thread.
+pub fn destinations(source: &Path, cancelled: &std::sync::atomic::AtomicBool) -> Vec<Destination> {
+    let mut found = Vec::new();
+    let began = std::time::Instant::now();
+    if let Ok(entries) = fs::read_dir(VOLUMES_ROOT) {
+        for entry in entries.take(32).filter_map(Result::ok) {
+            if cancelled.load(std::sync::atomic::Ordering::Relaxed)
+                || began.elapsed() >= Duration::from_secs(10)
+            {
+                break;
+            }
+            if let Ok(destination) = inspect_destination(&entry.path(), source) {
+                found.push(destination);
+            }
+            if found.len() == 8 {
+                break;
+            }
+        }
+    }
+    found.sort_by(|a, b| b.free_kb.cmp(&a.free_kb).then_with(|| a.path.cmp(&b.path)));
+    found
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RelocationPlan {
@@ -31,6 +151,14 @@ pub struct RelocationPlan {
     pub logical_bytes: u64,
     pub file_count: u64,
     pub directory_count: u64,
+    pub destination_free_kb: u64,
+    pub required_destination_kb: u64,
+    #[serde(skip)]
+    source_identity: PathIdentity,
+    #[serde(skip)]
+    destination_identity: PathIdentity,
+    #[serde(skip)]
+    destination_volume_uuid: String,
     #[serde(skip)]
     account_home: PathBuf,
     #[serde(skip)]
@@ -54,6 +182,8 @@ pub struct RelocationReport {
     pub logical_bytes: u64,
     pub file_count: u64,
     pub directory_count: u64,
+    pub destination_free_kb: u64,
+    pub required_destination_kb: u64,
     pub status: RelocationStatus,
     pub backup_removed: bool,
     pub message: Option<String>,
@@ -78,7 +208,11 @@ pub fn plan(
     require_absolute(destination_root, "destination")?;
 
     let source = validate_source(source, account_home)?;
-    let destination_root = validate_destination_root(destination_root, &source)?;
+    let source_identity = PathIdentity::capture(&source).ok_or("Could not identify the source.")?;
+    let destination_info = inspect_destination(destination_root, &source)?;
+    let destination_root = destination_info.path;
+    let destination_identity = PathIdentity::capture(&destination_root)
+        .ok_or("Could not identify the destination directory.")?;
     let source_device = fs::symlink_metadata(&source)
         .map_err(|error| format!("cannot inspect source {}: {error}", source.display()))?
         .dev();
@@ -105,6 +239,14 @@ pub fn plan(
     })?;
     let size_kb = cache::measure_target_kb(&source, CacheTarget::ExactPath)
         .map_err(|error| format!("could not measure source {}: {error}", source.display()))?;
+    let destination_info = inspect_destination(&destination_root, &source)?;
+    let required_destination_kb = required_destination_kb(size_kb, stats.logical_bytes);
+    if destination_info.free_kb < required_destination_kb {
+        return Err(format!(
+            "Not enough external space: need {required_destination_kb} KiB including copy overhead; {} KiB available. Nothing was moved.",
+            destination_info.free_kb
+        ));
+    }
     ensure_not_open(&source)?;
     ensure_related_process_closed(process_pattern)?;
 
@@ -135,7 +277,7 @@ pub fn plan(
             account_home.display()
         )
     })?;
-    Ok(RelocationPlan {
+    let plan = RelocationPlan {
         source,
         destination_root,
         destination,
@@ -143,11 +285,18 @@ pub fn plan(
         logical_bytes: stats.logical_bytes,
         file_count: stats.file_count,
         directory_count: stats.directory_count,
+        destination_free_kb: destination_info.free_kb,
+        required_destination_kb,
+        source_identity,
+        destination_identity,
+        destination_volume_uuid: destination_info.volume_uuid,
         account_home,
         process_pattern: process_pattern
             .filter(|pattern| !pattern.is_empty())
             .map(str::to_owned),
-    })
+    };
+    ensure_identities(&plan)?;
+    Ok(plan)
 }
 
 pub fn preview(plan: &RelocationPlan) -> RelocationReport {
@@ -179,13 +328,15 @@ struct ExecutionDetails {
 }
 
 fn execute_inner(prepared: &RelocationPlan) -> Result<ExecutionDetails, String> {
+    ensure_identities(prepared)?;
     let current = plan(
         &prepared.source,
         &prepared.destination_root,
         &prepared.account_home,
         prepared.process_pattern.as_deref(),
     )?;
-    if current.destination != prepared.destination
+    if current.destination_volume_uuid != prepared.destination_volume_uuid
+        || current.destination != prepared.destination
         || current.size_kb != prepared.size_kb
         || current.logical_bytes != prepared.logical_bytes
         || current.file_count != prepared.file_count
@@ -226,7 +377,7 @@ fn execute_after_revalidation(prepared: &RelocationPlan) -> Result<ExecutionDeta
         remove_owned_tree(&staging);
         return Err(error);
     }
-    fs::rename(&staging, &prepared.destination).map_err(|error| {
+    rename_exclusive(&staging, &prepared.destination).map_err(|error| {
         remove_owned_tree(&staging);
         format!(
             "could not commit the copy at {}: {error}",
@@ -241,10 +392,21 @@ fn execute_after_revalidation(prepared: &RelocationPlan) -> Result<ExecutionDeta
         remove_owned_tree(&prepared.destination);
         return Err(format!("{error}; the original was not moved"));
     }
-    if let Err(error) = fs::rename(&prepared.source, &backup) {
+    if let Err(error) = rename_exclusive(&prepared.source, &backup) {
         remove_owned_tree(&prepared.destination);
         return Err(format!(
             "could not stage the original source for linking: {error}"
+        ));
+    }
+
+    // Catch same-size edits made after the initial verification. Restore the
+    // original if the committed destination no longer matches it.
+    if let Err(error) = verify_copy(&backup, &prepared.destination) {
+        return Err(rollback_after_link_failure(
+            &prepared.source,
+            &backup,
+            &prepared.destination,
+            format!("the original changed before linking: {error}"),
         ));
     }
 
@@ -297,6 +459,8 @@ fn report_from_plan(
         logical_bytes: plan.logical_bytes,
         file_count: plan.file_count,
         directory_count: plan.directory_count,
+        destination_free_kb: plan.destination_free_kb,
+        required_destination_kb: plan.required_destination_kb,
         status,
         backup_removed,
         message,
@@ -376,11 +540,23 @@ fn validate_destination_root(destination_root: &Path, source: &Path) -> Result<P
         ));
     }
     let volume_root = Path::new(VOLUMES_ROOT).join(volume_name.as_os_str());
-    if cache::scan_location_kind(&volume_root) == ScanLocationKind::Network {
-        return Err(format!(
-            "network volumes are not supported as relocation destinations: {}",
-            volume_root.display()
-        ));
+    let volume_device = fs::symlink_metadata(&volume_root)
+        .map_err(|e| e.to_string())?
+        .dev();
+    let parent_device = fs::symlink_metadata(VOLUMES_ROOT)
+        .map_err(|e| e.to_string())?
+        .dev();
+    let source_device = fs::symlink_metadata(source)
+        .map_err(|e| e.to_string())?
+        .dev();
+    let destination_device = fs::symlink_metadata(&destination_root)
+        .map_err(|e| e.to_string())?
+        .dev();
+    if volume_device == parent_device
+        || volume_device == source_device
+        || destination_device != volume_device
+    {
+        return Err("Destination must be a mounted external filesystem, different from the source; ordinary /Volumes folders are not supported.".into());
     }
     if destination_root == source || destination_root.starts_with(source) {
         return Err("relocation destination cannot be inside the source".into());
@@ -602,8 +778,13 @@ fn copy_tree(source: &Path, destination: &Path) -> io::Result<TreeStats> {
         ));
     }
     if metadata.is_file() {
-        fs::copy(source, destination)?;
-        fs::set_permissions(destination, metadata.permissions())?;
+        #[cfg(target_os = "macos")]
+        copy_mac_metadata_and_data(source, destination, true)?;
+        #[cfg(not(target_os = "macos"))]
+        {
+            fs::copy(source, destination)?;
+            fs::set_permissions(destination, metadata.permissions())?;
+        }
         return Ok(TreeStats {
             logical_bytes: metadata.len(),
             file_count: 1,
@@ -626,8 +807,68 @@ fn copy_tree(source: &Path, destination: &Path) -> io::Result<TreeStats> {
         let entry = entry?;
         stats += copy_tree(&entry.path(), &destination.join(entry.file_name()))?;
     }
+    #[cfg(target_os = "macos")]
+    copy_mac_metadata_and_data(source, destination, false)?;
+    #[cfg(not(target_os = "macos"))]
     fs::set_permissions(destination, metadata.permissions())?;
     Ok(stats)
+}
+
+/// Apple's copyfile preserves resource forks, extended attributes, ACLs, and
+/// timestamps as well as data. Plain byte copies would discard folder metadata.
+#[cfg(target_os = "macos")]
+fn copy_mac_metadata_and_data(source: &Path, destination: &Path, data: bool) -> io::Result<()> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    unsafe extern "C" {
+        fn copyfile(
+            from: *const std::ffi::c_char,
+            to: *const std::ffi::c_char,
+            state: *mut std::ffi::c_void,
+            flags: u32,
+        ) -> std::ffi::c_int;
+    }
+    let from = CString::new(source.as_os_str().as_bytes())?;
+    let to = CString::new(destination.as_os_str().as_bytes())?;
+    // COPYFILE_ACL | STAT | XATTR; file copies add DATA | EXCL.
+    let flags = 7 | (1 << 18) | (1 << 19) | if data { 8 | (1 << 17) } else { 0 };
+    // SAFETY: both NUL-terminated paths live through this call; a null state
+    // asks copyfile to manage its own state, and flags match the macOS SDK.
+    if unsafe { copyfile(from.as_ptr(), to.as_ptr(), std::ptr::null_mut(), flags) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn rename_exclusive(source: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        unsafe extern "C" {
+            fn renamex_np(
+                from: *const std::ffi::c_char,
+                to: *const std::ffi::c_char,
+                flags: u32,
+            ) -> std::ffi::c_int;
+        }
+        let from = CString::new(source.as_os_str().as_bytes())?;
+        let to = CString::new(destination.as_os_str().as_bytes())?;
+        // SAFETY: valid NUL-terminated paths; RENAME_EXCL atomically refuses
+        // any existing destination, including an empty directory or symlink.
+        if unsafe { renamex_np(from.as_ptr(), to.as_ptr(), 4) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (source, destination);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Verified relocation requires macOS.",
+        ))
+    }
 }
 
 fn unique_sibling(path: &Path, role: &str) -> Result<PathBuf, String> {
@@ -659,6 +900,15 @@ fn unique_sibling(path: &Path, role: &str) -> Result<PathBuf, String> {
 
 /// Last checks immediately before the source is renamed aside.
 fn pre_link_checks(plan: &RelocationPlan) -> Result<(), String> {
+    ensure_identities(plan)?;
+    #[cfg(not(test))]
+    if inspect_destination(&plan.destination_root, &plan.source)?.volume_uuid
+        != plan.destination_volume_uuid
+    {
+        return Err(
+            "The external volume changed during the copy; the original was not moved.".into(),
+        );
+    }
     ensure_not_open(&plan.source)?;
     ensure_related_process_closed(plan.process_pattern.as_deref())?;
     let stats = tree_stats(&plan.source)
@@ -668,6 +918,19 @@ fn pre_link_checks(plan: &RelocationPlan) -> Result<(), String> {
         || stats.directory_count != plan.directory_count
     {
         return Err("the source changed after the copy was verified".into());
+    }
+    Ok(())
+}
+
+fn ensure_identities(plan: &RelocationPlan) -> Result<(), String> {
+    if PathIdentity::capture(&plan.source) != Some(plan.source_identity)
+        || PathIdentity::capture(&plan.destination_root) != Some(plan.destination_identity)
+        || cache::has_symlink_component_below(&plan.source, Path::new("/"))
+        || cache::has_symlink_component_below(&plan.destination_root, Path::new("/"))
+    {
+        return Err(
+            "The source or external destination changed since review; nothing was moved.".into(),
+        );
     }
     Ok(())
 }
@@ -702,7 +965,7 @@ fn rollback_after_link_failure(
         )),
     }
     if rollback_errors.is_empty()
-        && let Err(error) = fs::rename(backup, source)
+        && let Err(error) = rename_exclusive(backup, source)
     {
         rollback_errors.push(format!("could not restore the original source: {error}"));
     }
@@ -736,6 +999,10 @@ mod tests {
     use std::io::Write;
 
     fn test_plan(source: &Path, destination_root: &Path) -> RelocationPlan {
+        let source_path = source.canonicalize().unwrap();
+        let destination_path = destination_root.canonicalize().unwrap();
+        let source = source_path.as_path();
+        let destination_root = destination_path.as_path();
         let stats = tree_stats(source).unwrap();
         RelocationPlan {
             source: source.to_path_buf(),
@@ -745,9 +1012,143 @@ mod tests {
             logical_bytes: stats.logical_bytes,
             file_count: stats.file_count,
             directory_count: stats.directory_count,
+            destination_free_kb: u64::MAX,
+            required_destination_kb: required_destination_kb(0, stats.logical_bytes),
+            source_identity: PathIdentity::capture(source).unwrap(),
+            destination_identity: PathIdentity::capture(destination_root).unwrap(),
+            destination_volume_uuid: "fixture".into(),
             account_home: source.parent().unwrap().to_path_buf(),
             process_pattern: None,
         }
+    }
+
+    #[test]
+    fn capacity_accounts_for_sparse_files_and_copy_overhead() {
+        assert_eq!(
+            required_destination_kb(8, 1024 * 1024 * 1024),
+            1_048_576 + 65_536
+        );
+        assert_eq!(required_destination_kb(2_000_000, 10), 2_100_000);
+        assert_eq!(required_destination_kb(u64::MAX, u64::MAX), u64::MAX);
+    }
+
+    const EXTERNAL_INFO: &str = r#"<plist><dict>
+        <key>Internal</key><false/><key>WritableVolume</key><true/>
+        <key>FilesystemType</key><string>apfs</string>
+        <key>VolumeUUID</key><string>fixture-volume</string>
+        <key>VolumeFreeSpace</key><integer>1048576</integer>
+        <key>APFSContainerFree</key><integer>2097152</integer>
+        <key>TotalSize</key><integer>8388608</integer>
+        </dict></plist>"#;
+
+    #[test]
+    fn external_volume_policy_fails_closed_and_respects_volume_limits() {
+        let path = PathBuf::from("/Volumes/Fixture");
+        let info = destination_from_info(path.clone(), EXTERNAL_INFO).unwrap();
+        assert_eq!(info.free_kb, 1024);
+        assert_eq!(info.capacity_kb, 8192);
+        let hfs = EXTERNAL_INFO
+            .replace("<string>apfs</string>", "<string>hfs</string>")
+            .replace(
+                "<key>VolumeFreeSpace</key><integer>1048576</integer>",
+                "<key>FreeSpace</key><integer>1048576</integer>",
+            )
+            .replace("<key>APFSContainerFree</key><integer>2097152</integer>", "");
+        assert_eq!(
+            destination_from_info(path.clone(), &hfs).unwrap().free_kb,
+            1024
+        );
+        for invalid in [
+            EXTERNAL_INFO.replace("<key>Internal</key><false/>", "<key>Internal</key><true/>"),
+            EXTERNAL_INFO.replace("<key>Internal</key><false/>", ""),
+            EXTERNAL_INFO.replace(
+                "<key>WritableVolume</key><true/>",
+                "<key>WritableVolume</key><false/>",
+            ),
+            EXTERNAL_INFO.replace("<string>apfs</string>", "<string>exfat</string>"),
+            EXTERNAL_INFO.replace("<key>VolumeUUID</key><string>fixture-volume</string>", ""),
+        ] {
+            assert!(destination_from_info(path.clone(), &invalid).is_err());
+        }
+        assert!(destination_from_info(path, "").is_err());
+    }
+
+    #[test]
+    fn replaced_source_or_destination_invalidates_review() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("external");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(source.join("data"), "keep this").unwrap();
+        let plan = test_plan(&source, &destination);
+        assert!(ensure_identities(&plan).is_ok());
+        fs::rename(&destination, temp.path().join("old-external")).unwrap();
+        fs::create_dir(&destination).unwrap();
+        assert!(ensure_identities(&plan).is_err());
+        let plan = test_plan(&source, &destination);
+        fs::rename(&source, temp.path().join("old-source")).unwrap();
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("data"), "same size").unwrap();
+        assert!(execute_inner(&plan).is_err());
+        assert_eq!(
+            fs::read(temp.path().join("old-source/data")).unwrap(),
+            b"keep this"
+        );
+    }
+
+    #[test]
+    fn commit_never_overwrites_an_existing_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(source.join("data"), "keep").unwrap();
+        assert!(rename_exclusive(&source, &destination).is_err());
+        assert_eq!(fs::read(source.join("data")).unwrap(), b"keep");
+        assert!(destination.is_dir());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_copy_preserves_file_and_folder_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let copied = temp.path().join("copied");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("data"), "contents").unwrap();
+        let modified = UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        for path in [&source, &source.join("data")] {
+            let status = std::process::Command::new("/usr/bin/xattr")
+                .args(["-w", "com.diskray.fixture", "preserve-me"])
+                .arg(path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            fs::File::open(path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+        }
+        copy_tree(&source, &copied).unwrap();
+        verify_copy(&source, &copied).unwrap();
+        for path in [&copied, &copied.join("data")] {
+            let output = std::process::Command::new("/usr/bin/xattr")
+                .args(["-p", "com.diskray.fixture"])
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap().trim(),
+                "preserve-me"
+            );
+            assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), modified);
+        }
+        fs::write(copied.join("data"), "tampered").unwrap();
+        assert!(verify_copy(&source, &copied).is_err());
+        assert_eq!(fs::read(source.join("data")).unwrap(), b"contents");
     }
 
     #[test]

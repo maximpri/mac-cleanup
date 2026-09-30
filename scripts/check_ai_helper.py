@@ -156,6 +156,15 @@ if "--live" in sys.argv:
     assert response["report"]["phase"] == "inconclusive"
     print("PASS: live report cites missing history without claiming growth")
 
+    relocation = {"category": "personal_data", "allocated_kb": 1048576,
+                  "recently_modified": False,
+                  "destinations": [{"id": "v1", "free_kb": 100000000, "capacity_kb": 200000000}]}
+    response = request({"protocol": PROTOCOL, "request_id": "relocation-live", "operation": "relocation",
+                        "prompt": json.dumps(relocation),
+                        "allowed_destinations": ["v1", "keep_local", "inspect_first"]})
+    assert response["relocation"]["choice"] in {"v1", "keep_local", "inspect_first"}
+    print("PASS: live on-device relocation advice uses only permitted choices")
+
     tools = [
         tool("list_children", HANDLE),
         tool("folder_age", HANDLE),

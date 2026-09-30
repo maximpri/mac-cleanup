@@ -249,6 +249,14 @@ pub(super) fn render_relocation_confirmation(frame: &mut Frame<'_>, area: Rect, 
             Line::from(plan.source.display().to_string()),
             label(app, "DESTINATION"),
             Line::from(plan.destination.display().to_string()),
+            label(
+                app,
+                format!(
+                    "External free: {} · required with overhead: {}",
+                    format_kb(plan.destination_free_kb),
+                    format_kb(plan.required_destination_kb)
+                ),
+            ),
             Line::from(""),
             Line::from("The copy is content-verified before the original path becomes a symlink."),
             Line::from("Keep the external volume mounted to use this data at its original path."),

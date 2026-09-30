@@ -990,7 +990,7 @@ fn parse_df_output(output: &str, accounting_path: &Path, device: u64) -> io::Res
     })
 }
 
-fn classify_path(path: &Path) -> StorageCategory {
+pub(crate) fn classify_path(path: &Path) -> StorageCategory {
     let components: Vec<String> = path
         .components()
         .filter_map(|component| match component {

@@ -113,6 +113,30 @@ pub struct Triage {
     pub quick_win_ids: Vec<String>,
     pub reasons: Vec<String>,
 }
+
+/// Paths and file contents never enter this request. IDs name only measured
+/// destinations that Rust found large enough for the estimated copy.
+#[derive(Debug, Clone, Serialize)]
+pub struct RelocationContext {
+    pub category: crate::storage::StorageCategory,
+    pub allocated_kb: u64,
+    /// File modification is evidence of changes, not proof of access/activity.
+    pub recently_modified: Option<bool>,
+    pub destinations: Vec<RelocationDestination>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RelocationDestination {
+    pub id: String,
+    pub free_kb: u64,
+    pub capacity_kb: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RelocationAdvice {
+    /// keep_local, inspect_first, or an exact Rust-issued destination ID.
+    pub choice: String,
+}
 #[derive(Deserialize)]
 struct Response {
     protocol: u32,
@@ -123,6 +147,7 @@ struct Response {
     error_code: Option<String>,
     insight: Option<Insight>,
     triage: Option<Triage>,
+    relocation: Option<RelocationAdvice>,
     capabilities: Option<Capabilities>,
     diagnostics: Option<ModelDiagnostics>,
 }
@@ -597,6 +622,57 @@ pub fn triage(request: &Request, cancelled: &Arc<AtomicBool>) -> Result<Triage, 
     Ok(triage)
 }
 
+pub fn relocation_advice(
+    context: &RelocationContext,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<RelocationAdvice, String> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(
+            "Local AI advice paused or cancelled. Measured destinations remain available.".into(),
+        );
+    }
+    let required = crate::relocation::required_destination_kb(context.allocated_kb, 0);
+    let mut ids = HashSet::new();
+    if context.destinations.is_empty()
+        || context.destinations.len() > 8
+        || context.destinations.iter().any(|d| {
+            !d.id.starts_with('v')
+                || d.id.len() > 3
+                || !d.id[1..].chars().all(|c| c.is_ascii_digit())
+                || d.id.len() < 2
+                || !ids.insert(d.id.as_str())
+                || d.free_kb < required
+        })
+    {
+        return Err("No validated external destination fits the measured folder.".into());
+    }
+    let allowed = context
+        .destinations
+        .iter()
+        .map(|d| d.id.clone())
+        .chain(["keep_local".into(), "inspect_first".into()])
+        .collect::<Vec<_>>();
+    let request_id = "relocation";
+    let response = request_once(
+        &serde_json::json!({
+            "protocol": PROTOCOL_VERSION, "request_id": request_id,
+            "operation": "relocation", "prompt": serde_json::to_string(context).map_err(|e| e.to_string())?,
+            "allowed_destinations": allowed,
+        }),
+        request_id,
+        Duration::from_secs(20),
+        cancelled,
+        "Local advice stopped. Measured external destinations remain available.",
+    )?;
+    let advice = response
+        .relocation
+        .ok_or("No relocation advice returned.")?;
+    if !allowed.contains(&advice.choice) {
+        return Err("Local AI returned an unknown external destination.".into());
+    }
+    Ok(advice)
+}
+
 /// Summarize already-completed outcomes. The request contains no executable targets.
 pub fn summarize(request: &Request, cancelled: &Arc<AtomicBool>) -> Result<Insight, String> {
     let prompt = serde_json::to_string(request).map_err(|e| e.to_string())?;
@@ -654,6 +730,75 @@ pub(crate) mod tests {
                 disruption: "routine".into(),
             }],
         }
+    }
+
+    #[test]
+    fn relocation_model_can_only_choose_validated_destinations_or_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = RelocationContext {
+            category: crate::storage::StorageCategory::PersonalData,
+            allocated_kb: 1000,
+            recently_modified: Some(false),
+            destinations: vec![RelocationDestination {
+                id: "v1".into(),
+                free_kb: 1_000_000,
+                capacity_kb: 2_000_000,
+            }],
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        for choice in [
+            "v1",
+            "keep_local",
+            "inspect_first",
+            "v9",
+            "/Volumes/invented",
+            "delete",
+        ] {
+            let response = serde_json::json!({"protocol":3,"request_id":"relocation","available":true,"relocation":{"choice":choice}});
+            set_test_helper(Some(fake_helper(
+                dir.path(),
+                &format!("read line\necho '{response}'"),
+            )));
+            let result = relocation_advice(&context, &cancelled);
+            set_test_helper(None);
+            assert_eq!(
+                result.is_ok(),
+                matches!(choice, "v1" | "keep_local" | "inspect_first")
+            );
+        }
+        let mut invalid = context.clone();
+        invalid.destinations[0].free_kb = 1;
+        assert!(
+            relocation_advice(&invalid, &cancelled)
+                .unwrap_err()
+                .contains("No validated")
+        );
+        invalid = context;
+        invalid.destinations[0].id = "keep_local".into();
+        assert!(relocation_advice(&invalid, &cancelled).is_err());
+    }
+
+    #[test]
+    fn unavailable_relocation_inference_reports_measured_fallback_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        set_test_helper(Some(fake_helper(
+            dir.path(),
+            r#"read line
+echo '{"protocol":3,"request_id":"relocation","available":false,"error_code":"model_not_ready","error":"modelNotReady"}'"#,
+        )));
+        let context = RelocationContext {
+            category: crate::storage::StorageCategory::DeveloperData,
+            allocated_kb: 100,
+            recently_modified: None,
+            destinations: vec![RelocationDestination {
+                id: "v1".into(),
+                free_kb: 100_000,
+                capacity_kb: 200_000,
+            }],
+        };
+        let result = relocation_advice(&context, &Arc::new(AtomicBool::new(false)));
+        set_test_helper(None);
+        assert!(result.unwrap_err().contains("Apple model unavailable"));
     }
 
     #[test]

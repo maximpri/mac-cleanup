@@ -5,6 +5,7 @@ lists storage findings, folder children, or saved scans. The right panel shows
 the selected item's explanation, an investigation, Ask, help, or plan review.
 Both panels remain visible from 60 × 16 upward. The focused panel has a blue
 border; the footer names the available keys. Color supplements text labels.
+Folder and saved-scan lists also mark the selection with `›`.
 
 The header shows free space and commands for `/` Ask, `h` History, and `p` Plan.
 Clicking DISKRAY or pressing `g` returns to storage findings. A status line below
@@ -65,7 +66,9 @@ unreadable counts appear below the list when space permits.
 `Enter`, `Right`, or `e` opens the selected folder, even from its details.
 `b` opens the folder browser directly.
 The left panel shows the current path, child count, measured subtotal, and
-children sorted by size. Each row shows its share of measured space and whether
+children sorted by size. A `›` marks the selected row even without color.
+Names are shortened by terminal cell width so Unicode names leave room for sizes.
+Each row shows its share of measured space and whether
 it is queued or has a cleanup rule. Partial sizes stay labelled. `Enter` opens
 a directory or focuses a file's details. `Left` / `Backspace` goes to the parent;
 at the scan root it returns to storage findings. `Esc` first leaves details,
@@ -106,7 +109,11 @@ whether local AI or the measured fallback chose it.
 Ask AI spans the full width below both panels from launch, while the
 list initially has keyboard focus. `/` or a click focuses its input, which
 accepts up to 200 characters. `Enter` asks; `Esc`, `Tab`, or clicking the list
-returns to browsing and keeps the unsent draft. Letters such as `q` are text
+returns to browsing and keeps the unsent draft and cursor position.
+`Left` / `Right` moves through characters, `Home` / `End` jumps to either end,
+and `Backspace` / `Delete` removes the preceding or following character.
+Combined accents and emoji stay intact. Long questions scroll around the cursor.
+Letters such as `q` are text
 while typing. Clicking the composer again does not change its text.
 The answer contains the question, selected measured findings, and tool timeline.
 `1`–`3` can prefill a suggested follow-up question. Ask requires ready Apple

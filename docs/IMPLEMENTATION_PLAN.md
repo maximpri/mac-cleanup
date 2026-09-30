@@ -8,6 +8,22 @@ the accepted scope: a Rust/Ratatui utility for developers and AI-tool users,
 Apple Intelligence in the first release, macOS 26+ on compatible Apple silicon,
 and a visual workflow without chat.
 
+## Storage reallocation and live AI checkpoint — 2026-09-29
+
+- `m` starts with the selected folder; the largest-consumer list is no longer
+  required for contextual moves. A cancellable worker discovers external Mac
+  volumes, shows measured capacity, and requests bounded on-device move advice.
+- Foundation Models chooses only a measured volume ID, `keep_local`, or
+  `inspect_first`. Advice cannot change typed input, enqueue or confirm a move.
+  Unavailable inference keeps measured drive selection usable.
+- The relocation engine checks logical copy capacity and filesystem identities,
+  preserves Mac metadata, uses exclusive destination commits, and compares
+  bytes again before replacing the original path with a symlink.
+- Live helper checks now pass triage, relocation advice, and a five-tool
+  investigation on the development Mac. Removing unsupported regex generation
+  guides restored the tool loop; Rust's reference validation remains enforced.
+  This supersedes the earlier local `modelNotReady` checkpoint below.
+
 ## Workspace and AI readiness checkpoint — 2026-09-24
 
 This checkpoint and [TUI_NAVIGATION.md](TUI_NAVIGATION.md) supersede the older

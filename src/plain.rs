@@ -245,6 +245,11 @@ fn print_relocation_report(report: &RelocationReport) {
     println!("Source:      {}", report.source.display());
     println!("Destination: {}", report.destination.display());
     println!(
+        "Copy budget: {} required · {} external free at review",
+        format_kb(report.required_destination_kb),
+        format_kb(report.destination_free_kb)
+    );
+    println!(
         "Data:        {} across {} file(s) and {} directory(s)",
         format_kb(report.size_kb),
         report.file_count,

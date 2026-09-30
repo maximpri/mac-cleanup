@@ -115,9 +115,11 @@ impl Action {
                 p.parent_pid
             ),
             Self::Move(p) => format!(
-                "Move {}\nto {}\nOriginal becomes a symlink. Keep the destination mounted.",
+                "Move {}\nto {}\nExternal free: {} · required with overhead: {}\nOriginal becomes a symlink. Keep the destination mounted.",
                 p.source.display().to_string().escape_debug(),
-                p.destination.display().to_string().escape_debug()
+                p.destination.display().to_string().escape_debug(),
+                format_kb(p.destination_free_kb),
+                format_kb(p.required_destination_kb)
             ),
             Self::Trash(p) => format!(
                 "Move to Trash · {} observed\nFrees no space until Trash is emptied.\n{}\nThe entire selected item, including its contents, leaves its current location. Apps using it may stop working.\nRestore by dragging it out of Trash in Finder; Put Back may be unavailable.",
@@ -332,6 +334,8 @@ pub(super) struct Workspace {
     asking: Option<String>,
     /// An unsent question retained when focus returns to browsing.
     ask_draft: String,
+    /// UTF-8 byte offset at a grapheme boundary, retained while browsing.
+    ask_cursor: usize,
     /// The Ask answer page is open.
     answer_open: bool,
     measure: Option<MeasureWork>,
@@ -537,6 +541,7 @@ impl Workspace {
             report: None,
             asking: None,
             ask_draft: String::new(),
+            ask_cursor: 0,
             answer_open: false,
             measure: None,
             measured_folders: HashMap::new(),
@@ -880,6 +885,13 @@ impl Workspace {
                 },
                 care::Event::Processes(result, metrics) => {
                     self.metrics = metrics;
+                    app.relocation_allow_ai = self.metrics.pressure != Some(4);
+                    if !app.relocation_allow_ai
+                        && let Some(worker) = &app.relocation_advice_worker
+                    {
+                        worker.pause_inference();
+                        app.relocation_advice = "Measured destinations · local AI paused while memory pressure is critical. F5 retries.".into();
+                    }
                     self.respond_to_pressure(app);
                     if !self.metrics.cpu.is_empty() {
                         self.trend
@@ -2600,6 +2612,7 @@ impl Workspace {
             return true;
         }
         if let Some(text) = &mut self.asking {
+            self.ask_cursor = self.ask_cursor.min(text.len());
             match key.code {
                 KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab => {
                     self.blur_ask();
@@ -2607,8 +2620,22 @@ impl Workspace {
                 }
                 KeyCode::F(2) => Self::open_ai_settings(),
                 KeyCode::F(3) => self.show_ai_status(),
+                KeyCode::Left => {
+                    self.ask_cursor = previous_grapheme_boundary(text, self.ask_cursor);
+                }
+                KeyCode::Right => {
+                    self.ask_cursor = next_grapheme_boundary(text, self.ask_cursor);
+                }
+                KeyCode::Home => self.ask_cursor = 0,
+                KeyCode::End => self.ask_cursor = text.len(),
                 KeyCode::Backspace => {
-                    text.pop();
+                    let previous = previous_grapheme_boundary(text, self.ask_cursor);
+                    text.replace_range(previous..self.ask_cursor, "");
+                    self.ask_cursor = previous;
+                }
+                KeyCode::Delete => {
+                    let next = next_grapheme_boundary(text, self.ask_cursor);
+                    text.replace_range(self.ask_cursor..next, "");
                 }
                 KeyCode::Enter => {
                     let question = text.trim().to_string();
@@ -2617,6 +2644,7 @@ impl Workspace {
                     } else if !question.is_empty() {
                         self.asking = None;
                         self.ask_draft.clear();
+                        self.ask_cursor = 0;
                         self.start_ask(app, &question);
                     }
                 }
@@ -2625,7 +2653,8 @@ impl Workspace {
                         && !key.modifiers.contains(KeyModifiers::CONTROL)
                         && text.chars().count() < agent::QUESTION_LIMIT =>
                 {
-                    text.push(c)
+                    text.insert(self.ask_cursor, c);
+                    self.ask_cursor = next_grapheme_boundary(text, self.ask_cursor);
                 }
                 _ => {}
             }
@@ -2783,6 +2812,7 @@ impl Workspace {
             if let Some(follow_up) = follow_ups(&question).get(digit as usize - '1' as usize) {
                 self.answer_open = false;
                 self.asking = Some((*follow_up).to_string());
+                self.ask_cursor = follow_up.len();
             }
             return true;
         }
@@ -2989,8 +3019,41 @@ impl Workspace {
             KeyCode::Char('x') if self.screen == Screen::Overview => self.add_selected(app, true),
             KeyCode::Char('m') => {
                 if !app.analysis_only {
-                    app.open_relocation_sources();
-                    self.legacy = true;
+                    let selected = if self.screen == Screen::Explore {
+                        app.explorer_items()
+                            .get(app.explorer_cursor)
+                            .map(|i| (*i).clone())
+                    } else if self.screen == Screen::Overview {
+                        self.selected().and_then(|f| match &f.target {
+                            Target::Cache(path) | Target::Folder(path) => Some(StorageItem {
+                                path: path.clone(),
+                                size_kb: f.size_kb,
+                                kind: StorageItemKind::Directory,
+                                category: crate::storage::classify_path(path),
+                            }),
+                            _ => None,
+                        })
+                    } else {
+                        None
+                    };
+                    self.triage_work = None;
+                    self.result_work = None;
+                    self.cancel_agent(
+                        app,
+                        "Investigation stopped while you review external storage.",
+                    );
+                    app.relocation_allow_ai = self.metrics.pressure != Some(4);
+                    if let Some(item) = selected {
+                        if let Err(error) = app.open_relocation_for_item(item) {
+                            self.note = Some(error);
+                        }
+                    } else {
+                        app.open_relocation_sources();
+                    }
+                    self.legacy = matches!(
+                        app.phase,
+                        Phase::RelocationSources | Phase::RelocationDestination
+                    );
                 }
             }
             KeyCode::Char('o') if self.screen != Screen::History => {
@@ -5568,6 +5631,101 @@ mod tests {
         assert!(!w.answer_open);
         assert!(screen_text(&app, &w, 80, 24, "ask-after-answer").contains("Ask AI ›"));
     }
+    #[test]
+    fn ask_editing_moves_cursor_and_preserves_it_across_focus_changes() {
+        let (_home, mut app, mut w) = fixture();
+        w.ai_framework = ai::FrameworkStatus::Available {
+            detail: String::new(),
+            diagnostics: None,
+        };
+        press(&mut w, &mut app, KeyCode::Char('/'));
+        for c in "what grew?".chars() {
+            press(&mut w, &mut app, KeyCode::Char(c));
+        }
+        press(&mut w, &mut app, KeyCode::Left);
+        press(&mut w, &mut app, KeyCode::Left);
+        press(&mut w, &mut app, KeyCode::Char('X'));
+        assert_eq!(w.asking.as_deref(), Some("what greXw?"));
+        let text = screen_text(&app, &w, 60, 16, "ask-cursor");
+        assert!(text.contains("what greX▏w?"), "{text}");
+        press(&mut w, &mut app, KeyCode::Tab);
+        press(&mut w, &mut app, KeyCode::Char('/'));
+        press(&mut w, &mut app, KeyCode::Backspace);
+        assert_eq!(w.asking.as_deref(), Some("what grew?"));
+        press(&mut w, &mut app, KeyCode::Delete);
+        assert_eq!(w.asking.as_deref(), Some("what gre?"));
+        press(&mut w, &mut app, KeyCode::Home);
+        press(&mut w, &mut app, KeyCode::Delete);
+        assert_eq!(w.asking.as_deref(), Some("hat gre?"));
+        press(&mut w, &mut app, KeyCode::End);
+        for c in "日本e\u{301}👩‍💻".chars() {
+            press(&mut w, &mut app, KeyCode::Char(c));
+        }
+        press(&mut w, &mut app, KeyCode::Backspace);
+        assert_eq!(w.asking.as_deref(), Some("hat gre?日本e\u{301}"));
+        press(&mut w, &mut app, KeyCode::Left);
+        press(&mut w, &mut app, KeyCode::Delete);
+        assert_eq!(w.asking.as_deref(), Some("hat gre?日本"));
+        press(&mut w, &mut app, KeyCode::Left);
+        press(&mut w, &mut app, KeyCode::Right);
+        press(&mut w, &mut app, KeyCode::Char('!'));
+        assert_eq!(w.asking.as_deref(), Some("hat gre?日本!"));
+    }
+
+    #[test]
+    fn compact_folder_rows_keep_unicode_sizes_and_monochrome_selection_visible() {
+        let (home, mut app, mut w) = fixture();
+        let root = home.path().join("Unicode");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("日本語 résumé.txt"), vec![1; 4096]).unwrap();
+        app.inventory = Some(StorageInventory::scan(&root, &root));
+        app.explorer_path = Some(root.canonicalize().unwrap());
+        app.no_color = true;
+        w.navigate(Screen::Explore);
+        for width in [60, 80, 120] {
+            app.terminal_width = width;
+            let text = screen_text(&app, &w, width, 24, "unicode-folder");
+            let selected = text
+                .lines()
+                .find(|line| line.contains("›·"))
+                .expect("text selection marker");
+            let folder_column = selected.split('│').nth(1).unwrap();
+            assert!(folder_column.contains("4 KiB"), "{width}: {selected}");
+            assert!(folder_column.contains(".txt"), "{width}: {selected}");
+            assert!(
+                text.lines().any(|line| line
+                    .split('│')
+                    .nth(1)
+                    .is_some_and(|column| column.contains("100% ·"))),
+                "{text}"
+            );
+        }
+        w.history = vec![
+            Session {
+                state: "First scan".into(),
+                ..Default::default()
+            },
+            Session {
+                state: "Second scan".into(),
+                ..Default::default()
+            },
+        ];
+        w.navigate(Screen::History);
+        let text = screen_text(&app, &w, 80, 24, "history-monochrome");
+        assert_eq!(
+            text.lines().filter(|line| line.starts_with("│ › ")).count(),
+            1,
+            "{text}"
+        );
+        press(&mut w, &mut app, KeyCode::Down);
+        let text = screen_text(&app, &w, 80, 24, "history-monochrome-selected");
+        assert_eq!(
+            text.lines().filter(|line| line.starts_with("│ › ")).count(),
+            1,
+            "{text}"
+        );
+    }
+
     #[test]
     fn unavailable_ai_keeps_drafts_and_refreshes_without_submitting() {
         let (_home, mut app, mut w) = fixture();

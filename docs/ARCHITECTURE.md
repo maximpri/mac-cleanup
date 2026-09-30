@@ -38,7 +38,8 @@ provides historical design context. The current implementation checkpoint is in
   `agent` operation creates a `LanguageModelSession` with one bridged `Tool` per
   Rust spec; each call is forwarded to Rust and answered on stdin through an
   actor that routes replies by call ID, so concurrent calls are safe. Handle
-  arguments use regex-guided string schemas, and the final report uses a
+  arguments use string schemas checked against Rust's issued-handle table
+  (some Apple models reject regex guides), and the final report uses a
   dynamic schema whose hypothesis IDs are constrained to the case. A hard cap
   stops a model that ignores its budget. The helper has no filesystem, shell,
   or remote capability of its own. `selftest` exercises the bridge without a
@@ -59,6 +60,12 @@ provides historical design context. The current implementation checkpoint is in
 - Existing cache, process, whitelist, and relocation engines own all other mutation
   safeguards. No model-generated path or signal is executed. Model suggestions
   are badges on actions Rust already allows; the user adds and confirms them.
+- The relocation destination flow runs bounded drive discovery and an optional
+  Foundation Models decision on a cancellable worker. `src/ai.rs` validates its
+  opaque destination choice; `native/AIHelper.swift` constrains it with a dynamic
+  schema. The UI owns selection and plan review. `src/relocation.rs` rechecks
+  capacity and filesystem identity, preserves Mac metadata with `copyfile`,
+  commits using exclusive renames, verifies bytes, and leaves an absolute symlink.
 - Administrator-assisted diagnostics are fixed read-only collectors. The TUI
   obtains explicit approval before invoking macOS authorization, records denial
   as unusable evidence, and never gives the model a shell or command arguments.

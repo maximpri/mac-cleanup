@@ -54,6 +54,21 @@ an item by dragging it out of Trash in Finder; Put Back may be unavailable.
 Protected/system locations, redirects, and whitelist entries remain blocked.
 No separate terminal commands are required.
 
+**Move to external storage** (`m`) opens the selected folder, including folders
+outside the largest-consumer list. Diskray detects mounted, writable external
+APFS/Mac OS Extended drives and shows their free space. `Tab` / `Shift+Tab`
+cycle drives that fit the measured estimate; you can also type an existing
+destination folder. `F5` refreshes drive measurements and local AI advice.
+On-device Foundation Models considers the folder category, a bounded file-age
+measurement, and available capacity. It may suggest a drive, keeping the data
+local, or inspecting it first. Advice never changes a typed destination or
+adds an action. When AI is unavailable, measured drive selection still works.
+`Enter` checks actual copy size, ownership, open files, and destination identity,
+then adds the exact move to the shared review plan. A move requires the `m`
+acknowledgment and typed `APPLY`. Keep the external drive connected afterward;
+the original folder becomes a symlink. Apps must support accessing their data
+through that link. No transfer starts from selecting a drive or receiving AI advice.
+
 **Review plan** lists exact cleanup paths, process identities and signals, and
 relocation destinations with tradeoffs. `Space` adds/removes a finding's action;
 `p` reviews. Type `CLEAN` for ordinary cleanup, `APPLY` for signals or relocation,
@@ -131,7 +146,7 @@ text labels; `--no-color` is supported.
 | `F2` | Open System Settings, including while typing in Ask. |
 | `e` / `d` | Explore selected finding's contents / expand evidence. |
 | `P` | Inspect current-account processes. |
-| `m` | Plan relocation to an external volume. |
+| `m` | Plan moving the selected folder to external storage. |
 | `f` / `K` | All/fewer items; hide the selected item until the next scan. |
 | `v` | Show/hide exact storage totals and scan coverage. |
 | `o` | Reveal selected path in Finder. |

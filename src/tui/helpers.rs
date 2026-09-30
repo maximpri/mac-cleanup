@@ -1,25 +1,100 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
+use unicode_segmentation::UnicodeSegmentation;
 
-pub(super) fn truncate_middle(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
+/// Fit terminal cells without splitting wide or multi-codepoint characters.
+pub(super) fn truncate_middle(value: &str, width: usize) -> String {
+    if Span::raw(value).width() <= width {
         return value.to_owned();
     }
-    if max_chars <= 1 {
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
         return "…".into();
     }
-    let left = max_chars.saturating_sub(1) / 2;
-    let right = max_chars.saturating_sub(1).saturating_sub(left);
-    let prefix: String = value.chars().take(left).collect();
-    let suffix: String = value
-        .chars()
+    let mut used = 0;
+    let prefix: String = value
+        .graphemes(true)
+        .take_while(|g| {
+            used += Span::raw(*g).width();
+            used <= (width - 1) / 2
+        })
+        .collect();
+    let remaining = width - 1 - Span::raw(prefix.as_str()).width();
+    used = 0;
+    let suffix = value
+        .graphemes(true)
         .rev()
-        .take(right)
-        .collect::<String>()
-        .chars()
+        .take_while(|g| {
+            used += Span::raw(*g).width();
+            used <= remaining
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{prefix}…{suffix}")
+}
+
+/// Cut a sentence at the end with an ellipsis; paths use `truncate_middle`.
+pub(super) fn truncate_end(value: &str, width: usize) -> String {
+    if Span::raw(value).width() <= width {
+        return value.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut used = 0;
+    let mut result: String = value
+        .graphemes(true)
+        .take_while(|g| {
+            used += Span::raw(*g).width();
+            used < width
+        })
+        .collect();
+    result.push('…');
+    result
+}
+
+pub(super) fn previous_grapheme_boundary(text: &str, cursor: usize) -> usize {
+    text.grapheme_indices(true)
+        .map(|(index, _)| index)
+        .take_while(|index| *index < cursor)
+        .last()
+        .unwrap_or(0)
+}
+
+pub(super) fn next_grapheme_boundary(text: &str, cursor: usize) -> usize {
+    text.grapheme_indices(true)
+        .map(|(index, _)| index)
+        .find(|index| *index > cursor)
+        .unwrap_or(text.len())
+}
+
+/// Keep the insertion point visible, with nearby text on both sides when possible.
+pub(super) fn input_window(text: &str, cursor: usize, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let cursor = cursor.min(text.len());
+    let room = width - 1; // The visible insertion marker occupies one cell.
+    let after = &text[cursor..];
+    let before_room = room.saturating_sub(Span::raw(after).width().min(room / 3));
+    let mut used = 0;
+    let before: String = text[..cursor]
+        .graphemes(true)
+        .rev()
+        .take_while(|g| {
+            used += Span::raw(*g).width();
+            used <= before_room
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
         .rev()
         .collect();
-    format!("{prefix}…{suffix}")
+    let remaining = room - Span::raw(before.as_str()).width();
+    format!("{before}▏{}", truncate_end(after, remaining))
 }
 
 pub(super) fn render_vertical_scrollbar(
@@ -204,5 +279,50 @@ pub(super) fn table_hits(
             make(index),
         ));
         y += row_height;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncation_respects_terminal_cells_and_complete_graphemes() {
+        let text = "日本語 re\u{301}sume\u{301} 👩‍💻.txt";
+        for width in 0..40 {
+            for result in [truncate_middle(text, width), truncate_end(text, width)] {
+                assert!(
+                    Span::raw(result.as_str()).width() <= width,
+                    "{width}: {result}"
+                );
+                assert!(
+                    result
+                        .graphemes(true)
+                        .all(|g| g == "…" || text.graphemes(true).any(|original| original == g)),
+                    "{result}"
+                );
+            }
+        }
+        assert_eq!(truncate_middle("日本語 résumé.txt", 15), "日本語 …umé.txt");
+        assert_eq!(truncate_end("e\u{301}xy", 2), "e\u{301}…");
+        assert_eq!(truncate_middle("abcdef", 0), "");
+    }
+
+    #[test]
+    fn input_window_keeps_cursor_and_nearby_unicode_visible() {
+        let text = "前".repeat(30) + "middle" + &"後".repeat(30);
+        for cursor in text
+            .grapheme_indices(true)
+            .map(|(i, _)| i)
+            .chain([text.len()])
+        {
+            for width in [1, 12, 45] {
+                let result = input_window(&text, cursor, width);
+                assert!(result.contains('▏'), "{cursor}: {result}");
+                assert!(Span::raw(result.as_str()).width() <= width);
+            }
+        }
+        assert!(input_window(&text, "前".repeat(30).len(), 45).contains("▏middle"));
+        assert!(input_window(&text, text.len(), 45).ends_with("後▏"));
     }
 }

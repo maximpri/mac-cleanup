@@ -46,6 +46,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Selected-folder storage reallocation with detected external drives, free-space
+  estimates, keyboard drive selection, and bounded Apple on-device AI advice.
+  The reviewed move rechecks capacity and volume identity, preserves Mac file
+  metadata, and refuses to overwrite an existing destination. Measured selection
+  remains available without Apple Intelligence.
+
 - `diskray why`: a one-screen, screenshot-friendly explanation of what fills
   the disk, including hidden space, quick wins, and growth since an earlier
   assessment (`--json`, `--since DAYS`, `--quick`).

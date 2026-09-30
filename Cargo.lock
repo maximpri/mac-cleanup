@@ -276,6 +276,7 @@ dependencies = [
  "tempfile",
  "toml",
  "trash",
+ "unicode-segmentation",
 ]
 
 [[package]]

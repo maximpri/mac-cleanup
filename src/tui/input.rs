@@ -761,12 +761,17 @@ impl App {
 
     pub(super) fn handle_relocation_destination_key(&mut self, key: KeyEvent) {
         match key.code {
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.cycle_relocation_destination(key.code == KeyCode::BackTab)
+            }
+            KeyCode::F(5) => self.start_relocation_advice(),
             KeyCode::Backspace => {
                 self.relocation_destination.pop();
                 self.relocation_destination_error = None;
             }
             KeyCode::Enter => self.start_relocation_plan(),
             KeyCode::Esc => {
+                self.relocation_advice_worker = None;
                 self.relocation_destination_error = None;
                 self.phase = Phase::RelocationSources;
             }

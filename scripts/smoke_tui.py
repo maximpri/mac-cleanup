@@ -73,12 +73,22 @@ class Screen:
             elif char == "\n": self.y += 1
             elif char == "\b": self.x = max(0, self.x - 1)
             elif char >= " ":
+                if unicodedata.combining(char):
+                    if self.y < self.height and self.x > 0:
+                        previous = min(self.x - 1, self.width - 1)
+                        while previous > 0 and self.rows[self.y][previous] == "":
+                            previous -= 1
+                        self.rows[self.y][previous] += char
+                    i += 1
+                    continue
                 if self.x >= self.width:
                     self.x = 0
                     self.y += 1
                 if self.y < self.height:
                     self.rows[self.y][self.x] = char
-                self.x += 0 if unicodedata.combining(char) else (2 if unicodedata.east_asian_width(char) in "WF" else 1)
+                    if unicodedata.east_asian_width(char) in "WF" and self.x + 1 < self.width:
+                        self.rows[self.y][self.x + 1] = ""
+                self.x += 2 if unicodedata.east_asian_width(char) in "WF" else 1
             i += 1
         self.pending = text[i:]
 
@@ -290,6 +300,16 @@ def main():
             session.send(b"/")
             session.wait_for("Esc browse")
             assert "Ask AI › q" in session.screen.text(), "refocusing must restore the draft"
+            session.send(b"\x1b[Dwhy \x1b[F?")
+            session.wait_for("Ask AI › why q?▏")
+            session.send(b"\x1b[H\x1b[3~W\x1b[F\x7f")
+            session.wait_for("Ask AI › Why q▏")
+            session.send(b"\x1b[D")
+            session.wait_for("Ask AI › Why ▏q")
+            session.send(b"\x1b")
+            session.wait_for("WHERE")
+            session.send(b"/my ")
+            session.wait_for("Ask AI › Why my ▏q")
             session.send(b"\x1b")
             session.pump(3.0)  # Let measured triage settle so the selection is stable.
             session.send(b"i")

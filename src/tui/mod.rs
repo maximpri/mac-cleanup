@@ -260,6 +260,10 @@ struct App {
     relocation_source: Option<StorageItem>,
     relocation_destination: String,
     relocation_destination_error: Option<String>,
+    relocation_destinations: Vec<relocation::Destination>,
+    relocation_advice: String,
+    relocation_allow_ai: bool,
+    relocation_advice_worker: Option<DestinationWork>,
     relocation_plan: Option<RelocationPlan>,
     relocation_plan_worker: Option<RelocationPlanWorker>,
     relocation_worker: Option<RelocationWorker>,
@@ -404,6 +408,7 @@ fn run_loop(
     mut app: App,
 ) -> Result<i32, String> {
     while !app.quit {
+        app.poll_relocation_advice();
         if let Some(mut workspace) = app.care.take() {
             workspace.tick(&mut app);
             app.care = Some(workspace);
