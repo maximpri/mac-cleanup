@@ -65,16 +65,32 @@ submits them. Diskray never changes system language settings.
 References: [Apple Intelligence requirements](https://support.apple.com/en-us/121115)
 and [SystemLanguageModel](https://developer.apple.com/documentation/foundationmodels/systemlanguagemodel).
 
-### Current validation status — 2026-09-24
+### Current validation status — 2026-09-30
 
-On the development Mac, both languages are now `en-US` and the release helper
-was rebuilt with the macOS 27.0 SDK. Apple still reports `modelNotReady`;
-older helpers rebuilt on this Mac fail the same way. Helper protocol and tool
-routing checks pass, but live inference and the tool-using model loop remain
-unverified for this revision. A restart requested by macOS is deferred for the
-user to perform manually. See the [readiness investigation](AI_READINESS_2026-09-24.md)
-for the evidence and exact steps to resume. Matching languages and rebuilding
-are not evidence of successful inference.
+September 30 follow-up: the rebuilt helper passes the live protocol and
+inference checks, including a report that cites missing history. The exact
+question “What grew since last week?” passed three live fixture runs with one
+`growth(week)` call each and no measured fallback. The expanded fixture suite
+passed 11/11 safety checks and 10/10 model-backed quality cases; the off-topic
+case used the measured fallback. Rust checks passed 276 tests (one ignored).
+
+The development Mac now completes actual on-device inference. The release
+helper built with the macOS 27.0 SDK passes `check_ai_helper.py --live`, including
+triage and a tool-using investigation. That
+investigation called five read-only tools and cited only evidence they returned.
+The framework reported an 8,192-token context; this fixture used 1,029 setup
+tokens. These are local validation results, not performance guarantees.
+
+A single run of the ten-case fixture evaluation passed 10/10 safety checks
+and 9/9 model-backed quality cases. The off-topic question used the measured
+fallback, so its model-quality check was skipped. No fixture data was changed.
+
+The first live investigation exposed an unsupported regex generation guide.
+Handle and evidence strings now use ordinary string schemas, with the same
+Rust-side issued-handle and evidence validation. Fixed choices still use guided
+enums. The [September 24 readiness investigation](AI_READINESS_2026-09-24.md)
+records the earlier `modelNotReady` state; it is historical, not the current
+status. A successful protocol-only test still does not establish live inference.
 
 ## How investigations work
 
@@ -86,7 +102,7 @@ processes hold files open, earlier measurements from History, whether a cleanup
 rule covers it, the likely owning app (via Spotlight), one process's details and
 short samples, memory pressure and top processes, disk accounting and local
 snapshots, mounted volumes, and bundled Apple reference notes. Each investigation
-family gets at most six tools so their definitions fit the on-device model's
+family gets at most six tools so their definitions also fit models with a
 4,096-token context. The model refers to folders and processes only by handles
 the app issued in earlier results (`n2`, `p1`); paths and unknown handles are
 rejected. Every result becomes numbered evidence (`E3`) that the report must cite.
@@ -123,6 +139,21 @@ and `NO_COLOR` provide static presentation. The health line shows AI
 availability; `?` includes detailed helper and model capability status, and
 helper errors are shown in plain language.
 
+General Ask questions cannot suggest process signals: start an investigation
+on the specific process to review those. Cleanup questions replace the general
+CPU-ranking tool with the open-file check while retaining the six-tool limit.
+Growth questions expose a history-comparison tool within that same limit. It
+compares complete assessments of the same root and volume against the previous
+assessment, or a baseline at least one day, seven days, or thirty days old.
+Missing history and incomplete assessments appear in the answer; current size
+alone is never reported as growth. When the call or context budget is used,
+the app waits for accepted checks to finish and switches to a session without
+tools to select the report evidence. Exit events from the old helper cannot
+cancel that report.
+Report-only sessions require a citation from the collected evidence IDs,
+including unavailable checks that explain a limitation. An initial report
+without valid citations gets one such retry within the original time limit.
+
 `R` controls saved one-time consent for online research. When enabled, the app
 fetches only its fixed Apple documentation catalog and supplies short excerpts
 as typed research evidence. It never builds a model-generated URL or sends local
@@ -132,7 +163,7 @@ remains on-device whether research is on or off.
 ## Checking quality
 
 `python3 scripts/check_ai_helper.py` checks the helper protocol, and
-`python3 scripts/eval_agent.py` asks twelve fixture questions and checks that
+`python3 scripts/eval_agent.py` asks eleven fixture questions and checks that
 every cited evidence ID exists, every suggestion was eligible, fixtures are
 unchanged, and prompt-injected folder names are ignored. Its quality checks need
 a Mac whose Apple Intelligence model is ready.

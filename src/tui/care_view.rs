@@ -1569,6 +1569,7 @@ impl Workspace {
                 metrics: &self.metrics,
                 findings: &self.findings,
                 history: &self.history,
+                current: Some(&self.session),
                 volume: self.volume.as_ref(),
                 online_research: self.online_research,
                 subject_pid: self

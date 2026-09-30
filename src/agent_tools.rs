@@ -66,6 +66,11 @@ pub const TOOLS: &[ToolSpec] = &[
         arg: Arg::Folder,
     },
     ToolSpec {
+        name: "growth",
+        description: "What grew or shrank since an earlier complete assessment; reports missing history explicitly.",
+        arg: Arg::Choice("since", &["previous", "day", "week", "month"]),
+    },
+    ToolSpec {
         name: "cleanup_rule",
         description: "Whether an app cleanup rule covers a folder, its status, and any eligible action ID.",
         arg: Arg::Folder,
@@ -171,6 +176,50 @@ pub enum Toolset {
 }
 
 impl Toolset {
+    /// Keep the six-tool context budget while exposing the in-use check for
+    /// cleanup questions. General resource questions retain top_processes.
+    pub fn tools_for_question(
+        self,
+        automatic: bool,
+        question: Option<&str>,
+    ) -> Vec<&'static ToolSpec> {
+        let mut tools = self.tools(automatic);
+        let cleanup_question = question.is_some_and(|q| {
+            q.split(|c: char| !c.is_alphanumeric()).any(|word| {
+                matches!(
+                    word.to_ascii_lowercase().as_str(),
+                    "cache" | "caches" | "clear" | "clean" | "cleanup" | "delete" | "deleting"
+                )
+            })
+        });
+        if self == Self::Ask
+            && cleanup_question
+            && let Some(tool) = tools.iter_mut().find(|tool| tool.name == "top_processes")
+        {
+            *tool = spec("open_handles").expect("known read-only tool");
+        }
+        if self == Self::Ask
+            && question.and_then(growth_period).is_some()
+            && let Some(tool) = tools.iter_mut().find(|tool| tool.name == "memory_state")
+        {
+            *tool = spec("growth").expect("known read-only tool");
+        }
+        tools
+    }
+
+    pub fn fallback_for_question(
+        self,
+        automatic: bool,
+        question: Option<&str>,
+    ) -> Vec<(&'static str, Option<&'static str>)> {
+        if self == Self::Ask
+            && let Some(period) = question.and_then(growth_period)
+        {
+            return vec![("growth", Some(period))];
+        }
+        self.fallback(automatic)
+    }
+
     pub fn tools(self, automatic: bool) -> Vec<&'static ToolSpec> {
         let names: &[&str] = match self {
             Self::Storage => &[
@@ -256,6 +305,41 @@ impl Toolset {
         }
         steps
     }
+}
+
+/// Select the bounded history check for common temporal storage questions.
+fn growth_period(question: &str) -> Option<&'static str> {
+    let words: Vec<String> = question
+        .split(|c: char| !c.is_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let has = |choices: &[&str]| words.iter().any(|word| choices.contains(&word.as_str()));
+    if !has(&[
+        "grew",
+        "grown",
+        "grow",
+        "growth",
+        "shrunk",
+        "shrank",
+        "changed",
+        "changes",
+        "since",
+        "increase",
+        "increased",
+        "bigger",
+        "history",
+    ]) {
+        return None;
+    }
+    Some(if has(&["week", "weekly"]) {
+        "week"
+    } else if has(&["month", "monthly"]) {
+        "month"
+    } else if has(&["yesterday", "day", "daily"]) {
+        "day"
+    } else {
+        "previous"
+    })
 }
 
 /// Opaque references issued to the model for one investigation.
@@ -392,6 +476,8 @@ pub struct ToolWorld<'a> {
     pub metrics: &'a Metrics,
     pub findings: &'a [Finding],
     pub history: &'a [Session],
+    /// The current assessment, including its root, volume identity and coverage.
+    pub current: Option<&'a Session>,
     pub volume: Option<&'a VolumeStats>,
     pub online_research: bool,
     pub subject_pid: Option<u32>,
@@ -657,6 +743,7 @@ fn system_tool(
             Dispatch::Ready(top_processes_outcome(argument == "cpu", world, handles))
         }
         "disk_accounting" => Dispatch::Ready(disk_outcome(world)),
+        "growth" => Dispatch::Ready(growth_comparison_outcome(argument, world, handles)),
         "volume_context" => Dispatch::Slow(Box::new(|cancel| {
             Slow::Observation(care::observe_volume_context(cancel))
         })),
@@ -936,6 +1023,68 @@ fn owners_outcome(
             ),
         ),
     }
+}
+
+fn growth_comparison_outcome(
+    period: &str,
+    world: &ToolWorld<'_>,
+    handles: &mut Handles,
+) -> Outcome {
+    let unavailable = |text: String| {
+        Outcome::unavailable(
+            EvidenceKind::VolumeContext,
+            EvidenceStatus::Unsupported,
+            text,
+        )
+    };
+    let Some(current) = world.current.filter(|current| current.complete) else {
+        return unavailable("Growth cannot be measured yet: the current assessment is incomplete. Finish a full assessment, then compare it with saved history.".into());
+    };
+    let days = match period {
+        "day" => 1,
+        "week" => 7,
+        "month" => 30,
+        _ => 0,
+    };
+    let Some(base) = crate::growth::baseline(world.history, current, days) else {
+        let interval = if days == 0 {
+            "earlier".into()
+        } else {
+            format!("at least {days} days old")
+        };
+        return unavailable(format!(
+            "Growth cannot be measured: no comparable complete assessment of this volume {interval} is saved. Current folder sizes do not establish growth. Keep complete assessments to build history."
+        ));
+    };
+    let deltas = crate::growth::diff(base, current);
+    let since = crate::history::format_timestamp(UNIX_EPOCH + Duration::from_secs(base.updated));
+    let text = if deltas.is_empty() {
+        format!(
+            "No significant growth or shrinkage in folders measured in both assessments since {since} (threshold: 500 MiB and 5%)."
+        )
+    } else {
+        let changes = deltas
+            .iter()
+            .take(3)
+            .map(|delta| {
+                let path = Path::new(&delta.path);
+                let handle = handles.folder(path).unwrap_or_default();
+                format!(
+                    "{handle} {} {}{} ({} → {})",
+                    short_path(path, world.home),
+                    if delta.change_kb() >= 0 { "+" } else { "−" },
+                    format_kb(delta.change_kb().unsigned_abs()),
+                    format_kb(delta.before_kb),
+                    format_kb(delta.after_kb)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!(
+            "Changes since {since}: {changes}. Only folders measured in both complete assessments are compared."
+        )
+    };
+    Outcome::complete(EvidenceKind::VolumeContext, cap(&text))
 }
 
 fn growth_outcome(path: &Path, world: &ToolWorld<'_>) -> Outcome {
@@ -1397,7 +1546,11 @@ fn findings_outcome(world: &ToolWorld<'_>, handles: &mut Handles) -> Outcome {
                 Target::Process(..) => "process",
                 Target::System => "system reading",
             };
-            let action = (world.suggest)(&finding.target)
+            // An unscoped findings list cannot establish which process the
+            // user intends to act on. Targeted investigations issue those IDs.
+            let action = (!matches!(finding.target, Target::Process(..)))
+                .then(|| (world.suggest)(&finding.target))
+                .flatten()
                 .and_then(|id| handles.action(&id))
                 .map(|handle| format!(" · eligible action {handle}"))
                 .unwrap_or_default();
@@ -1456,6 +1609,7 @@ mod tests {
             metrics,
             findings: &[],
             history: &[],
+            current: None,
             volume: None,
             online_research: false,
             subject_pid: None,
@@ -1533,6 +1687,84 @@ mod tests {
     }
 
     #[test]
+    fn growth_questions_get_history_tools_within_the_six_tool_limit() {
+        for (question, period) in [
+            ("What grew since last week?", "week"),
+            ("What changed since yesterday?", "day"),
+            ("What shrank since last month?", "month"),
+            ("What grew since last time?", "previous"),
+            (
+                "Which caches grew since last week and can I clean them?",
+                "week",
+            ),
+        ] {
+            let tools = Toolset::Ask.tools_for_question(false, Some(question));
+            assert!(tools.iter().any(|tool| tool.name == "growth"));
+            assert_eq!(tools.len(), 6);
+            assert!(
+                tools
+                    .iter()
+                    .map(|tool| spec_json(tool).to_string().len())
+                    .sum::<usize>()
+                    < 1600
+            );
+            assert_eq!(
+                Toolset::Ask.fallback_for_question(false, Some(question)),
+                vec![("growth", Some(period))]
+            );
+        }
+        assert!(
+            Toolset::Ask
+                .tools_for_question(false, Some("What is using memory?"))
+                .iter()
+                .any(|tool| tool.name == "memory_state")
+        );
+    }
+
+    #[test]
+    fn growth_compares_the_requested_period_and_matching_volume() {
+        let home = Path::new("/Users/demo");
+        let metrics = Metrics::default();
+        let none = |_: &Target| None;
+        let mut world = world(home, None, &[], &[], &metrics, &none);
+        let session = |id, days: u64, kb, volume: &str, complete| Session {
+            id,
+            updated: days * 86_400,
+            complete,
+            root: Some("/".into()),
+            volume_id: Some(volume.into()),
+            measurements: [("/Users/demo/Movies".into(), kb)].into_iter().collect(),
+            ..Session::default()
+        };
+        let current = session(5, 30, 4 * GIB_KB, "disk1", true);
+        let history = vec![
+            session(4, 29, 3 * GIB_KB, "disk1", true),
+            session(3, 23, GIB_KB, "other-disk", true),
+            session(2, 23, GIB_KB, "disk1", false),
+            session(1, 22, 2 * GIB_KB, "disk1", true),
+        ];
+        world.current = Some(&current);
+        world.history = &history;
+        let mut handles = Handles::default();
+        let result = growth_comparison_outcome("week", &world, &mut handles);
+        assert_eq!(result.status, EvidenceStatus::Complete);
+        assert!(result.text.contains("+2.0 GiB"), "{}", result.text);
+        assert!(result.text.contains("~/Movies"));
+        assert_eq!(handles.folder_path("n1").unwrap(), home.join("Movies"));
+        let previous = growth_comparison_outcome("previous", &world, &mut handles);
+        assert!(previous.text.contains("+1.0 GiB"), "{}", previous.text);
+        let missing = growth_comparison_outcome("month", &world, &mut handles);
+        assert_eq!(missing.status, EvidenceStatus::Unsupported);
+        assert!(missing.text.contains("at least 30 days old"));
+        assert!(!missing.text.contains("No significant growth"));
+        world.current = None;
+        assert_eq!(
+            growth_comparison_outcome("week", &world, &mut handles).status,
+            EvidenceStatus::Unsupported
+        );
+    }
+
+    #[test]
     fn handles_reject_paths_unknown_and_foreign_references() {
         let mut handles = Handles::default();
         assert_eq!(
@@ -1602,6 +1834,13 @@ mod tests {
         let ask = Toolset::Ask.tools(false);
         assert!(parse_call("top_processes", r#"{"sort":"cpu"}"#, &ask).is_ok());
         assert!(parse_call("top_processes", r#"{"sort":"disk"}"#, &ask).is_err());
+        let cleanup =
+            Toolset::Ask.tools_for_question(false, Some("Is it safe to clear my pip CACHE?"));
+        assert_eq!(cleanup.len(), 6);
+        assert!(parse_call("open_handles", r#"{"folder":"n1"}"#, &cleanup).is_ok());
+        assert!(parse_call("top_processes", r#"{"sort":"cpu"}"#, &cleanup).is_err());
+        let cpu = Toolset::Ask.tools_for_question(false, Some("Which process uses CPU?"));
+        assert!(parse_call("top_processes", r#"{"sort":"cpu"}"#, &cpu).is_ok());
     }
 
     #[test]

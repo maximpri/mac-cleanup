@@ -237,7 +237,7 @@ fn record(snapshot: &Snapshot, source: &str) -> care::Session {
     let mut session = snapshot.session(source);
     session.root = Some(snapshot.root.display().to_string());
     session.volume_id = care::volume_id(&snapshot.root);
-    session.complete = snapshot.complete;
+    session.complete = snapshot.complete && snapshot.inventory.as_ref().is_some_and(|i| i.complete);
     session.source = source.into();
     session
 }
@@ -533,7 +533,9 @@ fn ask(
             snapshot.suggestion(&Target::Process(process.pid, process.start_time.clone()))
         }))
         .collect();
-    let world = snapshot.world(&suggest, care::online_research_enabled(home));
+    let mut session = record(&snapshot, "ask");
+    let mut world = snapshot.world(&suggest, care::online_research_enabled(home));
+    world.current = Some(&session);
     let mut finish = None;
     let mut timed_out = false;
     while finish.is_none() {
@@ -559,7 +561,6 @@ fn ask(
         thread::sleep(Duration::from_millis(50));
     }
     clear_progress(as_json);
-    let mut session = record(&snapshot, "ask");
     session.investigations.push(case.clone());
     let _ = care::save_session(home, &session);
     let code = if timed_out {

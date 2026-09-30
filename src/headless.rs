@@ -175,6 +175,7 @@ impl Snapshot {
             metrics: &self.metrics,
             findings: &self.findings,
             history: &self.history,
+            current: None,
             volume: self.volume.as_ref(),
             online_research,
             subject_pid: None,

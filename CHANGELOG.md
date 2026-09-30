@@ -8,6 +8,15 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Ask growth questions compare saved assessments for the requested period and
+  explain missing history. Exhausted tool budgets switch to a report-only
+  session, and stale helper-exit events no longer cancel the recovery report.
+- On-device tool investigations work with Apple models that reject regex
+  generation guides; Rust still validates every handle and evidence reference.
+- General Ask questions cannot suggest stopping processes without a targeted
+  process investigation. Cleanup questions expose the open-file check within
+  the existing six-tool budget.
+
 - The startup volume's capacity came from the sealed system volume, so the
   Data volume was reported as "other volumes" and the capacity figures did not
   add up. Capacity and before/after free space now come from the Data volume.

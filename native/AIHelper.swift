@@ -189,8 +189,10 @@ struct BridgedTool: Tool {
             if argument.kind == "choice" {
                 schema = AIHelper.choice("\(spec.name)_\(argument.name)", argument.description, argument.choices ?? [])
             } else {
-                let regex = try Regex(argument.pattern ?? "[a-z][0-9]{1,2}")
-                schema = DynamicGenerationSchema(type: String.self, guides: [.pattern(regex)])
+                // Some installed Apple models reject regex guides at inference
+                // time even though schema construction succeeds. Handles are
+                // still checked against Rust's issued-handle table on every call.
+                schema = DynamicGenerationSchema(type: String.self)
             }
             properties.append(.init(name: argument.name, description: argument.description, schema: schema))
         }
@@ -346,13 +348,14 @@ struct AIHelper {
     }
 
     /// The final investigation report. Evidence and action references use
-    /// short-ID patterns because tools issue them during the session; the app
-    /// rejects any ID it did not issue.
-    static func reportSchema(hypotheses: [String]) throws -> GenerationSchema {
-        let evidenceID = DynamicGenerationSchema(type: String.self, guides: [.pattern(try Regex("E[0-9]{1,2}"))])
-        let actionID = DynamicGenerationSchema(type: String.self, guides: [.pattern(try Regex("A[0-9]{1,2}"))])
+    /// strings because tools issue IDs during the session; Rust rejects any
+    /// unissued ID. Avoid regex guides unsupported by some installed models.
+    static func reportSchema(hypotheses: [String], evidence: [String] = []) throws -> GenerationSchema {
+        let evidenceID = evidence.isEmpty ? DynamicGenerationSchema(type: String.self)
+            : choice("EvidenceID", "An exact collected evidence ID, including checks that explain limitations.", evidence)
+        let actionID = DynamicGenerationSchema(type: String.self)
         var properties: [DynamicGenerationSchema.Property] = [
-            .init(name: "evidence_ids", description: "Up to four evidence IDs that best answer the question. The app writes the answer directly from these checks.", schema: array(evidenceID, maximum: 4)),
+            .init(name: "evidence_ids", description: "Up to four exact collected IDs such as E1. Cite unsupported or failed checks when they explain a limitation such as missing history. Never invent an ID. The app writes the answer from these checks.", schema: array(evidenceID, minimum: evidence.isEmpty ? 0 : 1, maximum: 4)),
         ]
         if !hypotheses.isEmpty {
             let verdict = DynamicGenerationSchema(name: "Verdict", properties: [
@@ -529,7 +532,7 @@ struct AIHelper {
     static func finalReport(_ request: Request, prompt: String, model: SystemLanguageModel) async {
         do {
             try await ensureContext(model, prompt: prompt, responseReserve: 700)
-            let schema = try reportSchema(hypotheses: request.allowedHypotheses ?? [])
+            let schema = try reportSchema(hypotheses: request.allowedHypotheses ?? [], evidence: request.allowedEvidence ?? [])
             let session = LanguageModelSession(model: model, instructions: request.instructions ?? defaultAgentInstructions)
             let generated = try await session.respond(
                 to: prompt, schema: schema,

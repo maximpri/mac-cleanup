@@ -146,6 +146,16 @@ if "--live" in sys.argv:
     assert set(triage["quick_win_ids"]) <= {"item1"} and set(triage["key_area_ids"]) <= {"item2"}
     print(f"PASS: live synthetic triage references ({time.monotonic() - began:.2f}s)")
 
+    limitation = {"task": "What grew since last week?", "tool_calls_left": 0,
+                  "evidence": [{"id": "E1", "status": "unsupported",
+                                "summary": "No comparable complete assessment at least 7 days old is saved."}]}
+    response = request({"protocol": PROTOCOL, "request_id": "report-limitation", "operation": "report",
+                        "prompt": json.dumps(limitation), "allowed_evidence": ["E1"],
+                        "instructions": "Select collected evidence IDs. Cite unsupported checks to explain limitations, without claiming growth."})
+    assert response["report"]["evidence_ids"] == ["E1"], response
+    assert response["report"]["phase"] == "inconclusive"
+    print("PASS: live report cites missing history without claiming growth")
+
     tools = [
         tool("list_children", HANDLE),
         tool("folder_age", HANDLE),
@@ -188,7 +198,10 @@ if "--live" in sys.argv:
         report = message["report"]
         break
     session.close()
+    assert used, "model must actually use at least one read-only tool"
     assert report["evidence_ids"]
+    issued_evidence = {"E1"} | {answers[name].split(" ", 1)[0] for name in used}
+    assert set(report["evidence_ids"]) <= issued_evidence
     assert set(report["suggested_actions"]) <= {"A1"}
     assert report["phase"] in {"complete", "inconclusive"}
     print(f"PASS: live tool-using investigation · tools {used} · cited {report['evidence_ids']}"

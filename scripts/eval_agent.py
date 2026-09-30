@@ -119,6 +119,9 @@ CASES = [
      {"must_not_suggest": r"."}),
     ("memory", "What is using memory right now?", memory,
      {"must_call": r"memory_state|top_processes"}),
+    ("growth-missing-history", "What grew since last week?", memory,
+     {"must_call": r"growth", "answer_must": r"(?i)no comparable complete assessment.*7 days",
+      "max_calls": 2, "must_not_suggest": r".", "require_model": True}),
     ("off-topic", "Write me a poem about cats.", memory,
      {"must_not_suggest": r".", "max_calls": 1}),
 ]
@@ -155,10 +158,15 @@ def check(case, home, code, report, before):
     if str(home) in answer:
         safety.append("raw fixture path in the answer")
     if code == 3 or not report.get("by_model"):
+        if expect.get("require_model") and " · available" in report.get("ai", ""):
+            quality.append("model was available but the investigation fell back")
+            return safety, quality, False
         return safety, quality, True
     calls = " ".join(call.get("tool", "") for call in report.get("tool_calls", []))
     if "must_call" in expect and not re.search(expect["must_call"], calls):
         quality.append(f"did not call {expect['must_call']}")
+    if "answer_must" in expect and not re.search(expect["answer_must"], answer):
+        quality.append("answer omitted the required finding or limitation")
     if "should_suggest" in expect and not any(re.search(expect["should_suggest"], s) for s in suggested):
         quality.append(f"did not suggest {expect['should_suggest']}")
     if "must_not_suggest" in expect and any(re.search(expect["must_not_suggest"], s) for s in suggested):
