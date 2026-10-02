@@ -2,11 +2,20 @@
 
 *An X-ray for your Mac's disk. Understand before you delete.*
 
+A macOS disk analyzer built in Rust with a **[Ratatui](https://ratatui.rs/)
+terminal interface**. Explore large folders, investigate storage with on-device
+AI, and review cleanup or external-drive moves from your terminal.
+
 [![CI](https://github.com/maximpri/diskray/actions/workflows/ci.yml/badge.svg)](https://github.com/maximpri/diskray/actions/workflows/ci.yml)
 [![License: GPL v3+](https://img.shields.io/badge/License-GPLv3%2B-blue.svg)](LICENSE)
 ![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 
-![Diskray's two panels: storage items and their status on the left, measured explanations and actions on the right](docs/images/overview.svg)
+![Live color recording of Diskray: explore folders and Rust build output, open the command palette, and review the empty read-only plan](docs/demo/hero.gif)
+
+Recorded from the running app with disposable sample files and `--analyze`.
+Folder sizes come from the fixture; free space and system status come from the
+recording Mac. [View a still screenshot](docs/images/tui-storage.png) or
+[reproduce the recording](docs/demo/README.md).
 
 "System Data is 180 GB" is not an answer. Diskray measures where the space
 actually went, explains what each large item is and whether it is safe to
@@ -78,7 +87,21 @@ child when available, including build output such as `target/debug`. Asking
 while browsing includes the current folder as context. To move useful data,
 select its folder and press `m` for the separate external-storage review.
 
-![An explanation: what was measured, what the checks found, what you can do, and how it was checked](docs/images/details.svg)
+![Real TUI screenshot of a Rust target/debug directory and its measured build files](docs/images/tui-build-output.png)
+
+| Key | Action |
+| --- | --- |
+| `b` | Open the folder browser |
+| `Enter` / `→` | Open the selected folder |
+| `←` / `Esc` | Go to the parent / return to the previous view |
+| `Tab` | Switch between the list and details |
+| `/` | Ask about measured storage |
+| `Space` / `p` | Add an eligible cleanup / review the plan |
+| `m` | Review a move to external storage |
+| `:` / `?` | Command palette / keyboard help |
+
+Use `diskray --analyze` for a read-only session. CLI commands, `--json`, and
+`--no-tui` also support scripts and terminals without an interactive display.
 
 ## The safety promise
 
@@ -131,6 +154,19 @@ can only save a proposal that you review with `diskray review`.
 | [Product review](docs/REVIEW_2026-09.md) | Goal, Apple AI use, interface, comparison with Mole, roadmap |
 
 ## Contributing and security
+
+Run the Rust tests, lint checks, and Python evaluation tests locally:
+
+```bash
+cargo test --all-targets --locked
+cargo fmt --all --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+python3 -m unittest discover -s scripts -p 'test_*.py' -v
+```
+
+The TUI tests use Ratatui's `TestBackend` for rendering, navigation, resizing,
+and confirmation behavior. [Contributor instructions](CONTRIBUTING.md) cover
+the full validation workflow.
 
 Contributions are welcome, and new rule packs are a great first contribution.
 Read [CONTRIBUTING.md](CONTRIBUTING.md) first: changes to cleanup paths or

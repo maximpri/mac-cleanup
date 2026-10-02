@@ -8,6 +8,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- The README includes a color GIF and still screenshots captured from the
+  running Ratatui interface, with a reproducible read-only demo tape.
 - `diskray installers` (and the `old_installers` MCP tool) reports `.dmg`,
   `.pkg`, `.xip`, and `.iso` files in Downloads and Desktop with their age,
   whether the matching app is already installed, and whether one is mounted.
