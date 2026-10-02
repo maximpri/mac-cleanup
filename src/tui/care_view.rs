@@ -1542,7 +1542,19 @@ impl Workspace {
         }
         self.cancel_agent(app, "A question replaced the previous investigation.");
         let mut case = investigation::InvestigationCase::new_question(&question, self.revision);
-        let run = agent::start(&mut case, agent::Subject::default(), false, true);
+        let subject =
+            if self.screen == Screen::Explore && agent_tools::is_cleanup_question(&question) {
+                agent::Subject {
+                    folder: app.explorer_path.clone(),
+                    description:
+                        "Folder currently open in Explore; the question may concern the whole disk."
+                            .into(),
+                    ..agent::Subject::default()
+                }
+            } else {
+                agent::Subject::default()
+            };
+        let run = agent::start(&mut case, subject, false, true);
         self.agent = Some(run);
         self.agent_subject = None;
         self.investigation_case = Some(case);
@@ -5563,6 +5575,36 @@ mod tests {
                 && hypothesis.status == investigation::HypothesisStatus::Open
         }));
     }
+    #[test]
+    fn cleanup_ask_keeps_the_open_explorer_folder_in_its_evidence() {
+        let (_home, mut app, mut w) = fixture();
+        app.account_home = app.account_home.canonicalize().unwrap();
+        let folder = app.account_home.join("code/project/target");
+        fs::create_dir_all(folder.join("debug")).unwrap();
+        fs::write(folder.join("debug/build-output"), vec![0x7f; 8192]).unwrap();
+        app.inventory = Some(StorageInventory::scan(&app.account_home, &app.account_home));
+        app.explorer_path = Some(folder);
+        w.navigate(Screen::Explore);
+        w.start_ask(
+            &app,
+            "how can i safely and quickly release 10gb of disk space?",
+        );
+        settle(&mut w, &mut app);
+        let case = w.investigation_case.as_ref().unwrap();
+        let overview = case
+            .evidence
+            .iter()
+            .find(|evidence| evidence.cleanup_total_kb.is_some())
+            .unwrap();
+        assert!(
+            overview.summary.contains("project/target"),
+            "{}",
+            overview.summary
+        );
+        assert!(case.conclusion.as_ref().unwrap().contains("not covered"));
+        assert!(w.plan.is_empty());
+    }
+
     #[test]
     fn ask_composer_is_visible_by_default_and_starts_a_bounded_question_case() {
         let (_home, mut app, mut w) = fixture();

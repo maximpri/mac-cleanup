@@ -23,6 +23,10 @@ provides historical design context. The current implementation checkpoint is in
   classification. Tools borrow app state or run existing collectors
   (`storage::folder_age`, `care::open_handle_owners`, `care::identify_owner`,
   `care::sample_process`, volume context, and the approval-gated trace).
+  For cleanup questions, `cleanup_options` totals eligible, disjoint cache rules
+  and supplies measured folder context. APFS Data-volume aliases compare as the
+  same logical path. Folder and child sizes never create cleanup eligibility,
+  and only references that fit the tool output are issued to the model.
 - `src/agent.rs` drives one investigation. The interface tick owns the run:
   model tool calls arrive over the helper's pipe, are dispatched against a
   borrowed `ToolWorld`, slow collectors run on threads, and results return as
@@ -30,10 +34,14 @@ provides historical design context. The current implementation checkpoint is in
   a measured fallback sequence, and a report-only finisher are enforced here.
   `validate_report` drops unissued references, downgrades unsupported verdicts,
   recomputes completeness, and keeps only still-eligible suggestions.
+  Model and fallback reports retain the latest usable cleanup total, discard
+  superseded totals, and compare an explicit requested amount with that estimate.
 - `src/investigation.rs` owns the case record: hypotheses, typed evidence status,
   the tool-call timeline, the question for Ask cases, and validated suggestions.
   A failed or denied collector cannot strengthen a hypothesis. New fields default
   so older History records still load.
+  Optional `cleanup_total_kb` records the eligible estimate separately from
+  displayed text and folder measurements.
 - `native/AIHelper.swift` calls Apple's on-device FoundationModels API. The
   `agent` operation creates a `LanguageModelSession` with one bridged `Tool` per
   Rust spec; each call is forwarded to Rust and answered on stdin through an
@@ -176,7 +184,7 @@ flowchart TD
 | `src/why.rs` | The "why is the disk full" overview shared by `diskray why` and the Overview |
 | `src/commands.rs` | `why`, `ask`, `artifacts`, and `rules` subcommands |
 | `src/growth.rs` | Growth between comparable complete assessments |
-| `src/artifacts.rs` | Report-only search for stale build output in untouched projects |
+| `src/artifacts.rs` | Report-only, marker-confirmed build output; source/Git age, symlink boundaries, device/inode deduplication |
 | `src/mcp.rs`, `src/pending.rs` | Read-only MCP server; agent proposals saved for `diskray review` |
 | `src/paths.rs`, `src/migrate.rs` | User-data locations and the one-time move from `mac-cleanup` |
 | `src/tui/mod.rs` | Session types, terminal lifecycle, event loop |

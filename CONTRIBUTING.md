@@ -13,10 +13,18 @@ cargo build
 cargo test --all-targets
 cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
+python3 -m unittest discover -s scripts -p 'test_*.py' -v
 ```
 
 Use `cargo run -- --analyze` for manual testing. Analysis is read-only. Never
 run the project or its tests with `sudo`.
+
+The Python test suite uses the standard library and disposable fixtures; it
+checks the evaluation harness without Apple Intelligence. After building the
+release binary and helper with `sh scripts/build-release.sh`, run
+`python3 scripts/eval_agent.py target/release/diskray --runs 1` to check Ask
+answers. Safety checks run even during measured fallback; model-quality checks
+need a ready Apple Intelligence model.
 
 ## Safety requirements
 

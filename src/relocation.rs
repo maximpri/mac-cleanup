@@ -977,7 +977,7 @@ fn rollback_after_link_failure(
         // Never delete the verified copy unless the original was restored:
         // it may be the only intact version left.
         format!(
-            "{reason}; rollback also failed: {}. Your data is kept in two places: the original at {} and the verified copy at {}.",
+            "{reason}; rollback also failed: {}. Recovery paths: original backup at {}; verified copy at {}. Neither was removed during rollback.",
             rollback_errors.join("; "),
             backup.display(),
             destination.display()
@@ -1022,6 +1022,34 @@ mod tests {
         }
     }
 
+    fn populated_test_plan() -> (tempfile::TempDir, RelocationPlan) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("source");
+        let destination_root = root.join("external");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination_root).unwrap();
+        fs::write(source.join("data"), b"original").unwrap();
+        let plan = test_plan(&source, &destination_root);
+        (temp, plan)
+    }
+
+    fn assert_no_temporary_copies(plan: &RelocationPlan) {
+        for directory in [plan.source.parent().unwrap(), &plan.destination_root] {
+            for entry in fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                assert!(
+                    !entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(crate::paths::RELOCATION_PREFIX),
+                    "temporary relocation data was left at {}",
+                    entry.path().display()
+                );
+            }
+        }
+    }
+
     #[test]
     fn capacity_accounts_for_sparse_files_and_copy_overhead() {
         assert_eq!(
@@ -1047,6 +1075,16 @@ mod tests {
         let info = destination_from_info(path.clone(), EXTERNAL_INFO).unwrap();
         assert_eq!(info.free_kb, 1024);
         assert_eq!(info.capacity_kb, 8192);
+        let constrained_container = EXTERNAL_INFO.replace(
+            "<key>APFSContainerFree</key><integer>2097152</integer>",
+            "<key>APFSContainerFree</key><integer>524288</integer>",
+        );
+        assert_eq!(
+            destination_from_info(path.clone(), &constrained_container)
+                .unwrap()
+                .free_kb,
+            512
+        );
         let hfs = EXTERNAL_INFO
             .replace("<string>apfs</string>", "<string>hfs</string>")
             .replace(
@@ -1065,8 +1103,18 @@ mod tests {
                 "<key>WritableVolume</key><true/>",
                 "<key>WritableVolume</key><false/>",
             ),
+            EXTERNAL_INFO.replace("<key>WritableVolume</key><true/>", ""),
+            EXTERNAL_INFO.replace(
+                "<dict>",
+                "<dict><key>BusProtocol</key><string>Disk Image</string>",
+            ),
             EXTERNAL_INFO.replace("<string>apfs</string>", "<string>exfat</string>"),
             EXTERNAL_INFO.replace("<key>VolumeUUID</key><string>fixture-volume</string>", ""),
+            EXTERNAL_INFO.replace("<string>fixture-volume</string>", "<string></string>"),
+            EXTERNAL_INFO.replace("<key>TotalSize</key><integer>8388608</integer>", ""),
+            EXTERNAL_INFO
+                .replace("<key>VolumeFreeSpace</key><integer>1048576</integer>", "")
+                .replace("<key>APFSContainerFree</key><integer>2097152</integer>", ""),
         ] {
             assert!(destination_from_info(path.clone(), &invalid).is_err());
         }
@@ -1108,6 +1156,200 @@ mod tests {
         assert!(rename_exclusive(&source, &destination).is_err());
         assert_eq!(fs::read(source.join("data")).unwrap(), b"keep");
         assert!(destination.is_dir());
+    }
+
+    #[test]
+    fn source_verification_detects_same_size_edits_after_the_first_read_buffer() {
+        let (_temp, fixture) = populated_test_plan();
+        let source = fixture.source.join("data");
+        let copied = fixture.destination.join("data");
+        let mut contents = vec![7_u8; 1024 * 1024 + 17];
+        fs::write(&source, &contents).unwrap();
+        let plan = test_plan(&fixture.source, &fixture.destination_root);
+        copy_tree(&plan.source, &plan.destination).unwrap();
+        ensure_source_unchanged(&plan, &plan.destination).unwrap();
+
+        *contents.last_mut().unwrap() = 8;
+        fs::write(&source, &contents).unwrap();
+        assert_eq!(tree_stats(&source).unwrap(), tree_stats(&copied).unwrap());
+        let error = ensure_source_unchanged(&plan, &plan.destination).unwrap_err();
+        assert!(error.contains("could not be verified against the source"));
+        assert!(error.contains("contents differ"));
+        assert_eq!(fs::read(&source).unwrap().last(), Some(&8));
+        assert_eq!(fs::read(&copied).unwrap().last(), Some(&7));
+    }
+
+    #[test]
+    fn verification_rejects_missing_extra_and_type_changed_nested_entries() {
+        for change in ["missing", "extra", "type"] {
+            let (_temp, plan) = populated_test_plan();
+            let nested = plan.source.join("nested");
+            fs::create_dir(&nested).unwrap();
+            fs::write(nested.join("data"), b"nested contents").unwrap();
+            copy_tree(&plan.source, &plan.destination).unwrap();
+
+            let copied_nested = plan.destination.join("nested");
+            match change {
+                "missing" => fs::remove_file(copied_nested.join("data")).unwrap(),
+                "extra" => fs::write(copied_nested.join("unexpected"), b"extra").unwrap(),
+                "type" => {
+                    fs::remove_file(copied_nested.join("data")).unwrap();
+                    fs::create_dir(copied_nested.join("data")).unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let error = verify_copy(&plan.source, &plan.destination).unwrap_err();
+            assert!(
+                matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+                ),
+                "{change}: {error}"
+            );
+            assert_eq!(fs::read(nested.join("data")).unwrap(), b"nested contents");
+        }
+    }
+
+    #[test]
+    fn verification_rejects_symlinks_on_either_side_even_when_contents_match() {
+        for replace_source in [false, true] {
+            let (_temp, plan) = populated_test_plan();
+            copy_tree(&plan.source, &plan.destination).unwrap();
+            let (replace, target) = if replace_source {
+                (plan.source.join("data"), plan.destination.join("data"))
+            } else {
+                (plan.destination.join("data"), plan.source.join("data"))
+            };
+            fs::remove_file(&replace).unwrap();
+            symlink(&target, &replace).unwrap();
+
+            let error = verify_copy(&plan.source, &plan.destination).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(fs::read(&target).unwrap(), b"original");
+            assert_eq!(fs::read_link(&replace).unwrap(), target);
+        }
+    }
+
+    #[test]
+    fn source_validation_rejects_nested_symlinks_without_following_them() {
+        let (temp, plan) = populated_test_plan();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"outside data").unwrap();
+        symlink(&outside, plan.source.join("nested-link")).unwrap();
+
+        let error = validate_source(&plan.source, &plan.account_home).unwrap_err();
+        assert!(error.contains("symbolic links"), "{error}");
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"outside data");
+        assert_eq!(fs::read(plan.source.join("data")).unwrap(), b"original");
+    }
+
+    #[test]
+    fn ancestor_symlink_swaps_invalidate_review_even_if_leaf_identities_match() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source_branch = root.join("source-branch");
+        let destination_branch = root.join("destination-branch");
+        let source = source_branch.join("project/source");
+        let destination_root = destination_branch.join("volume/external");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination_root).unwrap();
+        fs::write(source.join("data"), b"original").unwrap();
+        let plan = test_plan(&source, &destination_root);
+
+        for branch in [&source_branch, &destination_branch] {
+            let original = branch.with_extension("original");
+            fs::rename(branch, &original).unwrap();
+            symlink(&original, branch).unwrap();
+            assert_eq!(
+                PathIdentity::capture(&plan.source),
+                Some(plan.source_identity)
+            );
+            assert_eq!(
+                PathIdentity::capture(&plan.destination_root),
+                Some(plan.destination_identity)
+            );
+
+            let report = execute(&plan);
+            assert_eq!(report.status, RelocationStatus::Failed);
+            assert!(!report.backup_removed);
+            assert!(report.message.unwrap().contains("changed since review"));
+            assert_eq!(fs::read(source.join("data")).unwrap(), b"original");
+            assert!(!plan.destination.exists());
+            assert_no_temporary_copies(&plan);
+
+            fs::remove_file(branch).unwrap();
+            fs::rename(&original, branch).unwrap();
+        }
+    }
+
+    #[test]
+    fn changed_tree_after_revalidation_aborts_and_removes_the_staging_copy() {
+        let (_temp, plan) = populated_test_plan();
+        fs::write(plan.source.join("new-data"), b"new contents").unwrap();
+
+        let error = execute_inner_for_test(&plan).err().unwrap();
+        assert!(error.contains("did not match the source"), "{error}");
+        assert_eq!(fs::read(plan.source.join("data")).unwrap(), b"original");
+        assert_eq!(
+            fs::read(plan.source.join("new-data")).unwrap(),
+            b"new contents"
+        );
+        assert!(!plan.destination.exists());
+        assert_no_temporary_copies(&plan);
+    }
+
+    #[test]
+    fn symlink_introduced_after_review_aborts_copy_and_preserves_its_target() {
+        let (temp, plan) = populated_test_plan();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"outside data").unwrap();
+        let link = plan.source.join("new-link");
+        symlink(&outside, &link).unwrap();
+
+        let error = execute_inner_for_test(&plan).err().unwrap();
+        assert!(error.contains("symbolic link"), "{error}");
+        assert_eq!(fs::read(plan.source.join("data")).unwrap(), b"original");
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"outside data");
+        assert_eq!(fs::read_link(&link).unwrap(), outside);
+        assert!(!plan.destination.exists());
+        assert_no_temporary_copies(&plan);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn conflicting_destination_never_overwrites_files_directories_or_dangling_links() {
+        for conflict in ["file", "directory", "symlink"] {
+            let (temp, plan) = populated_test_plan();
+            let missing_target = temp.path().join("missing");
+            match conflict {
+                "file" => fs::write(&plan.destination, b"destination data").unwrap(),
+                "directory" => fs::create_dir(&plan.destination).unwrap(),
+                "symlink" => symlink(&missing_target, &plan.destination).unwrap(),
+                _ => unreachable!(),
+            }
+            let before = PathIdentity::capture(&plan.destination).unwrap();
+
+            let error = execute_inner_for_test(&plan).err().unwrap();
+            assert!(
+                error.contains("could not commit the copy"),
+                "{conflict}: {error}"
+            );
+            assert_eq!(PathIdentity::capture(&plan.destination), Some(before));
+            assert_eq!(fs::read(plan.source.join("data")).unwrap(), b"original");
+            match conflict {
+                "file" => assert_eq!(fs::read(&plan.destination).unwrap(), b"destination data"),
+                "directory" => assert_eq!(fs::read_dir(&plan.destination).unwrap().count(), 0),
+                "symlink" => {
+                    assert_eq!(fs::read_link(&plan.destination).unwrap(), missing_target);
+                    assert!(!missing_target.exists());
+                }
+                _ => unreachable!(),
+            }
+            assert_no_temporary_copies(&plan);
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1192,6 +1434,63 @@ mod tests {
         assert_eq!(message, "link failed");
         assert!(source.join("data").exists());
         assert!(!destination.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rollback_removes_a_replacement_link_without_touching_its_target() {
+        let (temp, plan) = populated_test_plan();
+        copy_tree(&plan.source, &plan.destination).unwrap();
+        let backup = temp.path().join("backup");
+        let unrelated = temp.path().join("unrelated");
+        fs::create_dir(&unrelated).unwrap();
+        fs::write(unrelated.join("keep"), b"unrelated data").unwrap();
+        fs::rename(&plan.source, &backup).unwrap();
+        symlink(&unrelated, &plan.source).unwrap();
+
+        let message = rollback_after_link_failure(
+            &plan.source,
+            &backup,
+            &plan.destination,
+            "wrong replacement link".into(),
+        );
+        assert_eq!(message, "wrong replacement link");
+        assert!(
+            !fs::symlink_metadata(&plan.source)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(plan.source.join("data")).unwrap(), b"original");
+        assert_eq!(fs::read(unrelated.join("keep")).unwrap(), b"unrelated data");
+        assert!(!backup.exists());
+        assert!(!plan.destination.exists());
+    }
+
+    #[test]
+    fn rollback_retains_the_verified_copy_when_the_original_cannot_be_restored() {
+        let (temp, plan) = populated_test_plan();
+        copy_tree(&plan.source, &plan.destination).unwrap();
+        let backup = temp.path().join("missing-backup");
+        fs::remove_dir_all(&plan.source).unwrap();
+
+        let message = rollback_after_link_failure(
+            &plan.source,
+            &backup,
+            &plan.destination,
+            "link creation failed".into(),
+        );
+        assert!(message.contains("could not restore the original source"));
+        assert!(message.contains(&plan.destination.display().to_string()));
+        assert!(
+            !message.contains("Your data is kept in two places"),
+            "a missing original backup must not be reported as intact: {message}"
+        );
+        assert_eq!(
+            fs::read(plan.destination.join("data")).unwrap(),
+            b"original"
+        );
+        assert!(!plan.source.exists());
     }
 
     #[test]

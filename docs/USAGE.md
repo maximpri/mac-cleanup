@@ -17,6 +17,14 @@ top-level folder in your home except media, apps, and sync folders; set
 `roots = ["code", "work"]` and `min_age_days = 90` in
 `~/.config/diskray/projects.toml` to narrow it.
 
+Build-output discovery requires the matching project marker, such as
+`Cargo.toml` for Rust's `target`. Project age follows source activity and Git's
+HEAD/index, while recognized build output is excluded from that age check.
+Symlinked roots, parent components, projects, and output directories are skipped;
+overlapping configured roots count each output once. The report preserves source
+files and both Rust build profiles. Finding `target/debug` does not create a
+cleanup action.
+
 ## The interactive workspace
 
 The workspace has two persistent panels. The left lists storage items, folders,
@@ -120,6 +128,20 @@ rechecks every 30 seconds and on Enter. `F2` opens System Settings. Questions
 are sent only when you press Enter with AI ready.
 If macOS requests a restart after a language change, save your work and restart
 before checking again. See [AI setup and live verification](AI.md).
+
+For a cleanup goal, ask a question such as:
+
+```bash
+diskray ask "I have 1.9 GB free; how can I reclaim 10 GB?"
+```
+
+The answer keeps the latest eligible cache estimate and the shortfall against
+the requested amount. `GB` is decimal and `GiB` is binary; space already free is
+not treated as the amount to reclaim. Large measured folders and their largest
+child provide inspection context, including the current Explore folder. These
+sizes do not count toward eligible cleanup. A build folder such as `target/debug`
+can be inspected without receiving a cleanup action. Use `m` on the selected
+folder for the separate external-storage workflow described above.
 
 A persistent progress band shows **Checks → Folder map → Review**, with actual
 completed checks, scanned items, unreadable entries, and elapsed time. Unknown

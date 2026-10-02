@@ -126,6 +126,9 @@ pub struct EvidenceRecord {
     pub status: EvidenceStatus,
     pub supports: Vec<String>,
     pub contradicts: Vec<String>,
+    /// Measured eligible cache estimate, separate from review-only folder sizes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_total_kb: Option<u64>,
 }
 
 /// A collector result before it becomes a numbered evidence record.
@@ -516,6 +519,7 @@ pub fn evidence(
         status,
         supports: supports.iter().map(|item| (*item).into()).collect(),
         contradicts: contradicts.iter().map(|item| (*item).into()).collect(),
+        cleanup_total_kb: None,
     }
 }
 

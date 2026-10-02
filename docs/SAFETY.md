@@ -300,6 +300,13 @@ folder cannot be overwritten. Native `copyfile` preserves extended attributes,
 resource forks, ACLs, and timestamps. File bytes are compared again after the
 original is staged and before linking; a mismatch restores the original.
 
+Source and destination parent paths must also remain free of symlinks after
+review. Verification detects same-size file edits, missing or extra entries,
+file-type changes, and newly introduced symlinks. If creating the replacement
+link fails, Diskray attempts to restore the original before removing the verified
+copy. If restoration also fails, it retains that copy and reports the backup and
+destination recovery paths without claiming that both copies still exist.
+
 The destination screen's on-device AI advice chooses only from measured drive
 IDs or conservative review decisions. It receives category, size, modification
 age, and capacity facts, without paths or file contents. It cannot create a

@@ -57,6 +57,9 @@ jobs:
       - name: Check MCP server
         run: python3 scripts/check_mcp.py target/release/diskray
 
+      - name: Test eval safety assertions without Apple Intelligence
+        run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
+
       - name: Check eval safety rules (quality needs Apple Intelligence)
         run: python3 scripts/eval_agent.py target/release/diskray --runs 1
 

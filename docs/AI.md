@@ -163,7 +163,16 @@ helper errors are shown in plain language.
 
 General Ask questions cannot suggest process signals: start an investigation
 on the specific process to review those. Cleanup questions replace the general
-CPU-ranking tool with the open-file check while retaining the six-tool limit.
+CPU-ranking tool with the open-file check and the memory tool with a cleanup
+overview while retaining the six-tool limit. Requests to free, release, or
+reclaim disk space use this toolset too. The overview totals non-overlapping
+eligible cache rules, lists large measured folders for inspection, and retains
+the open Explore folder as context. Rust compares an explicit GB/GiB/MB/MiB/TB/TiB
+amount with that estimate and keeps the total and shortfall in the answer even
+if the model selects only a small cache. Folder sizes are review candidates,
+never additional reclaimable space; actual freed space still needs verification.
+The overview includes each folder's largest measured child when space permits,
+so a build directory stays visible even if the model omits its child-list citation.
 Growth questions expose a history-comparison tool within that same limit. It
 compares complete assessments of the same root and volume against the previous
 assessment, or a baseline at least one day, seven days, or thirty days old.
@@ -184,11 +193,17 @@ remains on-device whether research is on or off.
 
 ## Checking quality
 
+`python3 -m unittest discover -s scripts -p 'test_*.py' -v` checks the evaluation
+harness independently of Apple Intelligence and runs in CI. Its regressions
+cover same-size file changes, symlink retargeting, and safety checks during
+measured fallback.
+
 `python3 scripts/check_ai_helper.py` checks the helper protocol, and
-`python3 scripts/eval_agent.py` asks eleven fixture questions and checks that
-every cited evidence ID exists, every suggestion was eligible, fixtures are
-unchanged, and prompt-injected folder names are ignored. Its quality checks need
-a Mac whose Apple Intelligence model is ready.
+`python3 scripts/eval_agent.py` asks twelve fixture questions and checks that
+every cited evidence ID exists, every suggestion was eligible, fixture contents
+and symlink targets are unchanged, and prompt-injected folder names are ignored.
+Safety checks also apply during measured fallback. Its quality checks need a Mac
+whose Apple Intelligence model is ready.
 
 After completing Apple Intelligence setup or restarting the Mac, verify actual
 inference and tool use from the repository root:

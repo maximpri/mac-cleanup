@@ -59,6 +59,7 @@ unreadable folders are reported as unreadable, never as empty.
 diskray why                          # one screen: what fills the disk and why
 diskray                              # interactive: explore, investigate, review, verify
 diskray ask "why is my disk almost full?"
+diskray ask "how can I safely free 10 GB of disk space?"
 diskray artifacts                    # node_modules, target, .venv in projects untouched for 60+ days
 claude mcp add --scope user diskray -- diskray mcp   # give coding agents read-only disk tools
 ```
@@ -72,6 +73,12 @@ reviews that plan before anything runs; `:` lists every command.
 The **Ask AI** input stays open below both panels. Press `/` or click it to
 type. `Left` / `Right`, `Home` / `End`, `Backspace`, and `Delete` edit your
 question; `Esc` returns to browsing and keeps your draft and cursor position.
+
+Cleanup answers compare your requested amount with the eligible cache estimate
+and show any shortfall. They include large folders and their largest measured
+child when available, including build output such as `target/debug`. Asking
+while browsing includes the current folder as context. To move useful data,
+select its folder and press `m` for the separate external-storage review.
 
 ![An explanation: what was measured, what the checks found, what you can do, and how it was checked](docs/images/details.svg)
 

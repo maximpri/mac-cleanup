@@ -8,6 +8,19 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Cleanup goals handle fractional amounts and distinguish requested space from
+  space already free. Repeated checks use the latest eligible total, and APFS
+  aliases no longer inflate estimates or hide the selected folder. Overviews
+  retain the largest measured child even when the AI omits its separate citation.
+- Build-output reports reject symlinked configured parents, count overlapping
+  roots once, and include recent source activity in unrelated folders whose
+  names happen to match build output.
+- Failed relocation rollback names recovery paths without falsely claiming
+  that both copies still exist.
+- Ask cleanup questions report the total eligible cache estimate and any
+  shortfall against a requested amount, and expose large measured folders for
+  further inspection. The open Explore folder is included as context. Review
+  folders never count toward eligible cleanup or acquire cleanup actions.
 - Ask growth questions compare saved assessments for the requested period and
   explain missing history. Exhausted tool budgets switch to a report-only
   session, and stale helper-exit events no longer cancel the recovery report.
@@ -75,8 +88,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   palette; explanations lead with a plain sentence and what the checks found;
   messages clear on the next key; Explore opens at the home folder.
 - `scripts/eval_agent.py`: fixture-based checks of `diskray ask` answers
-  (citations exist, suggestions eligible, fixtures unchanged, prompt injection
-  ignored).
+  (citations exist, suggestions eligible, file contents and symlink targets
+  unchanged, prompt injection ignored). Safety checks run during measured
+  fallback, with standalone harness regression tests in CI.
 - Release engineering: `build-release.sh` skips the AI helper on unsupported
   Macs, a tag-driven release workflow publishes a source tarball and updates
   the Homebrew tap, and `packaging/homebrew/diskray.rb` is the formula.

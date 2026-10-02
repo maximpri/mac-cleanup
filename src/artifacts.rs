@@ -9,6 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashSet,
     fs,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
@@ -189,10 +190,6 @@ fn kind_for(project: &Path, name: &str) -> Option<(&'static str, &'static str)> 
         })
 }
 
-fn is_artifact_name(name: &str) -> bool {
-    KINDS.iter().any(|(folder, ..)| *folder == name)
-}
-
 /// Seconds since the newest change to the project's own files, or `None`
 /// when the walk could not finish.
 fn project_age(project: &Path, now: SystemTime) -> Option<u64> {
@@ -218,19 +215,40 @@ fn project_age(project: &Path, now: SystemTime) -> Option<u64> {
             let entry = entry.ok()?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if directory == project && (is_artifact_name(&name) || name == ".git") {
+            if directory == project && name == ".git" {
                 continue;
             }
             let metadata = fs::symlink_metadata(entry.path()).ok()?;
+            if metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && kind_for(&directory, &name).is_some()
+            {
+                continue;
+            }
             if let Ok(modified) = metadata.modified() {
                 note(modified);
             }
-            if metadata.is_dir() && !metadata.file_type().is_symlink() && !is_artifact_name(&name) {
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
                 pending.push(entry.path());
             }
         }
     }
     newest.map(|newest| now.duration_since(newest).unwrap_or_default().as_secs())
+}
+
+/// Resolve configured roots without traversing any symlink beneath home.
+fn project_root(home: &Path, relative: &str) -> Option<(PathBuf, fs::Metadata)> {
+    let mut root = home.to_path_buf();
+    let mut metadata = None;
+    for component in Path::new(relative).components() {
+        root.push(component);
+        let current = fs::symlink_metadata(&root).ok()?;
+        if current.file_type().is_symlink() || !current.is_dir() {
+            return None;
+        }
+        metadata = Some(current);
+    }
+    Some((root, metadata?))
 }
 
 /// Find stale build output under the configured roots.
@@ -242,17 +260,14 @@ pub fn find(home: &Path, config: &Config, cancel: &AtomicBool) -> Report {
         ..Report::default()
     };
     let mut seen = 0;
+    let mut reported = HashSet::new();
     for root in &config.roots(home) {
         if crate::rules::valid_relative_path(root).is_err() {
             continue;
         }
-        let root = home.join(root);
-        let Ok(metadata) = fs::symlink_metadata(&root) else {
+        let Some((root, metadata)) = project_root(home, root) else {
             continue;
         };
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            continue;
-        }
         report.roots.push(root.clone());
         let device = metadata.dev();
         let mut pending = vec![(root, 0_usize)];
@@ -284,7 +299,10 @@ pub fn find(home: &Path, config: &Config, cancel: &AtomicBool) -> Report {
                     if let Some(age) = project_age(&directory, now) {
                         let days = age / 86_400;
                         let size_kb = crate::cache::directory_kb(&path);
-                        if days >= config.min_age_days && size_kb >= MIN_REPORT_KB {
+                        if days >= config.min_age_days
+                            && size_kb >= MIN_REPORT_KB
+                            && reported.insert((metadata.dev(), metadata.ino()))
+                        {
                             report.artifacts.push(Artifact {
                                 project: directory.clone(),
                                 path,
@@ -317,6 +335,7 @@ pub fn find(home: &Path, config: &Config, cancel: &AtomicBool) -> Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
 
     fn backdate(path: &Path, days: u64) {
         let when = SystemTime::now() - Duration::from_secs(days * 86_400);
@@ -423,5 +442,296 @@ mod tests {
         let report = find(home.path(), &custom, &AtomicBool::new(false));
         assert_eq!(report.artifacts.len(), 1);
         assert_eq!(report.roots, vec![home.path().join("work")]);
+    }
+
+    #[test]
+    fn rust_report_preserves_debug_release_and_source_contents() {
+        let home = tempfile::tempdir().unwrap();
+        let rust = project(home.path(), "code/app", "Cargo.toml", "target", 90);
+        fs::write(
+            rust.join("Cargo.toml"),
+            b"[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        backdate(&rust.join("Cargo.toml"), 90);
+        for profile in ["debug", "release"] {
+            fs::create_dir_all(rust.join("target").join(profile)).unwrap();
+            fs::write(
+                rust.join("target").join(profile).join("app"),
+                profile.as_bytes(),
+            )
+            .unwrap();
+        }
+
+        let report = find(home.path(), &Config::default(), &AtomicBool::new(false));
+
+        assert!(report.complete);
+        assert_eq!(report.artifacts.len(), 1);
+        assert_eq!(report.artifacts[0].path, rust.join("target"));
+        assert_eq!(report.artifacts[0].regenerate, "cargo build");
+        assert_eq!(report.to_json()["deleted"], false);
+        assert_eq!(fs::read(rust.join("target/debug/app")).unwrap(), b"debug");
+        assert_eq!(
+            fs::read(rust.join("target/release/app")).unwrap(),
+            b"release"
+        );
+        assert_eq!(fs::read(rust.join("src/main")).unwrap(), b"code");
+        assert_eq!(
+            fs::metadata(rust.join("target/blob")).unwrap().len(),
+            11 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn reports_supported_build_outputs_with_their_project_markers() {
+        let home = tempfile::tempdir().unwrap();
+        let code = home.path().join("code");
+        let cases = [
+            (
+                "node",
+                "package.json",
+                "node_modules",
+                "Node.js node_modules",
+            ),
+            ("rust", "Cargo.toml", "target", "Rust target"),
+            ("python", ".venv/pyvenv.cfg", ".venv", "Python .venv"),
+            ("swift", "Package.swift", ".build", "SwiftPM .build"),
+            ("gradle", "settings.gradle.kts", ".gradle", "Gradle .gradle"),
+            ("next", "package.json", ".next", "Next.js .next"),
+        ];
+        for (name, marker, artifact, _) in cases {
+            project(&code, name, marker, artifact, 90);
+        }
+
+        let report = find(home.path(), &Config::default(), &AtomicBool::new(false));
+
+        assert!(report.complete);
+        assert_eq!(report.artifacts.len(), cases.len());
+        for (name, _, artifact, kind) in cases {
+            let item = report
+                .artifacts
+                .iter()
+                .find(|item| item.path == code.join(name).join(artifact))
+                .unwrap();
+            assert_eq!(item.project, code.join(name));
+            assert_eq!(item.kind, kind);
+            assert!(item.size_kb >= 11 * 1024);
+            assert!(item.untouched_days >= 90);
+            assert!(!item.regenerate.is_empty());
+        }
+        assert!(report.total_kb() >= 6 * 11 * 1024);
+    }
+
+    #[test]
+    fn artifact_names_require_exact_project_marker_files() {
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir(project.path().join("Cargo.toml")).unwrap();
+        fs::write(project.path().join("Cargo.toml.backup"), b"manifest").unwrap();
+        assert!(kind_for(project.path(), "target").is_none());
+        fs::remove_dir(project.path().join("Cargo.toml")).unwrap();
+        fs::write(project.path().join("Cargo.toml"), b"manifest").unwrap();
+        assert_eq!(kind_for(project.path(), "target").unwrap().0, "Rust target");
+        for name in [
+            "debug",
+            "release",
+            "target-backup",
+            "Target",
+            "node_modules",
+        ] {
+            assert!(kind_for(project.path(), name).is_none(), "{name}");
+        }
+
+        fs::create_dir_all(project.path().join(".venv/pyvenv.cfg")).unwrap();
+        assert!(kind_for(project.path(), ".venv").is_none());
+        fs::remove_dir(project.path().join(".venv/pyvenv.cfg")).unwrap();
+        fs::write(project.path().join(".venv/pyvenv.cfg"), b"home = /python").unwrap();
+        assert_eq!(kind_for(project.path(), ".venv").unwrap().0, "Python .venv");
+    }
+
+    #[test]
+    fn recent_build_output_does_not_make_old_source_recent() {
+        let home = tempfile::tempdir().unwrap();
+        let rust = project(home.path(), "code/app", "Cargo.toml", "target", 90);
+        fs::create_dir_all(rust.join("target/debug/incremental")).unwrap();
+        fs::write(rust.join("target/debug/incremental/recent"), b"build").unwrap();
+
+        let report = find(home.path(), &Config::default(), &AtomicBool::new(false));
+
+        assert_eq!(report.artifacts.len(), 1);
+        assert_eq!(report.artifacts[0].project, rust);
+        assert!(report.artifacts[0].untouched_days >= 90);
+    }
+
+    #[test]
+    fn recent_source_in_an_unrelated_artifact_named_folder_counts_as_activity() {
+        let home = tempfile::tempdir().unwrap();
+        let rust = project(home.path(), "code/app", "Cargo.toml", "target", 90);
+        fs::create_dir(rust.join("node_modules")).unwrap();
+        fs::write(rust.join("node_modules/notes.txt"), b"user-authored notes").unwrap();
+        backdate(&rust.join("node_modules"), 90);
+        backdate(&rust, 90);
+
+        let report = find(home.path(), &Config::default(), &AtomicBool::new(false));
+
+        assert!(
+            report.artifacts.is_empty(),
+            "a folder name alone must not hide recent project activity"
+        );
+        assert_eq!(
+            fs::read(rust.join("node_modules/notes.txt")).unwrap(),
+            b"user-authored notes"
+        );
+    }
+
+    #[test]
+    fn both_git_head_and_index_protect_recently_used_projects() {
+        let home = tempfile::tempdir().unwrap();
+        for (name, git_file) in [("checked-out", "HEAD"), ("staged", "index")] {
+            let rust = project(
+                home.path(),
+                &format!("code/{name}"),
+                "Cargo.toml",
+                "target",
+                90,
+            );
+            fs::create_dir(rust.join(".git")).unwrap();
+            fs::write(rust.join(".git").join(git_file), b"git state").unwrap();
+            backdate(&rust, 90);
+        }
+
+        let report = find(home.path(), &Config::default(), &AtomicBool::new(false));
+
+        assert!(report.complete);
+        assert!(report.artifacts.is_empty());
+    }
+
+    #[test]
+    fn unrelated_git_internal_updates_do_not_hide_stale_build_output() {
+        let home = tempfile::tempdir().unwrap();
+        let rust = project(home.path(), "code/app", "Cargo.toml", "target", 90);
+        fs::create_dir_all(rust.join(".git/objects")).unwrap();
+        fs::write(rust.join(".git/HEAD"), b"ref: refs/heads/main").unwrap();
+        fs::write(rust.join(".git/index"), b"index").unwrap();
+        backdate(&rust.join(".git/HEAD"), 90);
+        backdate(&rust.join(".git/index"), 90);
+        fs::write(rust.join(".git/objects/recent"), b"background fetch").unwrap();
+        backdate(&rust, 90);
+
+        let report = find(home.path(), &Config::default(), &AtomicBool::new(false));
+
+        assert_eq!(report.artifacts.len(), 1);
+        assert_eq!(report.artifacts[0].project, rust);
+    }
+
+    #[test]
+    fn configured_roots_do_not_traverse_symlinked_parents() {
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let rust = project(outside.path(), "projects/app", "Cargo.toml", "target", 90);
+        fs::create_dir(home.path().join("code")).unwrap();
+        symlink(outside.path(), home.path().join("code/link")).unwrap();
+        let config = Config {
+            roots: vec!["code/link/projects".into()],
+            ..Config::default()
+        };
+
+        let report = find(home.path(), &config, &AtomicBool::new(false));
+
+        assert!(
+            report.artifacts.is_empty(),
+            "configured roots stay inside home"
+        );
+        assert!(report.roots.is_empty());
+        assert!(rust.join("target/blob").exists());
+    }
+
+    #[test]
+    fn symlinked_roots_projects_and_outputs_are_not_followed() {
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let external = project(outside.path(), "app", "Cargo.toml", "target", 90);
+        fs::create_dir(home.path().join("code")).unwrap();
+        symlink(outside.path(), home.path().join("linked-root")).unwrap();
+        symlink(&external, home.path().join("code/linked-project")).unwrap();
+        let local = home.path().join("code/local");
+        fs::create_dir(&local).unwrap();
+        fs::write(local.join("Cargo.toml"), b"manifest").unwrap();
+        backdate(&local.join("Cargo.toml"), 90);
+        symlink(external.join("target"), local.join("target")).unwrap();
+        backdate(&local, 90);
+
+        let report = find(home.path(), &Config::default(), &AtomicBool::new(false));
+
+        assert!(report.complete);
+        assert!(report.artifacts.is_empty());
+        assert_eq!(report.roots, vec![home.path().join("code")]);
+        assert!(
+            fs::symlink_metadata(local.join("target"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(external.join("target/blob").exists());
+    }
+
+    #[test]
+    fn cancelled_scan_does_not_claim_complete_coverage() {
+        let home = tempfile::tempdir().unwrap();
+        let rust = project(home.path(), "code/app", "Cargo.toml", "target", 90);
+
+        let report = find(home.path(), &Config::default(), &AtomicBool::new(true));
+
+        assert!(!report.complete);
+        assert!(report.artifacts.is_empty());
+        assert_eq!(report.to_json()["complete"], false);
+        assert!(rust.join("target/blob").exists());
+    }
+
+    #[test]
+    fn project_age_rejects_missing_and_future_dated_source() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            project_age(&root.path().join("missing"), SystemTime::now()),
+            None
+        );
+        let rust = project(root.path(), "app", "Cargo.toml", "target", 90);
+        let future = SystemTime::now() + Duration::from_secs(86_400);
+        fs::File::open(rust.join("src/main"))
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
+
+        assert_eq!(project_age(&rust, SystemTime::now()), Some(0));
+    }
+
+    #[test]
+    fn small_build_outputs_do_not_enter_the_report() {
+        let home = tempfile::tempdir().unwrap();
+        let rust = project(home.path(), "code/app", "Cargo.toml", "target", 90);
+        fs::write(rust.join("target/blob"), b"small build").unwrap();
+
+        let report = find(home.path(), &Config::default(), &AtomicBool::new(false));
+
+        assert!(report.complete);
+        assert!(report.artifacts.is_empty());
+        assert_eq!(report.total_kb(), 0);
+    }
+
+    #[test]
+    fn overlapping_configured_roots_do_not_double_count_the_same_output() {
+        let home = tempfile::tempdir().unwrap();
+        let rust = project(home.path(), "code/app", "Cargo.toml", "target", 90);
+        let config = Config {
+            roots: vec!["code".into(), "code/app".into(), "code".into()],
+            ..Config::default()
+        };
+
+        let report = find(home.path(), &config, &AtomicBool::new(false));
+
+        assert!(report.complete);
+        assert_eq!(report.artifacts.len(), 1);
+        assert_eq!(report.artifacts[0].path, rust.join("target"));
+        assert!(report.total_kb() >= 11 * 1024);
+        assert!(report.total_kb() < 12 * 1024);
     }
 }

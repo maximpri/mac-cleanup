@@ -124,6 +124,11 @@ pub const TOOLS: &[ToolSpec] = &[
         ),
     },
     ToolSpec {
+        name: "cleanup_options",
+        description: "Total eligible cleanup, largest cache actions, and large folders to inspect before deciding what to remove.",
+        arg: Arg::None,
+    },
+    ToolSpec {
         name: "list_findings",
         description: "The app's current measured findings with handles and eligible action IDs.",
         arg: Arg::None,
@@ -184,23 +189,26 @@ impl Toolset {
         question: Option<&str>,
     ) -> Vec<&'static ToolSpec> {
         let mut tools = self.tools(automatic);
-        let cleanup_question = question.is_some_and(|q| {
-            q.split(|c: char| !c.is_alphanumeric()).any(|word| {
-                matches!(
-                    word.to_ascii_lowercase().as_str(),
-                    "cache" | "caches" | "clear" | "clean" | "cleanup" | "delete" | "deleting"
-                )
-            })
-        });
-        if self == Self::Ask
-            && cleanup_question
-            && let Some(tool) = tools.iter_mut().find(|tool| tool.name == "top_processes")
-        {
-            *tool = spec("open_handles").expect("known read-only tool");
+        if self == Self::Ask && question.is_some_and(is_cleanup_question) {
+            for tool in &mut tools {
+                let replacement = match tool.name {
+                    "top_processes" => "open_handles",
+                    "memory_state" => "cleanup_options",
+                    _ => continue,
+                };
+                *tool = spec(replacement).expect("known read-only tool");
+            }
         }
         if self == Self::Ask
             && question.and_then(growth_period).is_some()
-            && let Some(tool) = tools.iter_mut().find(|tool| tool.name == "memory_state")
+            && let Some(tool) = tools.iter_mut().find(|tool| {
+                tool.name
+                    == if question.is_some_and(is_cleanup_question) {
+                        "disk_accounting"
+                    } else {
+                        "memory_state"
+                    }
+            })
         {
             *tool = spec("growth").expect("known read-only tool");
         }
@@ -216,6 +224,9 @@ impl Toolset {
             && let Some(period) = question.and_then(growth_period)
         {
             return vec![("growth", Some(period))];
+        }
+        if self == Self::Ask && question.is_some_and(is_cleanup_question) {
+            return vec![("cleanup_options", None), ("disk_accounting", None)];
         }
         self.fallback(automatic)
     }
@@ -305,6 +316,126 @@ impl Toolset {
         }
         steps
     }
+}
+
+pub fn is_cleanup_question(question: &str) -> bool {
+    let words: Vec<_> = question
+        .split(|c: char| !c.is_alphabetic())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let has = |choices: &[&str]| words.iter().any(|word| choices.contains(&word.as_str()));
+    has(&[
+        "cache", "caches", "clear", "clean", "cleanup", "delete", "deleting", "remove",
+    ]) || (has(&["free", "freeing", "release", "reclaim", "recover"])
+        && has(&[
+            "space", "disk", "storage", "gb", "gib", "mb", "mib", "tb", "tib",
+        ])
+        && !has(&["memory", "ram"]))
+}
+
+/// An explicit storage amount in a cleanup request. GB is decimal; GiB is binary.
+pub fn cleanup_goal_kb(question: &str) -> Option<u64> {
+    if !is_cleanup_question(question) {
+        return None;
+    }
+    let text = question.to_ascii_lowercase();
+    let chars: Vec<_> = text.chars().collect();
+    let mut i = 0;
+    let mut clause_start = 0;
+    let mut goal = None;
+    while i < chars.len() {
+        if !chars[i].is_ascii_digit()
+            && !(chars[i] == '.' && chars.get(i + 1).is_some_and(char::is_ascii_digit))
+        {
+            if matches!(chars[i], '.' | '?' | '!' | ';' | '\n') {
+                clause_start = i + 1;
+            }
+            i += 1;
+            continue;
+        }
+        let start = i;
+        // Never reinterpret the suffix of a signed amount, range, grouped
+        // number, exponent, or identifier as an independent storage goal.
+        let boundary_valid = start == 0
+            || !matches!(chars[start - 1], '.' | ',' | '-' | '+' | '–' | '—')
+                && !chars[start - 1].is_alphanumeric();
+        let prefix = chars[clause_start..start].iter().collect::<String>();
+        let words: Vec<_> = prefix
+            .split(|c: char| !c.is_alphabetic())
+            .filter(|word| !word.is_empty())
+            .collect();
+        let requester = words.iter().rposition(|word| {
+            matches!(
+                *word,
+                "free"
+                    | "freeing"
+                    | "release"
+                    | "reclaim"
+                    | "recover"
+                    | "need"
+                    | "want"
+                    | "clear"
+                    | "clean"
+                    | "cleanup"
+                    | "remove"
+                    | "delete"
+            )
+        });
+        let requested = requester.is_some_and(|requester| {
+            !words[requester + 1..].iter().any(|word| {
+                matches!(
+                    *word,
+                    "have" | "has" | "had" | "with" | "my" | "drive" | "capacity"
+                )
+            })
+        });
+        while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+            i += 1;
+        }
+        let amount = chars[start..i]
+            .iter()
+            .collect::<String>()
+            .parse::<f64>()
+            .ok();
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        let start = i;
+        while i < chars.len() && chars[i].is_ascii_alphabetic() {
+            i += 1;
+        }
+        let unit = chars[start..i].iter().collect::<String>();
+        let bytes = match unit.as_str() {
+            "mb" => 1_000_000.,
+            "gb" => 1_000_000_000.,
+            "tb" => 1_000_000_000_000.,
+            "mib" => 1_048_576.,
+            "gib" => 1_073_741_824.,
+            "tib" => 1_099_511_627_776.,
+            _ => continue,
+        };
+        let suffix = chars[i..].iter().collect::<String>();
+        let reported = suffix
+            .split(|c: char| !c.is_alphabetic())
+            .filter(|word| !word.is_empty())
+            .take(2)
+            .any(|word| matches!(word, "free" | "available" | "left" | "drive" | "capacity"));
+        clause_start = i;
+        if goal.is_some() && words.iter().any(|word| matches!(*word, "or" | "to")) && !requested {
+            return None;
+        }
+        if let Some(kb) = amount.map(|n| n * bytes / 1024.)
+            && boundary_valid
+            && requested
+            && !reported
+            && kb.is_finite()
+            && kb > 0.
+            && kb < u64::MAX as f64
+        {
+            goal = Some(kb.ceil() as u64);
+        }
+    }
+    goal
 }
 
 /// Select the bounded history check for common temporal storage questions.
@@ -495,6 +626,8 @@ pub struct Outcome {
     pub contradicts: Vec<String>,
     /// Newly measured folders to merge into the explorer inventory.
     pub inventory: Option<Box<StorageInventory>>,
+    /// Non-overlapping eligible cache sizes, never the sizes of review folders.
+    pub cleanup_total_kb: Option<u64>,
 }
 
 impl Outcome {
@@ -506,6 +639,7 @@ impl Outcome {
             supports: vec![],
             contradicts: vec![],
             inventory: None,
+            cleanup_total_kb: None,
         }
     }
     fn unavailable(kind: EvidenceKind, status: EvidenceStatus, text: String) -> Self {
@@ -763,6 +897,7 @@ fn system_tool(
             }
         }
         "list_findings" => Dispatch::Ready(findings_outcome(world, handles)),
+        "cleanup_options" => Dispatch::Ready(cleanup_options_outcome(world, handles)),
         _ => Dispatch::Rejected("Unsupported tool.".into()),
     }
 }
@@ -1526,6 +1661,254 @@ fn compress_mounts(summary: &str) -> String {
     }
 }
 
+/// The Data-volume walk and the explorer can name the same home folder through
+/// different macOS mount aliases. Compare them without probing the filesystem.
+fn logical_path(path: &Path) -> PathBuf {
+    path.strip_prefix("/System/Volumes/Data")
+        .map(|suffix| Path::new("/").join(suffix))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn measured_children<'a>(
+    inventory: &'a StorageInventory,
+    path: &Path,
+) -> Option<&'a [StorageItem]> {
+    inventory
+        .children
+        .get(path)
+        .or_else(|| inventory.children.get(&logical_path(path)))
+        .or_else(|| {
+            let logical = logical_path(path);
+            let alias = Path::new("/System/Volumes/Data").join(logical.strip_prefix("/").ok()?);
+            inventory.children.get(&alias)
+        })
+        .map(Vec::as_slice)
+}
+
+fn cleanup_options_outcome(world: &ToolWorld<'_>, handles: &mut Handles) -> Outcome {
+    let on_volume = |path: &Path| {
+        world.inventory.is_none_or(|inventory| {
+            let Some(volume) = &inventory.volume else {
+                return true;
+            };
+            let path = logical_path(path);
+            inventory
+                .roots
+                .iter()
+                .filter(|root| path.starts_with(logical_path(&root.path)))
+                .max_by_key(|root| {
+                    (
+                        logical_path(&root.path).components().count(),
+                        root.path == Path::new("/System/Volumes/Data"),
+                    )
+                })
+                // An unscanned path has no device evidence either way.
+                .is_none_or(|root| root.device == volume.device)
+        })
+    };
+    let mut eligible: Vec<_> = world
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            if entry.size_kb == 0
+                || !matches!(entry.status, CacheStatus::Ready | CacheStatus::Optional)
+                || !on_volume(&entry.spec.path)
+            {
+                return None;
+            }
+            (world.suggest)(&Target::Cache(entry.spec.path.clone()))
+                .filter(|id| id.starts_with("clean:"))
+                .map(|id| (entry, id))
+        })
+        .collect();
+    // Keep outermost paths so nested rules and duplicate findings cannot inflate
+    // the estimate. Sort the remaining rules by size for the model's next check.
+    eligible.sort_by_key(|(entry, _)| logical_path(&entry.spec.path).components().count());
+    let mut unique: Vec<(&CacheEntry, String)> = Vec::new();
+    for (entry, id) in eligible {
+        if !unique.iter().any(|(parent, _)| {
+            logical_path(&entry.spec.path).starts_with(logical_path(&parent.spec.path))
+        }) {
+            unique.push((entry, id));
+        }
+    }
+    unique.sort_by_key(|(entry, _)| std::cmp::Reverse(entry.size_kb));
+    let total = unique
+        .iter()
+        .fold(0u64, |sum, (entry, _)| sum.saturating_add(entry.size_kb));
+    let mut text = format!(
+        "Eligible cleanup: {} across {} rules; estimated, not guaranteed free space.",
+        format_kb(total),
+        unique.len()
+    );
+
+    // Findings may be ranked behind dozens of caches and processes. Inspect the
+    // measured folder index as well so a multi-GiB project remains reachable.
+    let mut candidates: Vec<(PathBuf, u64)> = world
+        .findings
+        .iter()
+        .filter_map(|finding| match &finding.target {
+            Target::Folder(path)
+                if world
+                    .inventory
+                    .is_none_or(|inventory| inventory.children.contains_key(path)) =>
+            {
+                Some((path.clone(), finding.size_kb))
+            }
+            _ => None,
+        })
+        .collect();
+    if let Some(inventory) = world.inventory {
+        let targets: Vec<_> = world
+            .entries
+            .iter()
+            .map(|entry| entry.spec.path.clone())
+            .collect();
+        let breakdown = crate::storage::breakdown(inventory, &targets, 1);
+        candidates.extend(breakdown.items.into_iter().filter_map(|item| {
+            if item.kind == StorageItemKind::Directory {
+                Some((item.path, item.size_kb))
+            } else {
+                let parent = item.path.parent()?;
+                let children = inventory.children.get(parent)?;
+                Some((
+                    parent.to_path_buf(),
+                    children
+                        .iter()
+                        .fold(0u64, |sum, child| sum.saturating_add(child.size_kb)),
+                ))
+            }
+        }));
+        // Keep the explorer's current folder even if the overview opens it into
+        // more specific descendants or it came from a later on-demand scan.
+        if let Some(path) = handles.folders.first()
+            && let Some(children) = measured_children(inventory, path)
+        {
+            candidates.push((
+                path.clone(),
+                children
+                    .iter()
+                    .fold(0u64, |sum, item| sum.saturating_add(item.size_kb)),
+            ));
+        }
+    }
+    candidates.retain(|(path, size)| {
+        let path = logical_path(path);
+        *size > 0
+            && path.starts_with(logical_path(world.home))
+            && path != logical_path(world.home)
+            && on_volume(&path)
+            && !world
+                .entries
+                .iter()
+                .any(|entry| path.starts_with(logical_path(&entry.spec.path)))
+    });
+    let selected = handles.folders.first().map(|path| logical_path(path));
+    candidates.sort_by(|a, b| {
+        let a_selected = selected.as_ref() == Some(&logical_path(&a.0));
+        let b_selected = selected.as_ref() == Some(&logical_path(&b.0));
+        b_selected
+            .cmp(&a_selected)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let mut review: Vec<PathBuf> = Vec::new();
+    let coverage = if world
+        .inventory
+        .is_some_and(|inventory| inventory.complete && inventory.scan_errors == 0)
+    {
+        ""
+    } else {
+        " (partial scan)"
+    };
+    text.push_str(&format!(
+        " Inspect folders{coverage}; size is not approved cleanup:"
+    ));
+    for (path, size) in candidates {
+        if review.len() == 2 {
+            break;
+        }
+        if review.iter().any(|known| {
+            logical_path(&path).starts_with(logical_path(known))
+                || logical_path(known).starts_with(logical_path(&path))
+        }) {
+            continue;
+        }
+        let mut issued = handles.clone();
+        if let Some(handle) = issued.folder(&path) {
+            let mut part = format!(
+                " {handle} {} {}",
+                truncate_middle(
+                    &short_path(&logical_path(&path), &logical_path(world.home)),
+                    38
+                ),
+                format_kb(size)
+            );
+            if let Some(child) = world
+                .inventory
+                .and_then(|inventory| measured_children(inventory, &path))
+                .and_then(|children| {
+                    children
+                        .iter()
+                        .filter(|child| child.size_kb > 0)
+                        .max_by_key(|child| child.size_kb)
+                })
+            {
+                let name = truncate_middle(
+                    &ai::display_text(
+                        &child
+                            .path
+                            .file_name()
+                            .unwrap_or(child.path.as_os_str())
+                            .to_string_lossy(),
+                    ),
+                    24,
+                );
+                let hint = format!(" (largest: {name} {})", format_kb(child.size_kb));
+                if text.len() + part.len() + hint.len() < OUTPUT_CAP - 145 {
+                    part.push_str(&hint);
+                }
+            }
+            part.push(';');
+            // Leave room for at least one cache and the tool-reply envelope.
+            if text.len() + part.len() <= OUTPUT_CAP - 145 {
+                text.push_str(&part);
+                review.push(path);
+                *handles = issued;
+            }
+        }
+    }
+    if review.is_empty() {
+        text.push_str(" none measured.");
+    }
+    text.push_str(" Eligible caches:");
+    for (entry, id) in unique.iter().take(3) {
+        let mut issued = handles.clone();
+        let Some(folder) = issued.folder(&entry.spec.path) else {
+            continue;
+        };
+        let Some(action) = issued.action(id) else {
+            continue;
+        };
+        let part = format!(
+            " {folder} {} {} {action};",
+            truncate_middle(&ai::display_text(entry.spec.label), 24),
+            format_kb(entry.size_kb)
+        );
+        if text.len() + part.len() <= OUTPUT_CAP - 45 {
+            text.push_str(&part);
+            *handles = issued;
+        }
+    }
+    if unique.is_empty() {
+        text.push_str(" none.");
+    }
+    let mut outcome =
+        Outcome::complete(EvidenceKind::Policy, text).partial_if(!coverage.is_empty());
+    outcome.cleanup_total_kb = Some(total);
+    outcome
+}
+
 fn findings_outcome(world: &ToolWorld<'_>, handles: &mut Handles) -> Outcome {
     let listed = world
         .findings
@@ -1646,6 +2029,34 @@ mod tests {
         }
     }
 
+    fn cache_entry(path: &Path, size_kb: u64, status: CacheStatus) -> CacheEntry {
+        CacheEntry {
+            spec: CacheSpec {
+                label: "fixture cache",
+                path: path.to_path_buf(),
+                ..crate::cache::scan_specs(Path::new("/Users/demo"), Path::new("/Users/demo"))[0]
+                    .clone()
+            },
+            status,
+            size_kb,
+            outcome: None,
+            identity: None,
+        }
+    }
+
+    fn folder_finding(path: &Path, size_kb: u64) -> Finding {
+        Finding {
+            id: format!("folder:{}", path.display()),
+            title: path.display().to_string(),
+            observation: String::new(),
+            consequence: String::new(),
+            size_kb,
+            quick_win: false,
+            target: Target::Folder(path.to_path_buf()),
+            related_pids: vec![],
+        }
+    }
+
     #[test]
     fn toolsets_fit_the_context_budget_and_hide_tracing_from_automation() {
         for set in [
@@ -1684,6 +2095,611 @@ mod tests {
                 .iter()
                 .all(|tool| spec_json(tool)["description"].as_str().unwrap().len() <= 110)
         );
+    }
+
+    #[test]
+    fn cleanup_requests_include_totals_and_safety_tools_within_budget() {
+        for question in [
+            "how can i safely and quickly release 10gb of disk space?",
+            "Free up 10 GiB",
+            "Reclaim storage",
+            "Recover disk space",
+            "Which caches can I clear safely?",
+        ] {
+            let tools = Toolset::Ask.tools_for_question(false, Some(question));
+            assert_eq!(tools.len(), 6);
+            for name in [
+                "cleanup_options",
+                "list_children",
+                "list_findings",
+                "open_handles",
+                "cleanup_rule",
+            ] {
+                assert!(
+                    tools.iter().any(|tool| tool.name == name),
+                    "{question}: {name}"
+                );
+            }
+            assert!(
+                tools
+                    .iter()
+                    .map(|tool| spec_json(tool).to_string().len())
+                    .sum::<usize>()
+                    < 1600
+            );
+            assert_eq!(
+                Toolset::Ask.fallback_for_question(false, Some(question))[0].0,
+                "cleanup_options"
+            );
+        }
+        for question in ["Free up memory", "Release 10 GB of RAM"] {
+            assert!(!is_cleanup_question(question));
+        }
+        assert_eq!(
+            cleanup_goal_kb("release 10gb of disk space"),
+            Some(9_765_625)
+        );
+        assert_eq!(cleanup_goal_kb("free 1.5 GiB"), Some(1_572_864));
+        assert_eq!(cleanup_goal_kb("free 500 MB"), Some(488_282));
+        assert_eq!(cleanup_goal_kb("free 0 GB"), None);
+        assert_eq!(cleanup_goal_kb("free disk space"), None);
+        assert_eq!(cleanup_goal_kb("release 10 GB of RAM"), None);
+        assert_eq!(
+            cleanup_goal_kb("I have 1.9GB free and need 10GB of disk space"),
+            Some(9_765_625)
+        );
+        assert_eq!(
+            cleanup_goal_kb("Free 10GB of disk space; only 1.9GB is left"),
+            Some(9_765_625)
+        );
+    }
+
+    #[test]
+    fn cleanup_goal_converts_decimal_and_binary_units_and_rounds_up() {
+        for (question, expected) in [
+            ("Free 1 MB of disk space", 977),
+            ("Free 1 MiB of disk space", 1024),
+            ("Free 1 GB of disk space", 976_563),
+            ("Free 1 GiB of disk space", GIB_KB),
+            ("Free 1 TB of disk space", 976_562_500),
+            ("Free 1 TiB of disk space", 1024 * GIB_KB),
+            ("RECLAIM 0.5\tGiB", GIB_KB / 2),
+            ("Free .5 GiB of disk space", GIB_KB / 2),
+            ("Free 0.000001 GB of disk space", 1),
+        ] {
+            assert_eq!(cleanup_goal_kb(question), Some(expected), "{question}");
+        }
+    }
+
+    #[test]
+    fn cleanup_goal_rejects_malformed_signed_and_ambiguous_amounts() {
+        for question in [
+            "Free -10 GB of disk space",
+            "Free +10 GB of disk space",
+            "Free 1..5 GB of disk space",
+            "Free 1,5 GB of disk space",
+            "Free 5-10 GB of disk space",
+            "Free 5–10 GB of disk space",
+            "Free 1e3 GB of disk space",
+            "Free x10 GB of disk space",
+            "Free 10 GB or 20 GB of disk space",
+            "Free 999999999999999999999999999 GB of disk space",
+            "Free 10 GBs of disk space",
+            "Free 10 KB of disk space",
+            "Free 0 GB of disk space",
+        ] {
+            assert_eq!(cleanup_goal_kb(question), None, "{question}");
+        }
+    }
+
+    #[test]
+    fn cleanup_goal_distinguishes_reported_free_space_from_the_requested_amount() {
+        for question in [
+            "Clean caches; I have 1.9 GB free",
+            "How can I free disk space? I have 1.9 GB free",
+            "Free disk space on my 500 GB drive",
+            "Clear caches with 1.9 GB available",
+        ] {
+            assert_eq!(cleanup_goal_kb(question), None, "{question}");
+        }
+        for question in [
+            "I have 1.9GB free and need 10GB of disk space",
+            "Free 10GB of disk space; only 1.9GB is left",
+            "My 500 GB drive has 1.9 GB available; I want to reclaim 10 GB",
+        ] {
+            assert_eq!(cleanup_goal_kb(question), Some(9_765_625), "{question}");
+        }
+    }
+
+    #[test]
+    fn cleanup_overview_requires_status_size_and_callback_eligibility() {
+        let home = Path::new("/Users/demo");
+        let mut entries: Vec<_> = [
+            CacheStatus::Ready,
+            CacheStatus::Optional,
+            CacheStatus::Review,
+            CacheStatus::InUse,
+            CacheStatus::ScanError,
+            CacheStatus::Symlink,
+            CacheStatus::Invalid,
+            CacheStatus::Missing,
+            CacheStatus::Whitelisted,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, status)| {
+            cache_entry(
+                &home.join(format!("Library/Caches/rule-{index}")),
+                1024,
+                status,
+            )
+        })
+        .collect();
+        for name in ["denied", "foreign", "empty"] {
+            entries.push(cache_entry(
+                &home.join(format!("Library/Caches/{name}")),
+                if name == "empty" { 0 } else { 100 * GIB_KB },
+                CacheStatus::Ready,
+            ));
+        }
+        let suggest = |target: &Target| match target {
+            Target::Cache(path) if path.ends_with("denied") => None,
+            Target::Cache(path) if path.ends_with("foreign") => Some("signal:42:start:TERM".into()),
+            Target::Cache(path) => Some(format!("clean:{}", path.display())),
+            _ => None,
+        };
+        let metrics = Metrics::default();
+        let world = world(home, None, &entries, &[], &metrics, &suggest);
+        let mut handles = Handles::default();
+        let outcome = cleanup_options_outcome(&world, &mut handles);
+        assert_eq!(outcome.cleanup_total_kb, Some(2048));
+        assert_eq!(handles.actions.len(), 2);
+        assert_eq!(handles.folders.len(), 2);
+        assert!(outcome.text.contains("across 2 rules"), "{}", outcome.text);
+        for (index, path) in handles.folders.iter().enumerate() {
+            assert!(path.ends_with(format!("rule-{index}")));
+            assert!(outcome.text.contains(&format!("n{} ", index + 1)));
+            assert!(outcome.text.contains(&format!(" A{};", index + 1)));
+        }
+    }
+
+    #[test]
+    fn cleanup_totals_deduplicate_aliases_and_nested_rules_in_any_order() {
+        let home = Path::new("/Users/demo");
+        let entries = [
+            cache_entry(
+                &home.join("Library/Caches/pip/http"),
+                80,
+                CacheStatus::Ready,
+            ),
+            cache_entry(
+                Path::new("/System/Volumes/Data/Users/demo/Library/Caches/pip"),
+                100,
+                CacheStatus::Ready,
+            ),
+            cache_entry(&home.join("Library/Caches/pip"), 100, CacheStatus::Ready),
+            cache_entry(&home.join("Library/Caches/pip2"), 40, CacheStatus::Ready),
+        ];
+        let metrics = Metrics::default();
+        for order in [
+            vec![0, 1, 2, 3],
+            vec![3, 2, 1, 0],
+            vec![1, 0, 3, 2],
+            vec![0, 1, 3],
+        ] {
+            let ordered: Vec<_> = order
+                .into_iter()
+                .map(|index| entries[index].clone())
+                .collect();
+            let suggest = |target: &Target| care::suggestion_id(&ordered, &[], target);
+            let world = world(home, None, &ordered, &[], &metrics, &suggest);
+            let mut handles = Handles::default();
+            let outcome = cleanup_options_outcome(&world, &mut handles);
+            assert_eq!(outcome.cleanup_total_kb, Some(140), "{}", outcome.text);
+            assert_eq!(handles.actions.len(), 2);
+            assert!(!handles.actions.iter().any(|id| id.ends_with("/http")));
+        }
+    }
+
+    #[test]
+    fn cleanup_totals_saturate_and_only_expose_the_largest_three_actions() {
+        let home = Path::new("/Users/demo");
+        let entries: Vec<_> = (0..5)
+            .map(|index| {
+                cache_entry(
+                    &home.join(format!("Library/Caches/rule-{index}")),
+                    u64::MAX - index,
+                    CacheStatus::Ready,
+                )
+            })
+            .collect();
+        let metrics = Metrics::default();
+        let suggest = |target: &Target| care::suggestion_id(&entries, &[], target);
+        let world = world(home, None, &entries, &[], &metrics, &suggest);
+        let mut handles = Handles::default();
+        let outcome = cleanup_options_outcome(&world, &mut handles);
+        assert_eq!(outcome.cleanup_total_kb, Some(u64::MAX));
+        assert_eq!(handles.actions.len(), 3);
+        for (index, action) in handles.actions.iter().enumerate() {
+            assert!(action.ends_with(&format!("/rule-{index}")));
+        }
+        assert!(outcome.text.len() <= OUTPUT_CAP - 45);
+    }
+
+    #[test]
+    fn cleanup_overview_keeps_large_debug_output_reachable_behind_many_findings() {
+        let home = Path::new("/Users/demo");
+        let debug = home.join("code/project/target/debug");
+        let metrics = Metrics::default();
+        let none = |_: &Target| None;
+        let mut findings: Vec<_> = (0..40)
+            .map(|index| Finding {
+                target: Target::Process(index + 1, "start".into()),
+                ..folder_finding(&home.join(format!("process-{index}")), 100)
+            })
+            .collect();
+        findings.push(folder_finding(&debug, 14 * GIB_KB));
+        let inventory = inventory(vec![(debug.clone(), vec![])]);
+        let mut world = world(home, Some(&inventory), &[], &[], &metrics, &none);
+        world.findings = &findings;
+        let mut handles = Handles::default();
+        let outcome = cleanup_options_outcome(&world, &mut handles);
+        assert_eq!(outcome.cleanup_total_kb, Some(0));
+        assert_eq!(handles.folder_path("n1").unwrap(), debug);
+        assert!(outcome.text.contains("debug 14.0 GiB"), "{}", outcome.text);
+        assert!(outcome.text.contains("size is not approved cleanup"));
+        assert!(handles.actions.is_empty());
+        assert!(handles.processes.is_empty());
+    }
+
+    #[test]
+    fn cleanup_overview_keeps_measured_target_context_in_project_summary() {
+        let home = Path::new("/Users/demo");
+        let project = home.join("code/project");
+        let metrics = Metrics::default();
+        let none = |_: &Target| None;
+        let findings = [folder_finding(&project, 120 * 1024 + 4)];
+        for (alias, target_name) in [
+            (false, "target"),
+            (true, "target"),
+            (true, "target\u{202e}\u{1b}"),
+        ] {
+            let measured = if alias {
+                Path::new("/System/Volumes/Data").join(project.strip_prefix("/").unwrap())
+            } else {
+                project.clone()
+            };
+            let target = measured.join(target_name);
+            let debug = target.join("debug");
+            let mut inventory = inventory(vec![
+                (
+                    measured.clone(),
+                    vec![
+                        item(&measured.join("Cargo.toml"), 4, StorageItemKind::File),
+                        item(&target, 120 * 1024, StorageItemKind::Directory),
+                    ],
+                ),
+                (
+                    target.clone(),
+                    vec![item(&debug, 120 * 1024, StorageItemKind::Directory)],
+                ),
+                (
+                    debug,
+                    vec![item(
+                        &target.join("debug/output.bin"),
+                        120 * 1024,
+                        StorageItemKind::File,
+                    )],
+                ),
+            ]);
+            inventory.top_level = vec![item(&project, 120 * 1024 + 4, StorageItemKind::Directory)];
+            let mut world = world(home, Some(&inventory), &[], &[], &metrics, &none);
+            world.findings = &findings;
+            let mut handles = Handles::default();
+            let outcome = cleanup_options_outcome(&world, &mut handles);
+            assert!(
+                outcome.text.contains("~/code/project 120.0 MiB"),
+                "{}",
+                outcome.text
+            );
+            assert!(
+                outcome.text.contains("largest: target 120.0 MiB"),
+                "{}",
+                outcome.text
+            );
+            assert!(outcome.text.contains("size is not approved cleanup"));
+            assert!(!outcome.text.contains(['\u{202e}', '\u{1b}']));
+            assert_eq!(outcome.cleanup_total_kb, Some(0));
+            assert_eq!(handles.folders, vec![project.clone()]);
+            assert!(handles.actions.is_empty());
+            assert!(outcome.text.len() <= OUTPUT_CAP - 45);
+        }
+    }
+
+    #[test]
+    fn cleanup_overview_finds_selected_folder_through_either_data_volume_alias() {
+        let home = Path::new("/Users/demo");
+        let canonical = home.join("code/project/target");
+        let alias = Path::new("/System/Volumes/Data").join(canonical.strip_prefix("/").unwrap());
+        let metrics = Metrics::default();
+        let none = |_: &Target| None;
+        for (selected, measured) in [(&canonical, &alias), (&alias, &canonical)] {
+            let inventory = inventory(vec![(
+                measured.clone(),
+                vec![item(
+                    &measured.join("debug"),
+                    14 * GIB_KB,
+                    StorageItemKind::Directory,
+                )],
+            )]);
+            let world = world(home, Some(&inventory), &[], &[], &metrics, &none);
+            let mut handles = Handles::default();
+            handles.folder(selected);
+            let outcome = cleanup_options_outcome(&world, &mut handles);
+            assert!(
+                outcome
+                    .text
+                    .contains(" n1 ~/code/project/target 14.0 GiB (largest: debug 14.0 GiB);"),
+                "{}",
+                outcome.text
+            );
+            assert_eq!(handles.folders, vec![selected.clone()]);
+            assert_eq!(outcome.cleanup_total_kb, Some(0));
+            assert!(handles.actions.is_empty());
+        }
+    }
+
+    #[test]
+    fn cleanup_overview_reports_partial_measurements_and_skips_overlapping_review_folders() {
+        let home = Path::new("/Users/demo");
+        let project = home.join("code/project");
+        let parent = home.join("code");
+        let other = home.join("Movies");
+        let cache = home.join("Library/Caches/pip");
+        let entries = [cache_entry(&cache, 1024, CacheStatus::Review)];
+        let findings = [
+            folder_finding(&parent, 30 * GIB_KB),
+            folder_finding(&project, 14 * GIB_KB),
+            folder_finding(&other, 20 * GIB_KB),
+            folder_finding(&cache.join("http"), 50 * GIB_KB),
+            folder_finding(home, 100 * GIB_KB),
+            folder_finding(Path::new("/Users/other/Documents"), 100 * GIB_KB),
+        ];
+        let metrics = Metrics::default();
+        let none = |_: &Target| None;
+        for (complete, scan_errors, expected) in [
+            (true, 0, EvidenceStatus::Complete),
+            (false, 0, EvidenceStatus::Partial),
+            (true, 1, EvidenceStatus::Partial),
+        ] {
+            let mut inventory = inventory(
+                findings
+                    .iter()
+                    .filter_map(|finding| match &finding.target {
+                        Target::Folder(path) => Some((path.clone(), vec![])),
+                        _ => None,
+                    })
+                    .collect(),
+            );
+            inventory.complete = complete;
+            inventory.scan_errors = scan_errors;
+            let mut world = world(home, Some(&inventory), &entries, &[], &metrics, &none);
+            world.findings = &findings;
+            let mut handles = Handles::default();
+            let outcome = cleanup_options_outcome(&world, &mut handles);
+            assert_eq!(outcome.status, expected);
+            assert_eq!(handles.folders, vec![parent.clone(), other.clone()]);
+            assert_eq!(outcome.cleanup_total_kb, Some(0));
+            assert!(handles.actions.is_empty());
+            assert_eq!(
+                outcome.text.contains("partial scan"),
+                expected == EvidenceStatus::Partial
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_overview_unicode_budget_issues_only_visible_handles() {
+        let home = Path::new("/Users/demo");
+        let entries: Vec<_> = (0..8)
+            .map(|index| CacheEntry {
+                spec: CacheSpec {
+                    label: "🧹🧹🧹🧹🧹🧹🧹🧹🧹🧹🧹🧹🧹🧹🧹🧹🧹🧹🧹🧹🧹🧹🧹🧹🧹",
+                    ..cache_entry(
+                        &home.join(format!("cache-{index}")),
+                        1024,
+                        CacheStatus::Ready,
+                    )
+                    .spec
+                },
+                ..cache_entry(
+                    &home.join(format!("cache-{index}")),
+                    1024,
+                    CacheStatus::Ready,
+                )
+            })
+            .collect();
+        let findings: Vec<_> = (0..4)
+            .map(|index| {
+                folder_finding(
+                    &home.join(format!("{index}-{}", "🧰".repeat(40))),
+                    14 * GIB_KB,
+                )
+            })
+            .collect();
+        let metrics = Metrics::default();
+        let suggest = |target: &Target| care::suggestion_id(&entries, &[], target);
+        let mut world = world(home, None, &entries, &[], &metrics, &suggest);
+        world.findings = &findings;
+        let mut handles = Handles::default();
+        let outcome = cleanup_options_outcome(&world, &mut handles);
+        let model_text = cap(&outcome.text);
+        assert_eq!(model_text, outcome.text);
+        assert!(model_text.len() <= OUTPUT_CAP - 45);
+        assert_eq!(outcome.cleanup_total_kb, Some(8 * 1024));
+        assert!(!handles.actions.is_empty());
+        assert!(
+            handles.actions.len() < 3,
+            "fixture must exceed the cache display budget"
+        );
+        for index in 1..=handles.folders.len() {
+            assert!(model_text.contains(&format!(" n{index} ")), "{model_text}");
+        }
+        for index in 1..=handles.actions.len() {
+            assert!(model_text.contains(&format!(" A{index};")), "{model_text}");
+        }
+    }
+
+    #[test]
+    fn cleanup_overview_handle_exhaustion_does_not_issue_invisible_references() {
+        let home = Path::new("/Users/demo");
+        let entries = [cache_entry(
+            &home.join("Library/Caches/pip"),
+            1024,
+            CacheStatus::Ready,
+        )];
+        let metrics = Metrics::default();
+        let suggest = |target: &Target| care::suggestion_id(&entries, &[], target);
+        let world = world(home, None, &entries, &[], &metrics, &suggest);
+        for exhausted_kind in ["folder", "action"] {
+            let mut handles = Handles::default();
+            for index in 0..MAX_HANDLES {
+                if exhausted_kind == "folder" {
+                    handles.folder(&home.join(format!("existing-{index}")));
+                } else {
+                    handles.action(&format!("clean:/existing-{index}"));
+                }
+            }
+            let before_folders = handles.folders.clone();
+            let before_actions = handles.actions.clone();
+            let outcome = cleanup_options_outcome(&world, &mut handles);
+            assert_eq!(handles.folders, before_folders, "{exhausted_kind}");
+            assert_eq!(handles.actions, before_actions, "{exhausted_kind}");
+            assert_eq!(outcome.cleanup_total_kb, Some(1024));
+            assert!(!outcome.text.contains(" A"));
+        }
+    }
+
+    #[test]
+    fn cleanup_totals_exclude_blocked_overlapping_and_review_data() {
+        let home = Path::new("/Users/demo");
+        let entry = |name: &str, size_kb, status| CacheEntry {
+            spec: CacheSpec {
+                label: "fixture cache",
+                path: home.join(name),
+                ..crate::cache::scan_specs(home, home)[0].clone()
+            },
+            status,
+            size_kb,
+            outcome: None,
+            identity: None,
+        };
+        let entries = vec![
+            entry("Library/Caches/pip", 125 * 1024, CacheStatus::Ready),
+            entry("Library/Caches/pip/http", 100 * 1024, CacheStatus::Ready),
+            entry("Library/Caches/brew", 250 * 1024, CacheStatus::Optional),
+            entry("Library/Caches/busy", 20 * GIB_KB, CacheStatus::InUse),
+            entry("Library/Caches/kept", 20 * GIB_KB, CacheStatus::Whitelisted),
+            entry("Library/Archives", 20 * GIB_KB, CacheStatus::Review),
+            entry("Library/Caches/failed", 20 * GIB_KB, CacheStatus::ScanError),
+        ];
+        let project = home.join("code/project/target");
+        let mut inventory = inventory(vec![(
+            project.clone(),
+            vec![item(
+                &project.join("debug"),
+                14 * GIB_KB,
+                StorageItemKind::Directory,
+            )],
+        )]);
+        inventory.complete = false;
+        let metrics = Metrics::default();
+        let suggest = |target: &Target| care::suggestion_id(&entries, &[], target);
+        let world = world(home, Some(&inventory), &entries, &[], &metrics, &suggest);
+        let mut handles = Handles::default();
+        handles.folder(&project);
+        let outcome = cleanup_options_outcome(&world, &mut handles);
+        assert_eq!(outcome.cleanup_total_kb, Some(375 * 1024));
+        assert_eq!(outcome.status, EvidenceStatus::Partial);
+        assert!(outcome.text.contains("375.0 MiB"), "{}", outcome.text);
+        assert!(outcome.text.contains("target 14.0 GiB"), "{}", outcome.text);
+        assert!(outcome.text.contains("not approved cleanup"));
+        assert!(outcome.text.contains("partial scan"));
+        assert!(outcome.text.len() <= OUTPUT_CAP - 45);
+        assert_eq!(handles.actions.len(), 2);
+        assert!(!handles.actions.iter().any(|id| id.contains("target")));
+        assert_eq!(
+            handles.action_id("A1"),
+            Some("clean:/Users/demo/Library/Caches/brew")
+        );
+    }
+
+    #[test]
+    fn cleanup_overview_sees_data_volume_aliases_and_excludes_other_volumes() {
+        let home = Path::new("/Users/demo");
+        let project = Path::new("/System/Volumes/Data/Users/demo/code/project/target");
+        let mut inventory = inventory(vec![(
+            project.to_path_buf(),
+            vec![item(
+                &project.join("debug"),
+                14 * GIB_KB,
+                StorageItemKind::Directory,
+            )],
+        )]);
+        inventory.top_level = vec![item(project, 14 * GIB_KB, StorageItemKind::Directory)];
+        inventory.volume = Some(VolumeStats {
+            accounting_path: "/System/Volumes/Data".into(),
+            filesystem: "apfs".into(),
+            capacity_kb: 100 * GIB_KB,
+            used_kb: 99 * GIB_KB,
+            free_kb: GIB_KB,
+            container_free_kb: None,
+            device: 2,
+        });
+        inventory.roots = [
+            ("/", 1),
+            ("/System/Volumes/Data", 2),
+            ("/Volumes/External", 3),
+        ]
+        .map(|(path, device)| crate::storage::StorageRoot {
+            path: path.into(),
+            size_kb: 0,
+            device,
+            scan_errors: 0,
+        })
+        .to_vec();
+        let entries =
+            ["/Users/demo/Library/Caches/pip", "/Volumes/External/cache"].map(|path| CacheEntry {
+                spec: CacheSpec {
+                    path: path.into(),
+                    label: "fixture",
+                    ..crate::cache::scan_specs(home, home)[0].clone()
+                },
+                size_kb: 125 * 1024,
+                status: CacheStatus::Ready,
+                identity: None,
+                outcome: None,
+            });
+        let metrics = Metrics::default();
+        let suggest = |target: &Target| care::suggestion_id(&entries, &[], target);
+        let world = world(home, Some(&inventory), &entries, &[], &metrics, &suggest);
+        for selected in [false, true] {
+            let mut handles = Handles::default();
+            if selected {
+                handles.folder(&home.join("code/project/target"));
+            }
+            let result = cleanup_options_outcome(&world, &mut handles);
+            assert_eq!(result.cleanup_total_kb, Some(125 * 1024));
+            assert!(result.text.contains("target"), "{}", result.text);
+            assert!(result.text.contains("14.0 GiB"));
+            assert!(!result.text.contains("/System/Volumes/Data"));
+            assert!(
+                !handles
+                    .actions
+                    .iter()
+                    .any(|action| action.contains("External"))
+            );
+        }
     }
 
     #[test]
