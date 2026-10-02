@@ -10,9 +10,11 @@ FoundationModels to build the `diskray-ai` helper, and Apple Intelligence turned
 on with its model downloaded. Without it, every measured finding still works and
 investigations run as a fixed sequence of the same read-only tools.
 
-> **Current Diskray AI requirement: English (United States).** For now, both
-> the Mac language and Siri language must be **English (United States)**
-> (`en-US`). Allow Apple's model setup to finish after changing either language.
+Apple Intelligence supports many languages. Diskray needs the Mac language to
+be one of them and Siri to use the same language; it checks both through the
+framework and shows a blocker only when one of those is actually false. The
+model's output is constrained to evidence and action IDs and Rust writes every
+displayed sentence, so the answer language does not depend on the model.
 
 ## Availability and model selection
 
@@ -24,16 +26,15 @@ The specialized content-tagging use case is not a replacement for the general
 model used to investigate storage. Diskray does not fall back to cloud inference.
 
 A language listed by Apple's framework does not by itself mean Diskray's AI is
-ready. Diskray's current setup requirement is English (United States) for both
-Mac and Siri; the framework may report additional supported languages.
-Apple requires the Mac and Siri languages to match. The helper checks model
+ready. Apple requires the Mac and Siri languages to match; tags such as
+`en_US` and `en-us` are treated as the same language. The helper checks model
 language support through the public framework API and reads the Siri language
 preference on a best-effort basis. Missing preferences are reported as unknown;
 they never override the framework's availability result. When macOS reports
 `modelNotReady` and the detected languages differ, the Ask bar shows the mismatch.
 That framework error can also reflect downloads or other system conditions;
 Diskray does not claim a download is running without evidence.
-If the model remains unavailable after Mac and Siri use English (United States),
+If the model remains unavailable while the languages match and are supported,
 Diskray reports that macOS still has not made the model available.
 `F3` shows recovery steps instead of implying that waiting will fix it.
 Automatic rechecks detect recovery; they do not
@@ -139,7 +140,13 @@ never support a conclusion. A free-form Ask question remains inconclusive at
 the case-status level because it has no predefined hypothesis; its measured
 findings can still answer a straightforward question. `i` and Ask allow 6 tool
 calls in 2 minutes; the automatic run allows 3 calls in 45 seconds; each tool
-output is capped at 560 bytes. Details show the tool timeline, each result, the
+measurement is capped at 560 bytes, followed by a short notice of how many tool
+calls the model has left. Greedy sampling on a small model can repeat an identical
+call; the repeat is answered with the earlier evidence ID ("Already checked as
+E3") instead of re-running the tool or spending the budget, and repeats are
+themselves bounded. A second process sample is a new reading and is exempt.
+When the shared on-device model reports it is busy, triage and result
+summaries retry once after 1.5 seconds before falling back. Details show the tool timeline, each result, the
 explanations considered, and the report. When the model is unavailable, the same
 tools run as a fixed measured sequence and the conclusion is labeled as having
 no AI.

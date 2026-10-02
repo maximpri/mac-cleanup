@@ -69,6 +69,7 @@ pub fn run(command: &Command, home: &Path) -> Result<i32, String> {
             let base = volume.as_deref().map(validate_scan_root).transpose()?;
             Ok(artifacts(home, base.as_deref(), *json, *days))
         }
+        Command::Installers { json } => Ok(installers(home, *json)),
         Command::Rules { action } => match action {
             RulesAction::List => Ok(list_rules(home)),
             RulesAction::Check { file } => check_rules(file),
@@ -117,6 +118,42 @@ fn artifacts(home: &Path, base: Option<&Path>, as_json: bool, days: Option<u64>)
     }
     println!(
         "\nNothing was deleted. Diskray reports these; remove them yourself if you no longer need them."
+    );
+    0
+}
+
+fn installers(home: &Path, as_json: bool) -> i32 {
+    if !as_json && io::stderr().is_terminal() {
+        eprint!("Looking for installer files in Downloads and Desktop…\r");
+    }
+    let report = crate::installers::find(home);
+    clear_progress(as_json);
+    if as_json {
+        println!("{}", report.to_json());
+        return 0;
+    }
+    if report.installers.is_empty() {
+        println!("No installer files over 1 MB in Downloads or Desktop.");
+        return 0;
+    }
+    println!(
+        "{} in {} installer file(s){}:\n",
+        format_kb(report.total_kb()),
+        report.installers.len(),
+        match report.redundant_kb() {
+            0 => String::new(),
+            kb => format!(" · {} for apps already installed", format_kb(kb)),
+        }
+    );
+    let display = |path: &Path| crate::why::display_path(path, home, home);
+    for line in report.lines(display, 50) {
+        println!("  {line}");
+    }
+    if !report.complete {
+        println!("\nPartial: the search stopped at its size limit.");
+    }
+    println!(
+        "\nNothing was deleted. Installers are usually needed once; in `diskray`, browse to one and press t to review moving it to Trash."
     );
     0
 }

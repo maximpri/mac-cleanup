@@ -41,11 +41,8 @@ sh scripts/build-release.sh          # adds the AI helper when this Mac supports
 ```
 
 Local AI needs Apple silicon, macOS 26 or later, and Apple Intelligence turned
-on with its model downloaded.
-
-> **Current AI requirement: English (United States).** For now, set both your
-> Mac language and Siri language to **English (United States)** to use Diskray's
-> embedded Apple Foundation Model. Allow Apple's model setup to finish.
+on with its model downloaded. Your Mac and Siri must use the same language, and
+Apple Intelligence must support it; `F3` tells you if either is not the case.
 
 See [local AI setup and verification](docs/AI.md) for availability diagnostics
 and the live inference check.
@@ -61,6 +58,7 @@ diskray                              # interactive: explore, investigate, review
 diskray ask "why is my disk almost full?"
 diskray ask "how can I safely free 10 GB of disk space?"
 diskray artifacts                    # node_modules, target, .venv in projects untouched for 60+ days
+diskray installers                   # old .dmg/.pkg/.xip files, and which apps are already installed
 claude mcp add --scope user diskray -- diskray mcp   # give coding agents read-only disk tools
 ```
 
@@ -97,14 +95,26 @@ Details: [docs/SAFETY.md](docs/SAFETY.md).
 ## How it compares
 
 **[Mole](https://github.com/tw93/Mole)** is an excellent, fast GPL-3.0 cleaner
-with far broader cleanup coverage and an app uninstaller. If you want to clear
-many known caches quickly, use it. Diskray covers fewer locations on purpose and
-focuses on explaining: hidden APFS space, per-item evidence, growth over time,
-on-device AI investigations, and before/after verification.
+with far broader cleanup coverage, an app uninstaller, and a live status
+dashboard. If you want to clear many known caches quickly, use it. Diskray
+covers fewer locations on purpose and focuses on explaining before acting:
+
+| | Mole | Diskray |
+| --- | --- | --- |
+| Where the space went | Folder sizes (top 30) | One reconciled balance: measured files, hidden APFS space, snapshots, other volumes, unreadable areas |
+| Why an item is safe | Rule category | Per-item evidence: age, open files, owning app, growth since last scan, rebuild cost |
+| AI | None | On-device Apple Foundation Models that call read-only tools and must cite evidence; no cloud, cannot act |
+| Personal files | Delete to Trash from analyzer | Reviewed Move to Trash plan, never counted as freed space |
+| Installers | `mo installer` | `diskray installers`, flags installers whose app is already installed |
+| Verification | Free space before/after | Free space before/after, per action, kept in History |
+| Coding agents | — | Read-only MCP server; agents can only save a proposal you review |
+
+See the [2026-09 product review](docs/REVIEW_2026-09.md) for the full comparison
+and roadmap.
 
 **Coding agents** can run `du` and `rm` for you, but they improvise shell
 commands with full delete rights and no memory of last week. Through
-`diskray mcp`, an agent gets thirteen measured, read-only tools instead, and it
+`diskray mcp`, an agent gets fourteen measured, read-only tools instead, and it
 can only save a proposal that you review with `diskray review`.
 
 ## Documentation
@@ -118,6 +128,7 @@ can only save a proposal that you review with `diskray review`.
 | [Rule packs](docs/RULES.md) | Cleanup rules as TOML, and writing your own |
 | [Navigation](docs/TUI_NAVIGATION.md) | Screen-by-screen interface behavior |
 | [Architecture](docs/ARCHITECTURE.md) | Module boundaries and safety invariants |
+| [Product review](docs/REVIEW_2026-09.md) | Goal, Apple AI use, interface, comparison with Mole, roadmap |
 
 ## Contributing and security
 

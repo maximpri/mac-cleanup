@@ -49,3 +49,19 @@ delete_scope = "Cursor settings, keybindings, snippets, workspace state, history
 impact = "Editor configuration and local workspace history may be permanently lost."
 recovery = "Only data already synced or backed up can be restored reliably."
 recommendation = "Clean up from Cursor or back up this directory before considering full deletion."
+
+[[rule]]
+id = "codex-sessions"
+label = "Codex conversation transcripts"
+path = ".codex/sessions"
+tier = "review"
+processes = ["[c]odex app-server", "/Codex.app/", "bin/[c]odex"]
+associate = ["/codex.app/", "bin/codex"]
+note = "past Codex conversations; delete them with Codex so its history stays consistent"
+advice = "Close Codex, then delete old conversations with `codex delete <session-id>` or from the Codex app. It removes each transcript together with its history records. Deleting files here leaves history entries pointing to missing transcripts."
+[rule.guidance]
+classification = "CONVERSATION HISTORY — NOT A CACHE"
+delete_scope = "Every Codex transcript (rollout-*.jsonl) under ~/.codex/sessions, including conversations you may want to resume. The history databases in ~/.codex (logs_*.sqlite, thread_history_*.sqlite, state_*.sqlite) are not part of this folder."
+impact = "Deleted conversations can no longer be resumed or searched. Transcripts that a running Codex session holds open are still in use."
+recovery = "Deleted transcripts cannot be restored unless they are in a backup."
+recommendation = "Keep conversations you may resume. Delete old ones with `codex delete` while Codex is closed, so transcripts and history records are removed together."

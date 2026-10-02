@@ -19,7 +19,7 @@ provides historical design context. The current implementation checkpoint is in
 - `src/agent_tools.rs` defines the read-only tools the model may call, the
   per-family toolsets (at most six, to fit the 4,096-token context), the
   per-investigation handle table (`n#` folders, `p#` processes, `A#` eligible
-  actions), 560-byte output caps, and deterministic supports/contradicts
+  actions), 560-byte measurement caps, and deterministic supports/contradicts
   classification. Tools borrow app state or run existing collectors
   (`storage::folder_age`, `care::open_handle_owners`, `care::identify_owner`,
   `care::sample_process`, volume context, and the approval-gated trace).
@@ -182,9 +182,10 @@ flowchart TD
 | `src/rules.rs`, `rules/` | Cleanup rule packs as TOML: loading, validation, pinned native commands |
 | `src/headless.rs` | The read-only assessment without the interface, shared by `why`, `ask`, and MCP |
 | `src/why.rs` | The "why is the disk full" overview shared by `diskray why` and the Overview |
-| `src/commands.rs` | `why`, `ask`, `artifacts`, and `rules` subcommands |
+| `src/commands.rs` | `why`, `ask`, `artifacts`, `installers`, and `rules` subcommands |
 | `src/growth.rs` | Growth between comparable complete assessments |
 | `src/artifacts.rs` | Report-only, marker-confirmed build output; source/Git age, symlink boundaries, device/inode deduplication |
+| `src/installers.rs` | Read-only installer discovery with age and installed-app context |
 | `src/mcp.rs`, `src/pending.rs` | Read-only MCP server; agent proposals saved for `diskray review` |
 | `src/paths.rs`, `src/migrate.rs` | User-data locations and the one-time move from `mac-cleanup` |
 | `src/tui/mod.rs` | Session types, terminal lifecycle, event loop |

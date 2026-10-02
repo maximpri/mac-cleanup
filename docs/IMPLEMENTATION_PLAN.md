@@ -8,6 +8,31 @@ the accepted scope: a Rust/Ratatui utility for developers and AI-tool users,
 Apple Intelligence in the first release, macOS 26+ on compatible Apple silicon,
 and a visual workflow without chat.
 
+## Cleanup goals and regression checkpoint — 2026-10-02
+
+- Ask cleanup answers retain the latest eligible cache estimate and any
+  shortfall against an explicit amount. GB is decimal and GiB is binary; an
+  existing-free-space reading is distinct from the requested amount.
+- Large measured folders, their largest child, and the open Explore folder
+  provide context. Build output such as `target/debug` remains an inspection
+  candidate without acquiring a cleanup action.
+- Artifact discovery checks project markers and source/Git activity, skips
+  symlinked paths, and counts overlapping roots once. Relocation regressions
+  cover changed copies, destination conflicts, symlink swaps, and rollback.
+- The evaluation harness compares file contents and symlink targets and checks
+  safety during measured fallback. Its standalone Python regressions run in CI
+  without Apple Intelligence.
+- Current language diagnostics check framework support and matching Mac/Siri
+  languages. The fixed English (United States) requirement in the September 24
+  checkpoint below is historical. Identical tool calls reuse measured evidence;
+  fresh process samples remain separate readings.
+
+Validation: 328 active Rust tests and 13 Python harness tests pass; the native
+Trash round-trip test remains ignored. Formatting, strict Clippy, the release
+and helper build, live helper checks, and all 14 MCP tools pass. The Ask fixture
+evaluation passes 12/12 safety and 11/11 model-quality checks; one measured
+fallback case skips model quality.
+
 ## Storage reallocation and live AI checkpoint — 2026-09-29
 
 - `m` starts with the selected folder; the largest-consumer list is no longer

@@ -346,7 +346,21 @@ fn request_once(
     cancelled: &AtomicBool,
     stopped: &str,
 ) -> Result<Response, String> {
-    let response = read_response(payload, request_id, timeout, cancelled, stopped)?;
+    let started = Instant::now();
+    let mut response = read_response(payload, request_id, timeout, cancelled, stopped)?;
+    // The shared on-device model can be briefly busy with another app's
+    // request. One short, cancellable retry avoids a needless fallback.
+    if busy(&response) && started.elapsed() + BUSY_RETRY_DELAY < timeout {
+        let resume = Instant::now() + BUSY_RETRY_DELAY;
+        while Instant::now() < resume {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(stopped.into());
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        let left = timeout.saturating_sub(started.elapsed());
+        response = read_response(payload, request_id, left, cancelled, stopped)?;
+    }
     if !response.available {
         return Err(availability_error(&response));
     }
@@ -356,12 +370,50 @@ fn request_once(
     Ok(response)
 }
 
+const BUSY_RETRY_DELAY: Duration = Duration::from_millis(1_500);
+
+fn busy(response: &Response) -> bool {
+    matches!(
+        response.error_code.as_deref(),
+        Some("rate_limited" | "concurrent_requests")
+    )
+}
+
+/// Compare language tags the way people read them: `en_US` and `en-us`
+/// name the same language as `en-US`.
+pub fn same_language(left: &str, right: &str) -> bool {
+    let normalize = |tag: &str| tag.trim().replace('_', "-").to_ascii_lowercase();
+    normalize(left) == normalize(right)
+}
+
+impl ModelDiagnostics {
+    /// A language problem the Mac itself reports, if any. Apple Intelligence
+    /// supports many languages; what it needs is a supported Mac language
+    /// that matches Siri's. Unknown Siri preferences are not a blocker.
+    pub fn language_blocker(&self) -> Option<String> {
+        if !self.locale_supported {
+            return Some(format!(
+                "Mac language {} is not supported by Apple's on-device model.",
+                display_text(&self.device_language)
+            ));
+        }
+        match &self.siri_language {
+            Some(siri) if !same_language(siri, &self.device_language) => Some(format!(
+                "Mac/Siri languages differ: {} / {}.",
+                display_text(&self.device_language),
+                display_text(siri),
+            )),
+            _ => None,
+        }
+    }
+}
+
 fn availability_error(response: &Response) -> String {
     if response.error_code.as_deref() == Some("model_not_ready")
         && let Some(diagnostics) = &response.diagnostics
         && let Some(siri) = &diagnostics.siri_language
     {
-        if siri != &diagnostics.device_language {
+        if !same_language(siri, &diagnostics.device_language) {
             return format!(
                 "Mac/Siri languages differ: {} / {}. Apple model is not ready.",
                 display_text(&diagnostics.device_language),
@@ -899,6 +951,60 @@ echo '{"protocol":3,"request_id":"triage:7","available":false,"error_code":"mode
             assert!(!text.contains("FoundationModels"), "{code}");
         }
         assert_eq!(friendly_error(None, "plain\u{1b}text"), "plaintext");
+    }
+    #[test]
+    fn a_busy_model_is_retried_once_before_falling_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("attempted");
+        let busy = r#"{"protocol":3,"request_id":"r1","available":true,"error":"busy","error_code":"rate_limited"}"#;
+        let ready = r#"{"protocol":3,"request_id":"r1","available":true}"#;
+        set_test_helper(Some(fake_helper(
+            dir.path(),
+            &format!(
+                "read line
+if [ -f '{0}' ]; then echo '{ready}'; else touch '{0}'; echo '{busy}'; fi",
+                marker.display()
+            ),
+        )));
+        let payload = serde_json::json!({"protocol": 3, "request_id": "r1"});
+        let never = AtomicBool::new(false);
+        let response = request_once(&payload, "r1", Duration::from_secs(10), &never, "stopped");
+        assert!(response.is_ok(), "{:?}", response.err());
+        // A second busy answer is reported, not retried forever.
+        set_test_helper(Some(fake_helper(
+            dir.path(),
+            &format!("read line\necho '{busy}'"),
+        )));
+        let error = request_once(&payload, "r1", Duration::from_secs(10), &never, "stopped");
+        assert_eq!(
+            error.err().as_deref(),
+            Some("The on-device model is busy. Try again shortly.")
+        );
+        set_test_helper(None);
+    }
+    #[test]
+    fn language_blocker_reports_only_real_mismatches_not_a_fixed_language() {
+        let diagnostics = |device: &str, siri: Option<&str>, supported: bool| ModelDiagnostics {
+            device_language: device.into(),
+            siri_language: siri.map(Into::into),
+            locale_supported: supported,
+            context_size: 4096,
+            supported_languages: Vec::new(),
+        };
+        // Any supported language works when Mac and Siri agree.
+        assert_eq!(
+            diagnostics("fr-FR", Some("fr-FR"), true).language_blocker(),
+            None
+        );
+        assert_eq!(
+            diagnostics("en-GB", Some("en_GB"), true).language_blocker(),
+            None
+        );
+        assert_eq!(diagnostics("de-DE", None, true).language_blocker(), None);
+        let mismatch = diagnostics("en-CA", Some("en-US"), true).language_blocker();
+        assert!(mismatch.unwrap().contains("languages differ"));
+        let unsupported = diagnostics("xx-YY", Some("xx-YY"), false).language_blocker();
+        assert!(unsupported.unwrap().contains("not supported"));
     }
     #[test]
     fn model_diagnostics_distinguish_supported_language_from_readiness() {

@@ -144,6 +144,13 @@ pub enum Command {
         #[arg(long, value_name = "DAYS")]
         days: Option<u64>,
     },
+    /// Report installer files (.dmg, .pkg, .xip, .iso) in Downloads and
+    /// Desktop, noting which apps are already installed; nothing is deleted
+    Installers {
+        /// Emit machine-readable JSON (schema `diskray.installers/1`)
+        #[arg(long)]
+        json: bool,
+    },
     /// List or validate cleanup rule packs
     Rules {
         #[command(subcommand)]

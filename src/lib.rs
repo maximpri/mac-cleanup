@@ -20,6 +20,7 @@ mod file_actions;
 pub mod growth;
 pub mod headless;
 pub mod history;
+pub mod installers;
 pub mod investigation;
 pub mod mcp;
 pub mod migrate;
