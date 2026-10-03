@@ -10,6 +10,7 @@
 pub mod agent;
 pub mod agent_tools;
 pub mod ai;
+pub mod answer;
 pub mod artifacts;
 pub mod cache;
 pub mod care;
@@ -29,6 +30,7 @@ pub mod paths;
 pub mod pending;
 pub mod plain;
 pub mod processes;
+pub mod question;
 pub mod relocation;
 pub mod retention;
 pub mod rules;

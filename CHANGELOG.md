@@ -28,6 +28,17 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Ask resolves explicit app and folder targets before considering the selected
+  row, measures required facts before inference, and uses small task-specific
+  tool sets. Ambiguous legacy-file requests ask whether to keep the app.
+- Local AI reports use constrained target and action IDs. Rust rejects unrelated
+  cleanup suggestions and requires current rule and open-file evidence. Answers
+  use measured facts with complete sentences instead of truncated tool dumps.
+- Ask JSON includes question scope, answer kind, and prompt version. Intentional
+  clarification succeeds without inference; fallback and partial measurements
+  remain explicit. Regression coverage includes misleading unrelated caches,
+  stale safety evidence, and live Foundation Models context limits.
+
 - Local AI no longer claims to require English (United States). Diskray shows
   a language blocker only when the Mac language is unsupported by Apple's
   model or differs from Siri's.

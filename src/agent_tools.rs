@@ -9,9 +9,9 @@
 
 use crate::{
     ai,
-    cache::{CacheEntry, CacheStatus, format_kb},
+    cache::{CacheEntry, CacheStatus, CacheTarget, format_kb},
     care::{self, Finding, Metrics, OwnerGuess, ProcessSample, Session, Target},
-    investigation::{CheckObservation, EvidenceKind, EvidenceStatus},
+    investigation::{CheckObservation, EvidenceDetails, EvidenceKind, EvidenceStatus},
     processes::{ProcessEntry, ProcessHealth},
     storage::{AgeProfile, StorageInventory, StorageItem, StorageItemKind, VolumeStats},
 };
@@ -170,7 +170,7 @@ pub fn spec_json(spec: &ToolSpec) -> Value {
 }
 
 /// Each investigation family sees a small toolset so tool definitions fit
-/// the on-device model's 4,096-token context.
+/// the on-device model's runtime-reported context budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Toolset {
     Storage,
@@ -550,6 +550,11 @@ impl Handles {
         let index = handle_index(handle, 'A', "action").ok()?;
         self.actions.get(index).map(String::as_str)
     }
+    pub fn action_choices(&self) -> Vec<String> {
+        (1..=self.actions.len())
+            .map(|index| format!("A{index}"))
+            .collect()
+    }
 }
 
 /// A call whose tool and argument shape were checked against the toolset.
@@ -628,6 +633,7 @@ pub struct Outcome {
     pub inventory: Option<Box<StorageInventory>>,
     /// Non-overlapping eligible cache sizes, never the sizes of review folders.
     pub cleanup_total_kb: Option<u64>,
+    pub details: EvidenceDetails,
 }
 
 impl Outcome {
@@ -640,6 +646,7 @@ impl Outcome {
             contradicts: vec![],
             inventory: None,
             cleanup_total_kb: None,
+            details: EvidenceDetails::default(),
         }
     }
     fn unavailable(kind: EvidenceKind, status: EvidenceStatus, text: String) -> Self {
@@ -662,16 +669,34 @@ impl Outcome {
         }
         self
     }
+    fn for_target(mut self, path: &Path) -> Self {
+        self.details.target = Some(path.to_path_buf());
+        self
+    }
+    fn with_measured_size(mut self, size: Option<u64>) -> Self {
+        self.details.size_kb = size;
+        self
+    }
+    fn with_open_handles(mut self, count: usize) -> Self {
+        self.details.open_handles = Some(count);
+        self
+    }
 }
 
 pub type Job = Box<dyn FnOnce(&AtomicBool) -> Slow + Send>;
 
 pub enum Dispatch {
-    Ready(Outcome),
+    Ready(Box<Outcome>),
     Slow(Job),
     NeedsApproval(Job),
     /// The call referenced something the model was never given.
     Rejected(String),
+}
+
+impl Dispatch {
+    fn ready(outcome: Outcome) -> Self {
+        Self::Ready(Box::new(outcome))
+    }
 }
 
 /// Raw results from collectors that run off the interface thread.
@@ -806,7 +831,7 @@ fn folder_tool(
                 .and_then(|inventory| inventory.children.get(&path))
             {
                 let complete = world.inventory.is_some_and(|inventory| inventory.complete);
-                return Dispatch::Ready(children_outcome(&path, items, complete, world, handles));
+                return Dispatch::ready(children_outcome(&path, items, complete, world, handles));
             }
             Dispatch::Slow(Box::new(move |cancel| {
                 let inventory = StorageInventory::scan_with_cancel(&path, &home, cancel);
@@ -825,8 +850,8 @@ fn folder_tool(
             let guess = care::identify_owner(&path, &home, Duration::from_secs(3));
             Slow::Owner(path, guess)
         })),
-        "growth_history" => Dispatch::Ready(growth_outcome(&path, world)),
-        "cleanup_rule" => Dispatch::Ready(cleanup_rule_outcome(&path, world, handles)),
+        "growth_history" => Dispatch::ready(growth_outcome(&path, world)),
+        "cleanup_rule" => Dispatch::ready(cleanup_rule_outcome(&path, world, handles)),
         _ => Dispatch::Rejected("Unsupported folder tool.".into()),
     }
 }
@@ -843,7 +868,7 @@ fn process_tool(
         .iter()
         .find(|process| process.pid == pid && process.start_time == start);
     match name {
-        "process_details" => Dispatch::Ready(match current {
+        "process_details" => Dispatch::ready(match current {
             Some(process) => process_outcome(handle, process, world),
             None => Outcome::complete(
                 EvidenceKind::ProcessSample,
@@ -872,12 +897,12 @@ fn system_tool(
     handles: &mut Handles,
 ) -> Dispatch {
     match name {
-        "memory_state" => Dispatch::Ready(memory_outcome(world, handles)),
+        "memory_state" => Dispatch::ready(memory_outcome(world, handles)),
         "top_processes" => {
-            Dispatch::Ready(top_processes_outcome(argument == "cpu", world, handles))
+            Dispatch::ready(top_processes_outcome(argument == "cpu", world, handles))
         }
-        "disk_accounting" => Dispatch::Ready(disk_outcome(world)),
-        "growth" => Dispatch::Ready(growth_comparison_outcome(argument, world, handles)),
+        "disk_accounting" => Dispatch::ready(disk_outcome(world)),
+        "growth" => Dispatch::ready(growth_comparison_outcome(argument, world, handles)),
         "volume_context" => Dispatch::Slow(Box::new(|cancel| {
             Slow::Observation(care::observe_volume_context(cancel))
         })),
@@ -890,14 +915,14 @@ fn system_tool(
                     Slow::Notes(care::research_sources(cancel, true))
                 }))
             } else {
-                Dispatch::Ready(Outcome::complete(
+                Dispatch::ready(Outcome::complete(
                     EvidenceKind::Research,
                     format!("Bundled reference · {}", bundled_note(argument)),
                 ))
             }
         }
-        "list_findings" => Dispatch::Ready(findings_outcome(world, handles)),
-        "cleanup_options" => Dispatch::Ready(cleanup_options_outcome(world, handles)),
+        "list_findings" => Dispatch::ready(findings_outcome(world, handles)),
+        "cleanup_options" => Dispatch::ready(cleanup_options_outcome(world, handles)),
         _ => Dispatch::Rejected("Unsupported tool.".into()),
     }
 }
@@ -956,6 +981,7 @@ pub fn finish(slow: Slow, world: &ToolWorld<'_>, handles: &mut Handles) -> Outco
                     None => format!("No likely owner for {place}: {}.", guess.basis),
                 },
             )
+            .for_target(&path)
         }
         Slow::Samples(handle, name, samples) => samples_outcome(&handle, &name, samples),
         Slow::Observation(observation) => {
@@ -1002,9 +1028,13 @@ fn children_outcome(
             EvidenceKind::VolumeContext,
             format!("{place} has no measured children."),
         )
-        .partial_if(!complete);
+        .partial_if(!complete)
+        .for_target(path)
+        .with_measured_size(complete.then_some(0));
     }
-    let total: u64 = items.iter().map(|item| item.size_kb).sum();
+    let total = items
+        .iter()
+        .fold(0u64, |sum, item| sum.saturating_add(item.size_kb));
     let mut parts = Vec::new();
     for item in items.iter().take(6) {
         let name = truncate_middle(
@@ -1034,10 +1064,13 @@ fn children_outcome(
         ));
     }
     if items.len() > 6 {
-        let rest: u64 = items.iter().skip(6).map(|item| item.size_kb).sum();
+        let rest = items
+            .iter()
+            .skip(6)
+            .fold(0u64, |sum, item| sum.saturating_add(item.size_kb));
         parts.push(format!("+{} more {}", items.len() - 6, format_kb(rest)));
     }
-    Outcome::complete(
+    let mut outcome = Outcome::complete(
         EvidenceKind::VolumeContext,
         format!(
             "{place} holds {} in {} measured items{}: {}",
@@ -1049,6 +1082,25 @@ fn children_outcome(
     )
     .supporting(&["measured_children", "measured_consumers"])
     .partial_if(!complete)
+    .for_target(path);
+    outcome.details.size_kb = Some(total);
+    outcome.details.children = items
+        .iter()
+        .take(6)
+        .map(|item| {
+            (
+                ai::display_text(
+                    &item
+                        .path
+                        .file_name()
+                        .unwrap_or(item.path.as_os_str())
+                        .to_string_lossy(),
+                ),
+                item.size_kb,
+            )
+        })
+        .collect();
+    outcome
 }
 
 fn age_outcome(path: &Path, profile: io::Result<AgeProfile>, world: &ToolWorld<'_>) -> Outcome {
@@ -1063,7 +1115,8 @@ fn age_outcome(path: &Path, profile: io::Result<AgeProfile>, world: &ToolWorld<'
                     "Age check for {place} unavailable: {}",
                     ai::display_text(&error.to_string())
                 ),
-            );
+            )
+            .for_target(path);
         }
     };
     if profile.files == 0 {
@@ -1071,7 +1124,9 @@ fn age_outcome(path: &Path, profile: io::Result<AgeProfile>, world: &ToolWorld<'
             EvidenceKind::VolumeContext,
             format!("{place} contains no readable files."),
         )
-        .partial_if(!profile.complete);
+        .partial_if(!profile.complete)
+        .for_target(path)
+        .with_measured_size(profile.complete.then_some(0));
     }
     let [recent, months, year, older] = profile.buckets_kb;
     let total = profile.total_kb;
@@ -1096,7 +1151,9 @@ fn age_outcome(path: &Path, profile: io::Result<AgeProfile>, world: &ToolWorld<'
             }
         ),
     )
-    .partial_if(!profile.complete);
+    .partial_if(!profile.complete)
+    .for_target(path)
+    .with_measured_size(Some(total));
     if newest.is_some_and(|age| age <= 86_400) {
         outcome = outcome.supporting(&["active_writer"]);
     } else if percent(year + older, total) >= 50 && newest.is_some_and(|age| age > 7 * 86_400) {
@@ -1112,12 +1169,13 @@ fn owners_outcome(
     handles: &mut Handles,
 ) -> Outcome {
     let place = short_path(path, world.home);
-    match owners {
+    let mut outcome = match owners {
         Ok(owners) if owners.is_empty() => Outcome::complete(
             EvidenceKind::ProcessSample,
             format!("No process has files open under {place} right now (point-in-time check)."),
         )
-        .contradicting(&["active_writer"]),
+        .contradicting(&["active_writer"])
+        .with_open_handles(0),
         Ok(owners) => {
             let listed = owners
                 .iter()
@@ -1143,6 +1201,7 @@ fn owners_outcome(
                 ),
             )
             .supporting(&["active_writer"])
+            .with_open_handles(owners.len())
         }
         Err(error) if error.kind() == io::ErrorKind::TimedOut => Outcome::unavailable(
             EvidenceKind::ProcessSample,
@@ -1157,7 +1216,9 @@ fn owners_outcome(
                 ai::display_text(&error.to_string())
             ),
         ),
-    }
+    };
+    outcome.details.target = Some(path.to_path_buf());
+    outcome
 }
 
 fn growth_comparison_outcome(
@@ -1279,14 +1340,41 @@ fn cleanup_rule_outcome(path: &Path, world: &ToolWorld<'_>, handles: &mut Handle
         .collect();
     matches.sort_by_key(|entry| std::cmp::Reverse(entry.size_kb));
     if matches.is_empty() {
-        return Outcome::complete(
+        let mut outcome = Outcome::complete(
             EvidenceKind::Policy,
             format!("No cleanup rule covers {place}, its contents, or a parent. Size alone does not make data removable."),
         )
-        .contradicting(&["rebuildable_data"]);
+        .contradicting(&["rebuildable_data"])
+        .for_target(path);
+        outcome.details.rule_status = Some("NO_RULE".into());
+        return outcome;
     }
+    let covering = matches
+        .iter()
+        .filter(|entry| path.starts_with(&entry.spec.path))
+        .max_by_key(|entry| entry.spec.path.components().count());
+    let rule_status = covering
+        .map(|entry| entry.status.label())
+        .unwrap_or("PARTIAL_RULE")
+        .to_string();
+    let size_kb = matches
+        .iter()
+        .find(|entry| {
+            entry.spec.path == path
+                && !matches!(entry.spec.target, CacheTarget::AgedContents { .. })
+                && matches!(
+                    entry.status,
+                    CacheStatus::Ready
+                        | CacheStatus::Optional
+                        | CacheStatus::Review
+                        | CacheStatus::InUse
+                        | CacheStatus::Whitelisted
+                )
+        })
+        .map(|entry| entry.size_kb);
     let mut supports = Vec::new();
     let mut contradicts = Vec::new();
+    let mut eligible_actions = Vec::new();
     let described = matches
         .iter()
         .take(3)
@@ -1309,8 +1397,15 @@ fn cleanup_rule_outcome(path: &Path, world: &ToolWorld<'_>, handles: &mut Handle
                 }
                 _ => {}
             }
-            let action = (world.suggest)(&Target::Cache(entry.spec.path.clone()))
-                .and_then(|id| handles.action(&id))
+            let action = matches!(entry.status, CacheStatus::Ready | CacheStatus::Optional)
+                .then(|| (world.suggest)(&Target::Cache(entry.spec.path.clone())))
+                .flatten()
+                .filter(|id| id.starts_with("clean:"))
+                .and_then(|id| {
+                    let handle = handles.action(&id)?;
+                    eligible_actions.push(id);
+                    Some(handle)
+                })
                 .map(|handle| format!(" · eligible action {handle}"))
                 .unwrap_or_default();
             format!(
@@ -1323,12 +1418,17 @@ fn cleanup_rule_outcome(path: &Path, world: &ToolWorld<'_>, handles: &mut Handle
         })
         .collect::<Vec<_>>()
         .join(" | ");
-    Outcome::complete(
+    let mut outcome = Outcome::complete(
         EvidenceKind::Policy,
         format!("Rules for {place}: {described}"),
     )
     .supporting(&supports)
     .contradicting(&contradicts)
+    .for_target(path);
+    outcome.details.size_kb = size_kb;
+    outcome.details.rule_status = Some(rule_status);
+    outcome.details.eligible_actions = eligible_actions;
+    outcome
 }
 
 fn process_outcome(handle: &str, process: &ProcessEntry, world: &ToolWorld<'_>) -> Outcome {
@@ -1813,6 +1913,7 @@ fn cleanup_options_outcome(world: &ToolWorld<'_>, handles: &mut Handles) -> Outc
             .then_with(|| a.0.cmp(&b.0))
     });
     let mut review: Vec<PathBuf> = Vec::new();
+    let mut review_details = Vec::new();
     let coverage = if world
         .inventory
         .is_some_and(|inventory| inventory.complete && inventory.scan_errors == 0)
@@ -1873,6 +1974,22 @@ fn cleanup_options_outcome(world: &ToolWorld<'_>, handles: &mut Handles) -> Outc
             // Leave room for at least one cache and the tool-reply envelope.
             if text.len() + part.len() <= OUTPUT_CAP - 145 {
                 text.push_str(&part);
+                let measured = world
+                    .inventory
+                    .and_then(|inventory| measured_children(inventory, &path))
+                    .and_then(|children| {
+                        children
+                            .iter()
+                            .filter(|child| child.size_kb > 0)
+                            .max_by_key(|child| child.size_kb)
+                    });
+                let (measured_path, measured_size) = measured
+                    .map(|child| (child.path.as_path(), child.size_kb))
+                    .unwrap_or((path.as_path(), size));
+                review_details.push((
+                    short_path(&logical_path(measured_path), &logical_path(world.home)),
+                    measured_size,
+                ));
                 review.push(path);
                 *handles = issued;
             }
@@ -1906,6 +2023,8 @@ fn cleanup_options_outcome(world: &ToolWorld<'_>, handles: &mut Handles) -> Outc
     let mut outcome =
         Outcome::complete(EvidenceKind::Policy, text).partial_if(!coverage.is_empty());
     outcome.cleanup_total_kb = Some(total);
+    outcome.details.children = review_details;
+    outcome.details.eligible_actions = unique.into_iter().map(|(_, id)| id).collect();
     outcome
 }
 
@@ -3041,5 +3160,155 @@ mod tests {
         assert!(capped.len() <= OUTPUT_CAP);
         assert!(capped.ends_with('…'));
         assert_eq!(cap("a\u{1b}b"), "ab");
+    }
+
+    #[test]
+    fn structured_children_keep_measured_names_and_partial_empty_is_unknown() {
+        let home = Path::new("/Users/demo");
+        let path = home.join("Projects/target");
+        let metrics = Metrics::default();
+        let none = |_: &Target| None;
+        let world = world(home, None, &[], &[], &metrics, &none);
+        let items = [item(
+            &path.join("debug"),
+            120 * 1024,
+            StorageItemKind::Directory,
+        )];
+        let mut handles = Handles::default();
+        handles.folder(&path);
+        let outcome = children_outcome(&path, &items, false, &world, &mut handles);
+        assert_eq!(outcome.details.target.as_deref(), Some(path.as_path()));
+        assert_eq!(outcome.details.size_kb, Some(120 * 1024));
+        assert_eq!(outcome.details.children, [("debug".into(), 120 * 1024)]);
+        assert_eq!(outcome.status, EvidenceStatus::Partial);
+        assert!(outcome.details.eligible_actions.is_empty());
+        let empty = children_outcome(&path, &[], false, &world, &mut handles);
+        assert!(empty.details.size_kb.is_none());
+        let complete = children_outcome(&path, &[], true, &world, &mut handles);
+        assert_eq!(complete.details.size_kb, Some(0));
+    }
+
+    #[test]
+    fn structured_open_checks_distinguish_clear_busy_and_unavailable() {
+        let home = Path::new("/Users/demo");
+        let path = home.join("Projects");
+        let metrics = Metrics::default();
+        let none = |_: &Target| None;
+        let world = world(home, None, &[], &[], &metrics, &none);
+        let mut handles = Handles::default();
+        let clear = owners_outcome(&path, Ok(vec![]), &world, &mut handles);
+        assert_eq!(clear.details.open_handles, Some(0));
+        let busy = owners_outcome(
+            &path,
+            Ok(vec![(7, "cargo".into()), (8, "lldb".into())]),
+            &world,
+            &mut handles,
+        );
+        assert_eq!(busy.details.open_handles, Some(2));
+        let failed = owners_outcome(
+            &path,
+            Err(io::Error::new(io::ErrorKind::TimedOut, "injected")),
+            &world,
+            &mut handles,
+        );
+        assert_eq!(failed.details.target.as_deref(), Some(path.as_path()));
+        assert!(failed.details.open_handles.is_none());
+        assert_eq!(failed.status, EvidenceStatus::TimedOut);
+    }
+
+    #[test]
+    fn structured_rule_actions_are_canonical_and_only_currently_eligible() {
+        let home = Path::new("/Users/demo");
+        let path = home.join("Library/Caches/pip");
+        let metrics = Metrics::default();
+        let suggest = |target: &Target| match target {
+            Target::Cache(path) => Some(format!("clean:{}", path.display())),
+            _ => None,
+        };
+        for (status, eligible) in [
+            (CacheStatus::Ready, true),
+            (CacheStatus::Optional, true),
+            (CacheStatus::InUse, false),
+            (CacheStatus::Review, false),
+            (CacheStatus::ScanError, false),
+        ] {
+            let mut entry = cache_entry(&path, 2048, status);
+            entry.spec.target = CacheTarget::DirectoryContents;
+            let entries = [entry];
+            let world = world(home, None, &entries, &[], &metrics, &suggest);
+            let mut handles = Handles::default();
+            let outcome = cleanup_rule_outcome(&path, &world, &mut handles);
+            assert_eq!(outcome.details.target.as_deref(), Some(path.as_path()));
+            assert_eq!(outcome.details.rule_status.as_deref(), Some(status.label()));
+            assert_eq!(
+                !outcome.details.eligible_actions.is_empty(),
+                eligible,
+                "{status:?}"
+            );
+            if eligible {
+                assert_eq!(
+                    outcome.details.eligible_actions,
+                    [format!("clean:{}", path.display())]
+                );
+            }
+            if status == CacheStatus::ScanError {
+                assert!(outcome.details.size_kb.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn subset_rules_never_relabel_a_whole_folder_as_ready_or_invent_its_size() {
+        let home = Path::new("/Users/demo");
+        let parent = home.join("Library/Caches");
+        let metrics = Metrics::default();
+        let none = |_: &Target| None;
+        let mut entry = cache_entry(&parent.join("pip"), 2048, CacheStatus::Ready);
+        entry.spec.target = CacheTarget::AgedContents { min_age_days: 60 };
+        let entries = [entry];
+        let world = world(home, None, &entries, &[], &metrics, &none);
+        let subset = cleanup_rule_outcome(&parent, &world, &mut Handles::default());
+        assert_eq!(subset.details.rule_status.as_deref(), Some("PARTIAL_RULE"));
+        assert!(subset.details.size_kb.is_none());
+        let aged = cleanup_rule_outcome(&entries[0].spec.path, &world, &mut Handles::default());
+        assert!(
+            aged.details.size_kb.is_none(),
+            "an eligible age subset is not the full folder size"
+        );
+        let missing = cleanup_rule_outcome(&home.join("Projects"), &world, &mut Handles::default());
+        assert_eq!(missing.details.rule_status.as_deref(), Some("NO_RULE"));
+    }
+
+    #[test]
+    fn structured_age_failures_preserve_target_without_measured_zero() {
+        let home = Path::new("/Users/demo");
+        let path = home.join("Projects");
+        let metrics = Metrics::default();
+        let none = |_: &Target| None;
+        let world = world(home, None, &[], &[], &metrics, &none);
+        let failure = age_outcome(&path, Err(io::Error::other("injected")), &world);
+        assert_eq!(failure.details.target.as_deref(), Some(path.as_path()));
+        assert!(failure.details.size_kb.is_none());
+        let profile = AgeProfile {
+            files: 0,
+            total_kb: 0,
+            buckets_kb: [0; 4],
+            newest_age_secs: None,
+            complete: false,
+            errors: 1,
+        };
+        let partial = age_outcome(&path, Ok(profile), &world);
+        assert_eq!(partial.status, EvidenceStatus::Partial);
+        assert!(partial.details.size_kb.is_none());
+    }
+
+    #[test]
+    fn allowed_action_choices_include_only_issued_deduplicated_handles() {
+        let mut handles = Handles::default();
+        assert!(handles.action_choices().is_empty());
+        handles.action("clean:/Users/demo/Library/Caches/pip");
+        handles.action("clean:/Users/demo/Library/Caches/pip");
+        handles.action("clean:/Users/demo/Library/Caches/Homebrew");
+        assert_eq!(handles.action_choices(), ["A1", "A2"]);
     }
 }

@@ -66,7 +66,23 @@ submits them. Diskray never changes system language settings.
 References: [Apple Intelligence requirements](https://support.apple.com/en-us/121115)
 and [SystemLanguageModel](https://developer.apple.com/documentation/foundationmodels/systemlanguagemodel).
 
-### Current validation status — 2026-09-30
+### Current validation status — 2026-10-03
+
+The `scoped-ask-v1` implementation passes all 15 fixture safety and usefulness
+checks, including direct Cursor inspection, legacy-data clarification, the
+10 GB cleanup shortfall, a cache held open, and a safe cache recommendation.
+All five scope checks pass; no quality cases were skipped. The local p95 was
+12 seconds. These are fixture results on this Mac, not performance guarantees.
+
+The release helper passes live triage, constrained reports and relocation
+advice, scoped clarification, full report-context accounting, and tool use.
+The framework reports an 8,192-token context; its helper fixture uses 1,144
+setup tokens. Runtime values are queried rather than assumed from this result.
+Rust has 381 passing tests and one pre-existing ignored test; Python has 30
+passing tests. Deterministic coverage includes unrelated/stale safety evidence,
+partial checks, explicit target precedence, multiple names, and negated cleanup.
+
+### Earlier validation — 2026-09-30
 
 September 30 follow-up: the rebuilt helper passes the live protocol and
 inference checks, including a report that cites missing history. The exact
@@ -125,14 +141,14 @@ processes hold files open, earlier measurements from History, whether a cleanup
 rule covers it, the likely owning app (via Spotlight), one process's details and
 short samples, memory pressure and top processes, disk accounting and local
 snapshots, mounted volumes, and bundled Apple reference notes. Each investigation
-family gets at most six tools so their definitions also fit models with a
-4,096-token context. The model refers to folders and processes only by handles
+family gets at most six tools; scoped Ask exposes three to five relevant
+tools. The helper budgets against the installed model's runtime context size. The model refers to folders and processes only by handles
 the app issued in earlier results (`n2`, `p1`); paths and unknown handles are
 rejected. Every result becomes numbered evidence (`E3`) that the report must cite.
 
-Rust re-validates every report before it is shown. The model selects evidence IDs
-and structured hypothesis verdicts; Rust writes the displayed conclusion from
-the selected tool results and verified hypothesis links. Model-written prose is
+Rust re-validates every report before it is shown. The model selects evidence IDs,
+an answer kind, a target, and structured hypothesis verdicts; Rust writes the
+displayed conclusion from typed measurements and verified hypothesis links. Model-written prose is
 never shown as a factual conclusion. References to evidence that was never
 collected are removed, a hypothesis counts as supported only when cited usable
 evidence supports it, and failed, denied, timed-out, and unsupported results
@@ -152,7 +168,9 @@ tools run as a fixed measured sequence and the conclusion is labeled as having
 no AI.
 
 `/` focuses the persistent **Ask** bar below both panels: type one question
-and get one tool-backed answer in the right panel. It is not a chat, and it needs the model. After a scan and triage settle,
+and get one tool-backed answer in the right panel. It is not a chat; the TUI
+checks model readiness before submission. The CLI can also return measured
+fallbacks and deterministic clarifications without model inference. After a scan and triage settle,
 local AI investigates the top key area once with the smaller budget. It pauses
 under elevated memory pressure, resumes once when pressure is normal, and stops
 when you open the review plan, start another investigation, or press `Esc`.
@@ -168,13 +186,28 @@ and `NO_COLOR` provide static presentation. The health line shows AI
 availability; `?` includes detailed helper and model capability status, and
 helper errors are shown in plain language.
 
+Ask resolves intent and target in Rust before starting inference. An explicit
+app or measured folder takes precedence over the selected Explore folder;
+“this folder” uses that selection. A broad request to free disk space stays
+global. Unknown or ambiguous targets, and requests to clean “old” app data
+without saying whether to keep the app, receive a clarification. The app does
+not infer that old data is obsolete or choose an unrelated cache instead.
+
+Required checks run first within the same six-call budget. Targeted cleanup
+questions inspect children, matching cleanup rules, and open files; inspection
+questions start with the child listing. Global cleanup questions collect the
+cleanup overview and disk accounting, then check the largest eligible cache
+when no requested amount remains unmet. Larger shortfalls preserve that budget
+for inspecting substantial folders. The model
+then receives the resolved scope, collected measurements, and only the relevant
+optional tools. A clarification is rendered directly without starting a model
+session. Cleanup suggestions must stay within the resolved target and cite
+successful rule and in-use checks, in addition to passing current eligibility.
 General Ask questions cannot suggest process signals: start an investigation
-on the specific process to review those. Cleanup questions replace the general
-CPU-ranking tool with the open-file check and the memory tool with a cleanup
-overview while retaining the six-tool limit. Requests to free, release, or
-reclaim disk space use this toolset too. The overview totals non-overlapping
-eligible cache rules, lists large measured folders for inspection, and retains
-the open Explore folder as context. Rust compares an explicit GB/GiB/MB/MiB/TB/TiB
+on the specific process to review those.
+
+The global cleanup overview totals non-overlapping
+eligible cache rules and lists large measured folders for inspection. Rust compares an explicit GB/GiB/MB/MiB/TB/TiB
 amount with that estimate and keeps the total and shortfall in the answer even
 if the model selects only a small cache. Folder sizes are review candidates,
 never additional reclaimable space; actual freed space still needs verification.
@@ -192,25 +225,57 @@ Report-only sessions require a citation from the collected evidence IDs,
 including unavailable checks that explain a limitation. An initial report
 without valid citations gets one such retry within the original time limit.
 
+The helper report schema uses `answer_kind` (`findings`, `clarification`, or
+`insufficient_evidence`), `target_id`, `evidence_ids`, `suggested_actions`, and
+the existing verdict/phase fields. Targets are constrained to the app's
+`allowed_targets`; a fresh report also constrains evidence and supplied
+`allowed_actions`. Live tool sessions can issue new evidence and action IDs,
+so Rust validates those references after generation. The optional
+`clarification_question` never overrides the app's deterministic wording.
+
+The current prompt revision is `scoped-ask-v1`, separate from helper protocol
+version 3. Requests and saved cases record `prompt_version`; helper responses
+echo it for diagnostics. On systems with the token-counting API, final-report
+context checks count instructions and the generation schema as well as the
+prompt and response reserve.
+
+`diskray ask --json` exposes `question_scope` and `prompt_version`. A resolved
+clarification succeeds with exit status `0` and `by_model: false`; this means
+the app needs a user answer, not that inference failed. A measured fallback
+without a completed model answer still uses exit status `3`. Timeouts retain
+their separate exit status. See [CLI usage](USAGE.md) for examples.
+
 `R` controls saved one-time consent for online research. When enabled, the app
 fetches only its fixed Apple documentation catalog and supplies short excerpts
 as typed research evidence. It never builds a model-generated URL or sends local
 paths, file contents, process arguments, or raw traces. Local Apple FM inference
 remains on-device whether research is on or off.
 
+The integration follows Apple's [on-device prompting guidance](https://developer.apple.com/documentation/foundationmodels/prompting-an-on-device-foundation-model),
+[guided generation](https://developer.apple.com/documentation/foundationmodels/generating-swift-data-structures-with-guided-generation),
+and [context-window management](https://developer.apple.com/documentation/technotes/tn3193-managing-the-on-device-foundation-model-s-context-window).
+Re-run the fixture suite when macOS or the installed model changes, following
+Apple's [prompt migration guidance](https://developer.apple.com/documentation/foundationmodels/updating-prompts-for-new-model-versions).
+
 ## Checking quality
 
 `python3 -m unittest discover -s scripts -p 'test_*.py' -v` checks the evaluation
 harness independently of Apple Intelligence and runs in CI. Its regressions
-cover same-size file changes, symlink retargeting, and safety checks during
-measured fallback.
+cover same-size file changes, symlink retargeting, safety checks during measured
+fallback, wrong app targets, and missing or unrelated clarification answers.
 
-`python3 scripts/check_ai_helper.py` checks the helper protocol, and
-`python3 scripts/eval_agent.py` asks twelve fixture questions and checks that
+`python3 scripts/check_ai_helper.py` checks the helper protocol and report
+schema/transport without inference. `report_selftest` builds the actual report
+schema and transports synthetic fields without requiring model assets.
+`python3 scripts/eval_agent.py` asks fifteen fixture questions and checks that
 every cited evidence ID exists, every suggestion was eligible, fixture contents
 and symlink targets are unchanged, and prompt-injected folder names are ignored.
-Safety checks also apply during measured fallback. Its quality checks need a Mac
-whose Apple Intelligence model is ready.
+Safety checks also apply during measured fallback. Cursor inspection, Cursor
+legacy-data clarification, and ambiguous-app fixtures check scope and useful
+answers even with no model; a larger pip cache must not replace the app-specific
+question. Inspection also requires the child-list preflight measurement. Scope checks must all pass.
+The remaining model-dependent quality checks need a Mac whose Apple Intelligence
+model is ready; their pass-rate gate remains 90%.
 
 After completing Apple Intelligence setup or restarting the Mac, verify actual
 inference and tool use from the repository root:
@@ -219,6 +284,7 @@ inference and tool use from the repository root:
 python3 scripts/check_ai_helper.py --live
 ```
 
-This must pass both synthetic triage and a tool-using investigation before
+This must pass synthetic triage, scoped report/clarification checks, context
+budget checks where supported, and a tool-using investigation before
 local AI is considered verified. Then launch `./target/release/diskray` and
 submit an Ask question. The protocol-only check does not establish model readiness.

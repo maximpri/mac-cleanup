@@ -14,7 +14,7 @@ import sys
 import time
 
 PROTOCOL = 3
-helper = Path(__file__).resolve().parents[1] / "target/release/diskray-ai"
+helper = Path(os.environ.get("DISKRAY_AI_HELPER", Path(__file__).resolve().parents[1] / "target/release/diskray-ai"))
 
 
 def request(payload):
@@ -94,6 +94,32 @@ else:
     print(f"INFO: model unavailable ({availability['error_code']}); live checks need Apple Intelligence")
 print("PASS: version rejection and structured availability")
 
+# Shape/transport tests run even when model assets are unavailable.
+sample_report = {"answer_kind": "clarification", "target_id": "n1", "evidence_ids": ["E1"],
+                 "suggested_actions": ["none"], "phase": "inconclusive",
+                 "clarification_question": "Keep using Cursor or remove its data?"}
+response = request({"protocol": PROTOCOL, "request_id": "report-shape", "operation": "report_selftest",
+                    "prompt_version": "scope-test-v1", "prompt": json.dumps(sample_report),
+                    "allowed_targets": ["n1"], "allowed_evidence": ["E1"], "allowed_actions": []})
+assert response["prompt_version"] == "scope-test-v1"
+assert response["report"] == {**sample_report, "suggested_actions": [], "verdicts": []}
+properties = response["schema"]["properties"]
+assert set(properties["answer_kind"]["enum"]) == {"findings", "clarification", "insufficient_evidence"}
+assert properties["target_id"]["enum"] == ["n1"]
+assert properties["evidence_ids"]["items"]["enum"] == ["E1"]
+assert properties["suggested_actions"]["items"]["enum"] == ["none"]
+assert "clarification_question" not in response["schema"]["required"]
+response = request({"protocol": PROTOCOL, "request_id": "report-actions", "operation": "report_selftest",
+                    "allowed_targets": ["n1", "n2"], "allowed_actions": ["A1", "A3"]})
+assert response["schema"]["properties"]["suggested_actions"]["items"]["enum"] == ["A1", "A3"]
+response = request({"protocol": PROTOCOL, "request_id": "report-legacy", "operation": "report_selftest"})
+assert response["schema"]["properties"]["target_id"]["enum"] == ["none"]
+assert "enum" not in response["schema"]["properties"]["suggested_actions"]["items"]
+assert "enum" not in response["schema"]["properties"]["evidence_ids"]["items"]
+assert response["report"]["answer_kind"] == "insufficient_evidence"
+assert "clarification_question" not in response["report"]
+print("PASS: scoped report schema, optional request fields, and report transport without inference")
+
 # Concurrent calls: every tool call must be emitted before any reply is sent,
 # and replies delivered out of order must reach the right caller.
 names = ["alpha", "beta", "gamma"]
@@ -151,10 +177,36 @@ if "--live" in sys.argv:
                                 "summary": "No comparable complete assessment at least 7 days old is saved."}]}
     response = request({"protocol": PROTOCOL, "request_id": "report-limitation", "operation": "report",
                         "prompt": json.dumps(limitation), "allowed_evidence": ["E1"],
+                        "allowed_targets": ["none"], "allowed_actions": [], "prompt_version": "scope-test-v1",
                         "instructions": "Select collected evidence IDs. Cite unsupported checks to explain limitations, without claiming growth."})
     assert response["report"]["evidence_ids"] == ["E1"], response
     assert response["report"]["phase"] == "inconclusive"
+    assert response["report"]["answer_kind"] == "insufficient_evidence", response
+    assert response["report"]["target_id"] == "none"
+    assert response["report"]["suggested_actions"] == []
+    assert response["prompt_version"] == "scope-test-v1"
     print("PASS: live report cites missing history without claiming growth")
+
+    scoped = {"task": "Can I clean old Cursor files?", "target": "n1 Cursor",
+              "evidence": [{"id": "E1", "summary": "Cursor has app-managed settings and workspace data."}],
+              "clarification": "Keep using Cursor, or remove its data?",
+              "unrelated_action": "A9 clears pip; this action is outside the question scope."}
+    response = request({"protocol": PROTOCOL, "request_id": "report-scope", "operation": "report",
+                        "prompt": json.dumps(scoped), "allowed_evidence": ["E1"],
+                        "allowed_targets": ["n1"], "allowed_actions": [],
+                        "instructions": "The target is Cursor. Ask the supplied clarification; do not suggest unrelated cleanup."})
+    assert response["report"]["answer_kind"] == "clarification", response
+    assert response["report"]["target_id"] == "n1"
+    assert response["report"]["suggested_actions"] == []
+    print("PASS: scoped Cursor clarification cannot suggest unrelated pip actions")
+
+    if capabilities["token_counting"] and diagnostics["context_size"] <= 12000:
+        response = request({"protocol": PROTOCOL, "request_id": "report-context", "operation": "report",
+                            "prompt": "Cite E1.", "instructions": "x " * diagnostics["context_size"],
+                            "allowed_evidence": ["E1"], "allowed_actions": []})
+        assert response.get("error_code") == "context", response
+        assert response.get("type") == "error"
+        print("PASS: final report counts instructions and schema against the context budget")
 
     relocation = {"category": "personal_data", "allocated_kb": 1048576,
                   "recently_modified": False,
@@ -213,5 +265,7 @@ if "--live" in sys.argv:
     assert set(report["evidence_ids"]) <= issued_evidence
     assert set(report["suggested_actions"]) <= {"A1"}
     assert report["phase"] in {"complete", "inconclusive"}
+    assert report["answer_kind"] in {"findings", "clarification", "insufficient_evidence"}
+    assert report["target_id"] == "none"
     print(f"PASS: live tool-using investigation · tools {used} · cited {report['evidence_ids']}"
           f" · suggested {report['suggested_actions']} ({time.monotonic() - began:.2f}s)")

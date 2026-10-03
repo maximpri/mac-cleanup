@@ -36,22 +36,37 @@ provides historical design context. The current implementation checkpoint is in
   recomputes completeness, and keeps only still-eligible suggestions.
   Model and fallback reports retain the latest usable cleanup total, discard
   superseded totals, and compare an explicit requested amount with that estimate.
+- `src/question.rs` resolves Ask intent and target from the current measured
+  inventory and rule entries. Explicit app/folder names take precedence over
+  incidental UI selection; unresolved targets produce clarification. Ask runs
+  the required collectors before inference, then exposes a small toolset for
+  the resolved scope. These checks share the original call and time budgets.
+  `src/answer.rs` renders answers from typed measurements and deterministic
+  clarification text rather than replaying collector prose as the conclusion.
 - `src/investigation.rs` owns the case record: hypotheses, typed evidence status,
   the tool-call timeline, the question for Ask cases, and validated suggestions.
   A failed or denied collector cannot strengthen a hypothesis. New fields default
   so older History records still load.
   Optional `cleanup_total_kb` records the eligible estimate separately from
-  displayed text and folder measurements.
+  displayed text and folder measurements. `question_scope`, typed evidence
+  details, and `prompt_version` preserve the context behind scoped Ask answers.
 - `native/AIHelper.swift` calls Apple's on-device FoundationModels API. The
   `agent` operation creates a `LanguageModelSession` with one bridged `Tool` per
   Rust spec; each call is forwarded to Rust and answered on stdin through an
   actor that routes replies by call ID, so concurrent calls are safe. Handle
   arguments use string schemas checked against Rust's issued-handle table
   (some Apple models reject regex guides), and the final report uses a
-  dynamic schema whose hypothesis IDs are constrained to the case. A hard cap
+  dynamic schema whose hypothesis and target IDs are constrained to the case.
+  Its answer-kind enum distinguishes findings, clarification, and insufficient
+  evidence. Fresh report sessions constrain supplied evidence/action IDs;
+  live tool sessions leave new references to Rust's issued-ID validation.
+  Final-report context accounting includes instructions and schema on systems
+  with the token-counting API. A hard cap
   stops a model that ignores its budget. The helper has no filesystem, shell,
   or remote capability of its own. `selftest` exercises the bridge without a
-  model, and `measure` reports token budgets.
+  model, `report_selftest` checks report schemas and transport without model
+  assets, and `measure` reports token budgets. `scoped-ask-v1` identifies the
+  prompt revision independently of transport protocol 3.
 - `src/tui/care_view.rs` owns the two-panel workspace and its storage/folder/history lists, the command palette, model activity visuals,
   shared review plans, sequential execution, and before/after observations.
 - Storage accounting uses disjoint areas from the inventory's accounted device,

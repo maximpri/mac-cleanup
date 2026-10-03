@@ -82,10 +82,16 @@ The **Ask AI** input stays open below both panels. Press `/` or click it to
 type. `Left` / `Right`, `Home` / `End`, `Backspace`, and `Delete` edit your
 question; `Esc` returns to browsing and keeps your draft and cursor position.
 
-Cleanup answers compare your requested amount with the eligible cache estimate
-and show any shortfall. They include large folders and their largest measured
-child when available, including build output such as `target/debug`. Asking
-while browsing includes the current folder as context. To move useful data,
+Ask resolves the app or folder named in your question before choosing checks.
+For example, “Can I clean old Cursor files?” asks whether you want to keep using
+Cursor or remove its data; it does not substitute unrelated pip cleanup. A
+selected folder supplies context when you refer to “this folder.” Unresolved
+targets get a clarification instead of cleanup suggestions.
+
+Whole-disk cleanup answers compare your requested amount with the eligible
+cache estimate and show any shortfall. They include large folders and their
+largest measured child when available, including build output such as
+`target/debug`. To move useful data,
 select its folder and press `m` for the separate external-storage review.
 
 ![Real TUI screenshot of a Rust target/debug directory and its measured build files](docs/images/tui-build-output.png)

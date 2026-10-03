@@ -1542,18 +1542,7 @@ impl Workspace {
         }
         self.cancel_agent(app, "A question replaced the previous investigation.");
         let mut case = investigation::InvestigationCase::new_question(&question, self.revision);
-        let subject =
-            if self.screen == Screen::Explore && agent_tools::is_cleanup_question(&question) {
-                agent::Subject {
-                    folder: app.explorer_path.clone(),
-                    description:
-                        "Folder currently open in Explore; the question may concern the whole disk."
-                            .into(),
-                    ..agent::Subject::default()
-                }
-            } else {
-                agent::Subject::default()
-            };
+        let subject = self.ask_subject(app);
         let run = agent::start(&mut case, subject, false, true);
         self.agent = Some(run);
         self.agent_subject = None;
@@ -1564,6 +1553,34 @@ impl Workspace {
         self.detail_scroll = 0;
         self.ai_error = None;
         self.persist(app);
+    }
+
+    fn ask_subject(&self, app: &App) -> agent::Subject {
+        let folder = match self.screen {
+            Screen::Explore => app
+                .explorer_items()
+                .get(app.explorer_cursor)
+                .map(|item| item.path.clone()),
+            Screen::Overview => self.selected().and_then(|finding| match &finding.target {
+                Target::Cache(path) | Target::Folder(path) => Some(path.clone()),
+                _ => None,
+            }),
+            Screen::History => None,
+        };
+        let description = folder
+            .as_deref()
+            .map(|path| {
+                format!(
+                    "Selection context: {}; the question determines the target.",
+                    agent_tools::short_path(path, &app.account_home)
+                )
+            })
+            .unwrap_or_default();
+        agent::Subject {
+            folder,
+            description,
+            ..agent::Subject::default()
+        }
     }
     /// Advance the running investigation and apply what it reports.
     fn pump_agent(&mut self, app: &mut App) {
@@ -5619,6 +5636,41 @@ mod tests {
         );
         assert!(case.conclusion.as_ref().unwrap().contains("not covered"));
         assert!(w.plan.is_empty());
+    }
+
+    #[test]
+    fn ask_selection_context_uses_exact_explorer_row_and_overview_finding() {
+        let (_home, mut app, mut w) = fixture();
+        w.navigate(Screen::Overview);
+        assert_eq!(
+            w.ask_subject(&app).folder,
+            Some(app.entries[0].spec.path.clone())
+        );
+        app.account_home = app.account_home.canonicalize().unwrap();
+        let parent = app.account_home.join("code/project/target");
+        let selected = parent.join("debug");
+        fs::create_dir_all(&selected).unwrap();
+        fs::write(selected.join("output.bin"), vec![0x7f; 8192]).unwrap();
+        app.inventory = Some(StorageInventory::scan(&app.account_home, &app.account_home));
+        app.explorer_path = Some(parent.clone());
+        app.explorer_cursor = app
+            .explorer_items()
+            .iter()
+            .position(|item| item.path == selected)
+            .unwrap();
+        w.navigate(Screen::Explore);
+        let subject = w.ask_subject(&app);
+        assert_eq!(subject.folder, Some(selected));
+        assert_ne!(subject.folder, Some(parent));
+        assert!(subject.description.starts_with("Selection context:"));
+        assert!(
+            subject
+                .description
+                .contains("question determines the target")
+        );
+        assert!(subject.actions.is_empty());
+        w.navigate(Screen::History);
+        assert!(w.ask_subject(&app).folder.is_none());
     }
 
     #[test]

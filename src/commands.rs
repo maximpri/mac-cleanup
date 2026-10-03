@@ -605,7 +605,12 @@ fn ask(
     let _ = care::save_session(home, &session);
     let code = if timed_out {
         EXIT_TIMED_OUT
-    } else if finish.as_ref().is_some_and(|finish| finish.by_model) {
+    } else if finish.as_ref().is_some_and(|finish| finish.by_model)
+        || case
+            .question_scope
+            .as_ref()
+            .is_some_and(|scope| scope.clarification.is_some())
+    {
         0
     } else {
         EXIT_AI_UNAVAILABLE
@@ -712,6 +717,9 @@ fn ask_json(
     json!({
         "schema": "diskray.ask/1",
         "question": question,
+        "question_scope": case.question_scope,
+        "prompt_version": case.prompt_version,
+        "answer_kind": case.answer_kind,
         "answer": finish.map(|f| f.summary.clone()),
         "by_model": finish.is_some_and(|f| f.by_model),
         "ai": framework.description(),

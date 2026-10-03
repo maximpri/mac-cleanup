@@ -129,6 +129,21 @@ pub struct EvidenceRecord {
     /// Measured eligible cache estimate, separate from review-only folder sizes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanup_total_kb: Option<u64>,
+    /// Collector-owned measurements used for scoped answers, independent of
+    /// the model-facing text and its transient handles.
+    #[serde(default)]
+    pub details: EvidenceDetails,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EvidenceDetails {
+    pub target: Option<std::path::PathBuf>,
+    pub size_kb: Option<u64>,
+    pub children: Vec<(String, u64)>,
+    pub eligible_actions: Vec<String>,
+    pub open_handles: Option<usize>,
+    pub rule_status: Option<String>,
 }
 
 /// A collector result before it becomes a numbered evidence record.
@@ -220,6 +235,12 @@ pub struct InvestigationCase {
     /// The Ask-box question, for question cases.
     #[serde(default)]
     pub question: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_scope: Option<crate::question::QuestionScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_kind: Option<String>,
     #[serde(default)]
     pub tool_calls: Vec<ToolCallRecord>,
     /// Validated plan-action IDs the model suggested. Never added automatically.
@@ -404,6 +425,9 @@ impl InvestigationCase {
             checks_run: Vec::new(),
             conclusion: None,
             question: None,
+            question_scope: None,
+            prompt_version: None,
+            answer_kind: None,
             tool_calls: Vec::new(),
             suggested_actions: Vec::new(),
         }
@@ -520,6 +544,7 @@ pub fn evidence(
         supports: supports.iter().map(|item| (*item).into()).collect(),
         contradicts: contradicts.iter().map(|item| (*item).into()).collect(),
         cleanup_total_kb: None,
+        details: EvidenceDetails::default(),
     }
 }
 
@@ -588,5 +613,46 @@ mod tests {
         let parsed: InvestigationCase = serde_json::from_str(legacy).unwrap();
         assert!(parsed.tool_calls.is_empty() && parsed.question.is_none());
         assert_eq!(parsed.phase, CasePhase::Researching);
+    }
+
+    #[test]
+    fn legacy_evidence_loads_without_inventing_target_measurements() {
+        let mut legacy = serde_json::to_value(evidence(
+            "E1",
+            EvidenceKind::Policy,
+            "cleanup_rule(pip)",
+            "A legacy measured check.",
+            &[],
+            &[],
+            EvidenceStatus::Complete,
+        ))
+        .unwrap();
+        legacy.as_object_mut().unwrap().remove("details");
+        let parsed: EvidenceRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.details, EvidenceDetails::default());
+        let partial: EvidenceDetails =
+            serde_json::from_value(serde_json::json!({"target": "/tmp/project"})).unwrap();
+        assert_eq!(
+            partial.target.as_deref(),
+            Some(std::path::Path::new("/tmp/project"))
+        );
+        assert!(partial.size_kb.is_none() && partial.open_handles.is_none());
+    }
+
+    #[test]
+    fn structured_evidence_round_trips_exact_measurements_and_action_ids() {
+        let details = EvidenceDetails {
+            target: Some("/Users/demo/code/project/target".into()),
+            size_kb: Some(120 * 1024),
+            children: vec![("debug".into(), 100 * 1024), ("release".into(), 20 * 1024)],
+            eligible_actions: vec!["clean:/Users/demo/Library/Caches/pip".into()],
+            open_handles: Some(0),
+            rule_status: Some("NO_RULE".into()),
+        };
+        assert_eq!(
+            serde_json::from_value::<EvidenceDetails>(serde_json::to_value(&details).unwrap())
+                .unwrap(),
+            details
+        );
     }
 }

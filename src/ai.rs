@@ -238,6 +238,12 @@ pub struct HelperProcess {
 impl HelperProcess {
     pub fn spawn() -> Result<Self, String> {
         let helper = helper_path()?;
+        Self::spawn_path(&helper)
+    }
+
+    /// Keep a run bound to the helper selected when it started, even when
+    /// deterministic measurements precede the first inference request.
+    pub(crate) fn spawn_path(helper: &Path) -> Result<Self, String> {
         let mut child = Command::new(helper)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

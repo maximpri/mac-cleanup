@@ -502,7 +502,7 @@ impl Server {
             argument,
         };
         let outcome = match agent_tools::dispatch(&call, &world, &mut self.handles) {
-            Dispatch::Ready(outcome) => outcome,
+            Dispatch::Ready(outcome) => *outcome,
             Dispatch::Slow(job) => {
                 let slow = job(&AtomicBool::new(false));
                 agent_tools::finish(slow, &world, &mut self.handles)

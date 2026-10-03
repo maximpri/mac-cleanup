@@ -23,8 +23,19 @@ The Python test suite uses the standard library and disposable fixtures; it
 checks the evaluation harness without Apple Intelligence. After building the
 release binary and helper with `sh scripts/build-release.sh`, run
 `python3 scripts/eval_agent.py target/release/diskray --runs 1` to check Ask
-answers. Safety checks run even during measured fallback; model-quality checks
-need a ready Apple Intelligence model.
+answers. Safety and deterministic scope/clarification checks run even during
+measured fallback; model-dependent quality checks need a ready Apple
+Intelligence model. A clarification with `by_model: false` and exit status `0`
+is an intentional successful result. Keep scope accuracy at 100% and do not
+skip usefulness checks merely because a scoped question needs no inference.
+
+When changing Ask, add fixtures with an unrelated eligible cache as a
+distraction, test both explicit targets and unresolved names, and verify that
+failed or missing in-use checks cannot produce cleanup suggestions. Keep
+`scoped-ask-v1` prompt diagnostics in sync when the request contract changes.
+`python3 scripts/check_ai_helper.py` covers optional request compatibility and
+constrained report schemas without inference; `--live` additionally checks
+actual generation and full report context accounting.
 
 For dependency changes, run `cargo deny --locked check licenses` with
 cargo-deny 0.20.2 and review [THIRD_PARTY.md](THIRD_PARTY.md). CI checks both

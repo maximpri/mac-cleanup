@@ -132,6 +132,25 @@ are sent only when you press Enter with AI ready.
 If macOS requests a restart after a language change, save your work and restart
 before checking again. See [AI setup and live verification](AI.md).
 
+Name the app or folder you mean. Ask binds explicit names to the measured
+inventory before checking files; the selected folder is context for phrases
+such as “this folder.” A whole-disk cleanup question stays global. If a name
+cannot be resolved, or “old app files” leaves it unclear whether you want to
+keep the app or remove its data, Diskray asks for clarification and suggests
+no cleanup. Age alone does not establish that app data is unused.
+
+For example:
+
+```bash
+diskray ask "Can I clean old Cursor files?" --json
+```
+
+The JSON includes `question_scope` (intent, target, label, and any clarification)
+plus `answer_kind` and `prompt_version`. A deterministic clarification returns exit status `0`
+with `by_model: false`, even without model inference. Answer the clarification
+in a new question; Ask does not keep a chat conversation. A measured answer
+used because inference was unavailable or failed retains exit status `3`.
+
 For a cleanup goal, ask a question such as:
 
 ```bash
