@@ -105,6 +105,9 @@ pub(super) fn render_help_overlay_if_open(frame: &mut Frame<'_>, area: Rect, app
     }
     lines.extend([
         Line::from(""),
+        heading(app, "LICENSE & COPYRIGHT"),
+        Line::from(crate::licensing::NOTICE),
+        Line::from(""),
         heading(app, "REVIEW BEFORE ACTION"),
         Line::from(if app.analysis_only {
             "This session is read-only. Cleanup, relocation, and signals are disabled."

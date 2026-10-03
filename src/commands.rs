@@ -27,6 +27,9 @@ pub const EXIT_TIMED_OUT: i32 = 4;
 /// Run a subcommand and return the process exit code.
 pub fn run(command: &Command, home: &Path) -> Result<i32, String> {
     match command {
+        Command::License => crate::licensing::write_license(io::stdout().lock())
+            .map(|()| 0)
+            .map_err(|error| format!("could not print license: {error}")),
         Command::Why {
             volume,
             json,

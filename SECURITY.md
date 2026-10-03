@@ -11,9 +11,10 @@ Please do not open a public issue for vulnerabilities that could cause data
 loss, escape the cleanup allowlist, follow symlinks, execute an unintended
 command, expose private paths, or bypass a confirmation or process check.
 
-Use the repository's **Security → Report a vulnerability** form to send a
-private report. If private vulnerability reporting is not yet enabled, contact
-the maintainer privately through the profile linked from the repository owner.
+Use the repository's [private vulnerability reporting form](https://github.com/maximpri/mac-cleanup/security/advisories/new)
+to send a report. Private vulnerability reporting is enabled on the upstream
+repository. Fork maintainers should enable it before advertising their own
+security reporting channel.
 
 Include:
 

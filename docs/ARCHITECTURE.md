@@ -188,7 +188,8 @@ flowchart TD
 | `src/installers.rs` | Read-only installer discovery with age and installed-app context |
 | `src/mcp.rs`, `src/pending.rs` | Read-only MCP server; agent proposals saved for `diskray review` |
 | `src/paths.rs`, `src/migrate.rs` | User-data locations and the one-time move from `mac-cleanup` |
-| `src/tui/mod.rs` | Session types, terminal lifecycle, event loop |
+| `src/tui/mod.rs` | Session types and event loop |
+| `src/tui/session.rs` | Guarded terminal setup, restoration, and panic diagnostics |
 | `src/tui/app.rs` | Scan and action orchestration, eligibility, worker results |
 | `src/tui/input.rs` | Keyboard/mouse routing, navigation, modal ownership |
 | `src/tui/scan.rs` | Bounded directory scan slices and worker construction |
@@ -197,6 +198,14 @@ flowchart TD
 | `src/tui/inspector.rs`, `dialogs.rs` | Exact-path context, consequences, scrollable decisions |
 | `src/tui/helpers.rs` | Presentation helpers and visible table-row hit regions |
 | `src/tui/tests.rs` | Behavioral regressions, layout checks, synthetic previews |
+
+Terminal setup is owned by a guard that restores raw mode, mouse/focus capture,
+cursor visibility, and the alternate screen on return, error, or unwinding.
+A single chained panic hook restores the active TUI thread before reporting
+diagnostics. Restoration attempts every reset even if an earlier write fails;
+it cannot recover a disconnected terminal or an uncatchable process kill.
+Lifecycle tests inject terminal operations instead of changing the test runner's
+terminal.
 
 The terminal adapter's submodules are private. The rest of the program continues
 to use only `tui::can_run()` and `tui::run()`. Domain modules do not depend on

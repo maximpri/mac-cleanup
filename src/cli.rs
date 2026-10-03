@@ -17,7 +17,7 @@ pub enum Mode {
     version,
     args_conflicts_with_subcommands = true,
     about = "Understand what fills your Mac's disk, then clear only reviewed, known-removable data",
-    after_help = "Cleanup and process termination can lose data. Review confirmations carefully, and never run this command with sudo."
+    after_help = "Cleanup and process termination can lose data. Review confirmations carefully, and never run this command with sudo.\nGPL-3.0-or-later · no warranty. Run `diskray license` for copyright and license terms."
 )]
 pub struct Cli {
     /// Keep the entire run read-only (the TUI defaults to analysis but can opt into cleanup)
@@ -86,6 +86,8 @@ pub struct Cli {
 /// interactive workspace exactly as before.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Print copyright, redistribution terms, and the full GPL license without scanning
+    License,
     /// Explain what fills the disk on one screen: capacity, hidden space,
     /// the largest folders, quick wins, and what to review first
     Why {

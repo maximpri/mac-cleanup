@@ -6,9 +6,44 @@
 #
 #   DEMO=$(sh scripts/demo_fixture.sh) && diskray why --volume "$DEMO" --no-save
 set -eu
-root="${1:-${TMPDIR:-/tmp}/diskray-demo}"
-rm -rf "$root"
-mkdir -p "$root"
+if [ "$#" -gt 1 ]; then
+  echo "usage: $0 [new-or-empty-directory]" >&2
+  exit 1
+fi
+if [ "$#" -eq 0 ]; then
+  root=$(mktemp -d "${TMPDIR:-/tmp}/diskray-demo.XXXXXX")
+else
+  root=$1
+  if [ -z "$root" ]; then
+    echo "demo fixture directory must not be empty" >&2
+    exit 1
+  fi
+  # A trailing slash must not hide a caller-supplied symlink.
+  while [ "$root" != / ] && [ "${root%/}" != "$root" ]; do
+    root=${root%/}
+  done
+  if [ -L "$root" ] || { [ -e "$root" ] && [ ! -d "$root" ]; }; then
+    echo "demo fixture requires a new or empty directory, not a file or symlink: $root" >&2
+    exit 1
+  fi
+  # Prefix relative paths so option-like names are never interpreted as flags.
+  case "$root" in /*) ;; *) root="./$root" ;; esac
+  if [ ! -d "$root" ]; then
+    mkdir "$root"
+  fi
+fi
+root=$(CDPATH= cd -- "$root" && pwd -P)
+if [ "$root" = / ]; then
+  echo "refusing to use the filesystem root for a demo fixture" >&2
+  exit 1
+fi
+# Never clear caller-owned contents, including hidden files and dangling links.
+for entry in "$root"/* "$root"/.[!.]* "$root"/..?*; do
+  if [ -e "$entry" ] || [ -L "$entry" ]; then
+    echo "demo fixture directory is not empty; use a new directory: $root" >&2
+    exit 1
+  fi
+done
 seed="$root/.seed"
 dd if=/dev/urandom of="$seed" bs=1m count=256 2>/dev/null
 

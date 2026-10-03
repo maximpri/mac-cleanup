@@ -18,15 +18,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossterm::{
-    cursor::{Hide, Show},
-    event::{
-        self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-        MouseEventKind,
-    },
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use ratatui::{
     Frame, Terminal,
@@ -71,6 +65,7 @@ mod inspector;
 mod process_view;
 mod relocation_view;
 mod scan;
+mod session;
 mod shell;
 mod storage_view;
 #[cfg(test)]
@@ -331,76 +326,16 @@ fn run_with(
     home: &Path,
     proposal: Option<(PathBuf, crate::pending::PendingPlan)>,
 ) -> Result<i32, String> {
-    let mut stdout = io::stdout();
-    enable_raw_mode().map_err(|error| format!("could not enable terminal raw mode: {error}"))?;
-    if let Err(error) = execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableFocusChange,
-        Hide
-    ) {
-        let _ = disable_raw_mode();
-        let _ = execute!(
-            stdout,
-            DisableFocusChange,
-            DisableMouseCapture,
-            Show,
-            LeaveAlternateScreen
-        );
-        return Err(format!(
-            "could not enter the alternate terminal screen: {error}"
-        ));
-    }
-
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = match Terminal::new(backend) {
-        Ok(terminal) => terminal,
-        Err(error) => {
-            let _ = disable_raw_mode();
-            let mut fallback = io::stdout();
-            let _ = execute!(
-                fallback,
-                DisableFocusChange,
-                DisableMouseCapture,
-                Show,
-                LeaveAlternateScreen
-            );
-            return Err(format!("could not initialize the terminal: {error}"));
+    session::run(|| {
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend)
+            .map_err(|error| format!("could not initialize the terminal: {error}"))?;
+        let mut app = App::new_with_care(cli, home, true)?;
+        if let (Some(workspace), Some(proposal)) = (app.care.as_mut(), proposal) {
+            workspace.load_proposal(proposal);
         }
-    };
-
-    let app = match App::new_with_care(cli, home, true) {
-        Ok(mut app) => {
-            if let (Some(workspace), Some(proposal)) = (app.care.as_mut(), proposal) {
-                workspace.load_proposal(proposal);
-            }
-            app
-        }
-        Err(error) => {
-            let _ = disable_raw_mode();
-            let _ = execute!(
-                terminal.backend_mut(),
-                DisableFocusChange,
-                DisableMouseCapture,
-                Show,
-                LeaveAlternateScreen
-            );
-            let _ = terminal.show_cursor();
-            return Err(error);
-        }
-    };
-    let result = run_loop(&mut terminal, app);
-    let _ = disable_raw_mode();
-    let _ = execute!(
-        terminal.backend_mut(),
-        DisableFocusChange,
-        DisableMouseCapture,
-        Show,
-        LeaveAlternateScreen
-    );
-    let _ = terminal.show_cursor();
-    result
+        run_loop(&mut terminal, app)
+    })
 }
 
 fn run_loop(

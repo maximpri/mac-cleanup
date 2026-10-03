@@ -5,6 +5,7 @@
 | Command | What it does |
 | --- | --- |
 | `diskray` | Opens the interactive workspace |
+| `diskray license` | Prints copyright, warranty, and the full GPLv3 license; no scan or settings migration |
 | `diskray why` | One-screen explanation: capacity, hidden space, largest folders, quick wins, what grew. `--json` for scripts |
 | `diskray ask "why is my disk full?"` | One question answered by the on-device model using read-only tools |
 | `diskray artifacts` | Build output (`node_modules`, `target`, `.venv`, …) in projects untouched for 60+ days. Report only |
@@ -13,7 +14,8 @@
 | `diskray review` | Review a cleanup proposal an agent saved, with the usual confirmation |
 | `diskray rules list` / `check FILE` | Show or validate cleanup rule packs ([docs/RULES.md](RULES.md)) |
 
-None of the subcommands delete anything. `diskray artifacts` searches every
+Reporting subcommands do not delete anything. `diskray review` opens the
+interactive confirmation flow for a saved proposal. `diskray artifacts` searches every
 top-level folder in your home except media, apps, and sync folders; set
 `roots = ["code", "work"]` and `min_age_days = 90` in
 `~/.config/diskray/projects.toml` to narrow it.

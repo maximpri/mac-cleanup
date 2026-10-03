@@ -15,6 +15,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  licenses:
+    name: Check dependency licenses
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Check the locked macOS dependency license graph
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1, cargo-deny 0.20.2
+        with:
+          rust-version: "1.88.0"
+          arguments: --locked
+          command: check licenses
+
   quality:
     name: Format, lint, test, and package
     runs-on: macos-26
@@ -50,6 +67,10 @@ jobs:
 
       - name: Build Rust and Apple AI release bundle
         run: RUSTUP_TOOLCHAIN=stable sh scripts/build-release.sh
+
+      - name: Exercise the terminal on disposable fixtures
+        timeout-minutes: 5
+        run: python3 scripts/smoke_tui.py target/release/diskray
 
       - name: Check Apple helper protocol
         run: python3 scripts/check_ai_helper.py

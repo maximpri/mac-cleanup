@@ -7,8 +7,8 @@ description = "An X-ray for your Mac's disk: understand storage and activity bef
 authors = ["Maxim Priezjev"]
 license = "GPL-3.0-or-later"
 readme = "README.md"
-repository = "https://github.com/maximpri/diskray"
-homepage = "https://github.com/maximpri/diskray"
+repository = "https://github.com/maximpri/mac-cleanup"
+homepage = "https://github.com/maximpri/mac-cleanup"
 keywords = ["macos", "disk", "storage", "tui", "apple-intelligence"]
 categories = ["command-line-utilities"]
 # Distributed from source through GitHub and the Homebrew tap; never uploaded

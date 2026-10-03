@@ -26,6 +26,12 @@ release binary and helper with `sh scripts/build-release.sh`, run
 answers. Safety checks run even during measured fallback; model-quality checks
 need a ready Apple Intelligence model.
 
+For dependency changes, run `cargo deny --locked check licenses` with
+cargo-deny 0.20.2 and review [THIRD_PARTY.md](THIRD_PARTY.md). CI checks both
+supported macOS architectures, including development and build dependencies.
+New source files should include `SPDX-License-Identifier: GPL-3.0-or-later`;
+retain upstream copyright and license notices when importing third-party code.
+
 ## Safety requirements
 
 Pull requests that add or change a cleanup target must:

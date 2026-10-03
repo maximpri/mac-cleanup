@@ -1,0 +1,14 @@
+Diskray
+Copyright (C) 2026 Maxim Priezjev and contributors
+
+Original project source, rule packs, documentation, and demo assets are
+licensed under the GNU General Public License, version 3 or (at your option)
+any later version (SPDX: GPL-3.0-or-later). See LICENSE for the full terms.
+
+This program is distributed WITHOUT ANY WARRANTY; without even the implied
+warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+Third-party dependencies retain their own copyright notices and licenses.
+See THIRD_PARTY.md for the dependency policy and redistribution guidance.
+
+Source and maintainer contact: https://github.com/maximpri/mac-cleanup

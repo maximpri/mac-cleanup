@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Check both supported macOS architectures, including build and test dependencies.
+[graph]
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+all-features = true
+
+[licenses]
+confidence-threshold = 0.95
+include-dev = true
+include-build = true
+allow = ["MIT", "Apache-2.0", "Unicode-3.0", "Zlib"]
+
+# publish = false controls crates.io publication, not this public project's license.
+[licenses.private]
+ignore = false
+
+# Keep copyleft approval specific to Diskray; new dependency licenses need review.
+[[licenses.exceptions]]
+crate = "diskray"
+allow = ["GPL-3.0-or-later"]

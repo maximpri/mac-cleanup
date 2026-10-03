@@ -2303,6 +2303,12 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &App, w: &Workspace) {
         "See where the space went → understand an item → add it to a plan → review → confirm",
         Style::default().fg(app.color(MINT)).bold(),
     )];
+    section(
+        &mut lines,
+        app,
+        "LICENSE & COPYRIGHT",
+        crate::licensing::NOTICE.into(),
+    );
     if let Some(note) = &w.note {
         section(&mut lines, app, "LAST MESSAGE", note.clone());
     }

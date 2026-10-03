@@ -8,6 +8,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `diskray license` prints the full GPLv3 license and project notice without
+  scanning, checking the host environment, or migrating settings. Terminal help
+  also exposes copyright, redistribution, and warranty information.
+- Dependency-license policy and CI checks for both supported Mac architectures,
+  plus attribution and source-distribution guidance for release maintainers.
 - The README includes a color GIF and still screenshots captured from the
   running Ratatui interface, with a reproducible read-only demo tape.
 - `diskray installers` (and the `old_installers` MCP tool) reports `.dmg`,
@@ -34,6 +39,13 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Terminal state is restored after partial setup failures and panics through
+  one session guard; panic diagnostics appear after the terminal is restored.
+- The demo fixture builder refuses nonempty or symlinked roots instead of
+  recursively deleting a caller-supplied directory.
+- Public source, issue, and security links point to the actual `mac-cleanup`
+  repository; source installation replaces the unavailable Homebrew tap in
+  the README. The formula remains an explicitly labeled release template.
 - Cleanup goals handle fractional amounts and distinguish requested space from
   space already free. Repeated checks use the latest eligible total, and APFS
   aliases no longer inflate estimates or hide the selected folder. Overviews
@@ -279,4 +291,4 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - PID owner, parent, start-time, health, and ancestry revalidation immediately
   before any requested process signal; unattended cleanup never sends signals.
 
-[Unreleased]: https://github.com/maximpri/diskray/commits/main
+[Unreleased]: https://github.com/maximpri/mac-cleanup/commits/main

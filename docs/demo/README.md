@@ -19,6 +19,10 @@ availability are live readings from the recording Mac. These values vary;
 inspect recordings before sharing them. The app may save scan history in its
 normal application state directory.
 
+The fixture builder refuses nonempty directories and file/symlink roots.
+If you supply a directory yourself, use a new or empty directory for each run;
+the script never clears an existing fixture or unrelated files.
+
 ## Reproduce the README media
 
 Run from the repository root on macOS with an APFS temporary directory:

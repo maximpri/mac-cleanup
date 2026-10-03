@@ -23,4 +23,5 @@ if [ -n "$reason" ]; then
 fi
 
 xcrun swiftc -O -parse-as-library -target arm64-apple-macosx26.0 native/AIHelper.swift -o target/release/diskray-ai
-echo 'Built target/release/diskray and target/release/diskray-ai. Distribute both together.'
+echo 'Built target/release/diskray and target/release/diskray-ai.'
+echo 'Before redistribution, follow the license and corresponding-source checklist in RELEASING.md.'

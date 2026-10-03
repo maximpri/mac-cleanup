@@ -1,19 +1,22 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Homebrew formula for the maximpri/homebrew-diskray tap. The release workflow
 # opens a pull request in the tap that updates `url` and `sha256`.
+# TEMPLATE ONLY: replace the placeholder checksum from a verified source release
+# before publishing this formula in a tap. See RELEASING.md.
 class Diskray < Formula
   desc "X-ray for your Mac's disk: understand before you delete"
-  homepage "https://github.com/maximpri/diskray"
-  url "https://github.com/maximpri/diskray/releases/download/v0.4.0/diskray-0.4.0.tar.gz"
+  homepage "https://github.com/maximpri/mac-cleanup"
+  url "https://github.com/maximpri/mac-cleanup/releases/download/v0.4.0/diskray-0.4.0.tar.gz"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "GPL-3.0-or-later"
-  head "https://github.com/maximpri/diskray.git", branch: "main"
+  head "https://github.com/maximpri/mac-cleanup.git", branch: "main"
 
   depends_on "rust" => :build
   depends_on :macos
 
   def install
     system "cargo", "install", *std_cargo_args
+    doc.install "LICENSE", "COPYRIGHT", "THIRD_PARTY.md"
 
     # Local AI needs Apple silicon, macOS 26 (Tahoe) or later, and an SDK
     # with FoundationModels. Everything else works without the helper.
@@ -47,6 +50,7 @@ class Diskray < Formula
 
   test do
     assert_match version.to_s, shell_output("#{bin}/diskray --version")
+    assert_match "GNU GENERAL PUBLIC LICENSE", shell_output("#{bin}/diskray license")
     (testpath/"pack.toml").write <<~TOML
       schema = 1
       pack = "test"

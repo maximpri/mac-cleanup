@@ -3798,6 +3798,22 @@ mod tests {
     }
 
     #[test]
+    fn help_exposes_license_and_warranty_on_compact_terminals() {
+        let (_home, mut app, mut w) = fixture();
+        press(&mut w, &mut app, KeyCode::Char('?'));
+        let mut seen = String::new();
+        for _ in 0..12 {
+            seen.push_str(&screen_text(&app, &w, 60, 16, "help-license"));
+            press(&mut w, &mut app, KeyCode::PageDown);
+        }
+        assert!(seen.contains("Copyright (C) 2026"));
+        assert!(seen.contains("GPL-3.0-or-later"));
+        assert!(seen.contains("NO WARRANTY"));
+        assert!(seen.contains("diskray license"));
+        assert!(w.plan.is_empty());
+    }
+
+    #[test]
     fn help_is_scrollable_and_captures_actions_and_navigation_clicks() {
         let (_home, mut app, mut w) = fixture();
         press(&mut w, &mut app, KeyCode::Char('?'));

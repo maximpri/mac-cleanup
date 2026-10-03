@@ -100,6 +100,7 @@ class Session:
     def __init__(self, binary, *args):
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
+        self.original_termios = termios.tcgetattr(slave)
         self.process = subprocess.Popen(
             [str(binary), *args], stdin=slave, stdout=slave, stderr=slave,
             env={**os.environ, "TERM": "xterm-256color"}, start_new_session=True,
@@ -159,7 +160,12 @@ class Session:
                         self.feed(data)
                 except OSError:
                     break
-        return self.process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        code = self.process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        if code == 0:
+            assert termios.tcgetattr(self.master) == self.original_termios, (
+                "successful TUI exit must restore the original PTY modes"
+            )
+        return code
 
     def close(self):
         try:

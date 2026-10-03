@@ -6,6 +6,18 @@ use diskray::{cache::validate_environment, cli::Cli, commands, migrate, plain, t
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // Legal information must work without a valid scan environment and must
+    // not migrate settings, inspect user files, or create application state.
+    if matches!(cli.command, Some(diskray::cli::Command::License)) {
+        return match diskray::licensing::write_license(std::io::stdout().lock()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("Could not print license: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let home = match validate_environment() {
         Ok(home) => home,
         Err(error) => {

@@ -1,7 +1,8 @@
 # Release process
 
-Diskray is distributed from source through GitHub Releases and the
-Homebrew tap (`maximpri/homebrew-diskray`). It is never published to crates.io.
+Diskray's release workflow distributes source through GitHub Releases at
+`maximpri/mac-cleanup`. Homebrew support is prepared but its public tap is not
+yet available. Diskray is never published to crates.io.
 
 ## Prepare
 
@@ -16,6 +17,8 @@ Homebrew tap (`maximpri/homebrew-diskray`). It is never published to crates.io.
    cargo fmt --all --check
    cargo clippy --all-targets --all-features --locked -- -D warnings
    cargo test --all-targets --locked
+   cargo deny --locked check licenses    # cargo-deny 0.20.2
+   python3 -m unittest discover -s scripts -p 'test_*.py' -v
    cargo doc --no-deps --document-private-items
    sh scripts/build-release.sh
    python3 scripts/check_ai_helper.py
@@ -44,7 +47,11 @@ Homebrew tap (`maximpri/homebrew-diskray`). It is never published to crates.io.
 ## Homebrew tap (one-time setup)
 
 1. Create the public repository `maximpri/homebrew-diskray` and copy
-   `packaging/homebrew/diskray.rb` to `Formula/diskray.rb` in it.
+   `packaging/homebrew/diskray.rb` to `Formula/diskray.rb` in it. The checked-in
+   formula is a template: set its versioned URL to an existing source release
+   and replace the all-zero `sha256` with that archive's verified SHA-256.
+   Run `brew install --build-from-source`, `brew test`, and `brew audit --strict`
+   before advertising the tap. Do not publish the placeholder unchanged.
 2. Create a fine-grained token with *Contents* and *Pull requests* write access
    to that repository only. Save it as the `TAP_TOKEN` secret in this
    repository, and set the repository variable `TAP_ENABLED` to `true`.
@@ -66,3 +73,29 @@ installer-ready.
 
 Do not upload binaries built from a dirty working tree, and do not commit
 signing certificates, notarization credentials, or generated cleanup reports.
+
+## License and source checklist
+
+The project remains **GPL-3.0-or-later**. The full GPLv3 text is in `LICENSE`;
+the project's copyright and copying notice is in `COPYRIGHT`. Contributions
+use the same license and the Developer Certificate of Origin in CONTRIBUTING.md.
+
+- Keep `LICENSE`, `COPYRIGHT`, `THIRD_PARTY.md`, `Cargo.lock`, rule packs, Swift
+  helper source, and build scripts in every source archive. Check the archive
+  contents before publishing; the existing workflow uses `git archive`.
+- Run the dependency-license check documented in `THIRD_PARTY.md` against the
+  exact release lockfile. Retain upstream copyright, license, and NOTICE files.
+- The current workflow publishes **source only**. If adding binary downloads,
+  bundle the project notices and the applicable third-party license/NOTICE
+  texts. An inventory of SPDX identifiers alone is not a license bundle.
+- Offer the exact corresponding source alongside each binary, including the
+  build scripts and dependency sources needed to rebuild it. Document the tag,
+  commit, toolchain, and target; verify a clean build from that source. `cargo
+  vendor --locked` can collect Rust dependencies and their license files.
+- Keep Apple SDKs and model assets out of archives. Local AI uses the installed
+  macOS frameworks; the Rust utility also builds without the optional helper.
+- Verify the upstream repository links and private security-reporting form.
+  Configure the tap and signing credentials separately; none belong in Git.
+
+See the [GNU guidance for applying the GPL](https://www.gnu.org/licenses/gpl-howto.en.html)
+and [GPLv3 distribution terms](https://www.gnu.org/licenses/gpl-3.0.en.html).

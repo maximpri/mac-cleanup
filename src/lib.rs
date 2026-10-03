@@ -22,6 +22,7 @@ pub mod headless;
 pub mod history;
 pub mod installers;
 pub mod investigation;
+pub mod licensing;
 pub mod mcp;
 pub mod migrate;
 pub mod paths;

@@ -60,7 +60,7 @@ a real `diskray why --json` run (fixture or a volunteer Mac), never invented.
 
 - Mole is faster and broader for bulk cleaning; use it for that.
 - Diskray is for understanding: hidden space, evidence, growth, verification.
-- `brew install maximpri/diskray/diskray`, `diskray why`, GPL-3.0, issues and
+- Build from the source checkout, `diskray why`, GPL-3.0-or-later, issues and
   rule packs welcome.
 
 ## Assets checklist

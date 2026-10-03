@@ -6,7 +6,7 @@ A macOS disk analyzer built in Rust with a **[Ratatui](https://ratatui.rs/)
 terminal interface**. Explore large folders, investigate storage with on-device
 AI, and review cleanup or external-drive moves from your terminal.
 
-[![CI](https://github.com/maximpri/diskray/actions/workflows/ci.yml/badge.svg)](https://github.com/maximpri/diskray/actions/workflows/ci.yml)
+[![CI](https://github.com/maximpri/mac-cleanup/actions/workflows/ci.yml/badge.svg)](https://github.com/maximpri/mac-cleanup/actions/workflows/ci.yml)
 [![License: GPL v3+](https://img.shields.io/badge/License-GPLv3%2B-blue.svg)](LICENSE)
 ![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 
@@ -37,17 +37,18 @@ remove, and only then lets you act, one reviewed action at a time.
 
 ## Install
 
-```bash
-brew install maximpri/diskray/diskray
-```
-
-The formula builds from source. Or build it yourself (Rust 1.88+):
+Build from source with Rust 1.88 or newer and the Xcode command-line tools:
 
 ```bash
-git clone https://github.com/maximpri/diskray.git && cd diskray
+git clone https://github.com/maximpri/mac-cleanup.git diskray
+cd diskray
 sh scripts/build-release.sh          # adds the AI helper when this Mac supports it
 ./target/release/diskray
 ```
+
+The Homebrew formula in `packaging/homebrew/` is a release template. A public
+tap is not yet available; use the source build above. Maintainers can follow
+[the release process](RELEASING.md) to publish a verified source release and tap.
 
 Local AI needs Apple silicon, macOS 26 or later, and Apple Intelligence turned
 on with its model downloaded. Your Mac and Siri must use the same language, and
@@ -178,8 +179,15 @@ the [Code of Conduct](CODE_OF_CONDUCT.md). Changes are listed in
 
 ## License
 
+Copyright (C) 2026 Maxim Priezjev and contributors.
+
 Diskray is free software: you can redistribute it and/or modify it under the
 terms of the [GNU General Public License](LICENSE) as published by the Free
 Software Foundation, either version 3 of the License, or (at your option) any
 later version. It is distributed in the hope that it will be useful, but
 WITHOUT ANY WARRANTY; see the license for details.
+
+Run `diskray license` to read the full license without scanning your disk.
+The TUI's `?` help also shows the copyright and warranty notice. See
+[COPYRIGHT](COPYRIGHT) and [third-party licensing](THIRD_PARTY.md) for attribution
+and dependency information.
